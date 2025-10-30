@@ -1,46 +1,16 @@
-#include <iostream>
+#include "../../include/core/dusktracer.h"
+#include "../../include/core/hittable.h"
+#include "../../include/core/hittable_list.h"
+#include "../../include/core/sphere.h"
 
-#include "../../include/core/colour.h"
-#include "../../include/core/vec3.h"
-#include "../../include/core/ray.h"
-
-double test_sphere(const point3& centre, double radius, const ray& r){
-
-    //vector from ray origin to sphere centre
-    vec3 oc = centre - r.origin();
-
-    //quadratic formula components
-    auto a = dot(r.direction(), r.direction());
-    auto b = -2.0 * dot(r.direction(), oc);
-    auto c = dot(oc, oc) - radius*radius;
-
-    //discriminant
-    auto discriminant = b * b - 4 * a * c;
-    
-    //if no real roots, ray misses sphere
-    if (discriminant < 0){
-
-        return -1.0;
-
-    //else return nearest t value
-    } else {
-
-        return (-b - std::sqrt(discriminant)) / (2.0 * a);
-    }
-
-}
 
 //returns colour based on ray direction
-colour ray_colour(const ray& r){
+colour ray_colour(const ray& r, const hittable& world){
 
-    //check if ray hits sphere at centre (0,0,-1) with radius 0.5
-    auto t = test_sphere(point3(0,0,-1), 0.5, r);
+    hit_record rec;
 
-    //if hit, compute normal and return normals colour based on normal
-    if (t > 0.0){
-
-        vec3 N = unit_vector(r.at(t) - vec3(0,0,-1));
-        return 0.5 * colour(N.x() + 1, N.y() + 1, N.z() + 1);
+    if(world.hit(r, 0, infinity, rec)){
+        return 0.5 * (rec.normal + colour(1,1,1));
     }
 
     vec3 unit_direction = unit_vector(r.direction());
@@ -48,9 +18,10 @@ colour ray_colour(const ray& r){
     return (1.0 - a) * colour(1.0, 1.0, 1.0) + a * colour(0.5, 0.7, 1.0);
 }
 
+
 int main(){
 
-    //image
+    //IMAGE//
     auto aspect_ratio = 16.0 / 9.0;
     int image_width = 400;
 
@@ -58,10 +29,14 @@ int main(){
     int image_height = int(image_width / aspect_ratio);
     image_height = (image_height < 1) ? 1 : image_height;
 
-    //camera detail//
-    auto focal_length = 1.0;
+    //WORLD//
+    hittable_list world;
 
-    //arbitrary viewport size
+    world.add(make_shared<sphere>(point3(0,0,-1), 0.5));
+    world.add(make_shared<sphere>(point3(0,-100.5,-1), 100));
+
+    //CAMERA DETAILS//
+    auto focal_length = 1.0;
     auto viewport_height = 2.0;
     auto viewport_width = viewport_height * (double(image_width)/image_height);
     auto camera_centre = point3(0,0,0);
@@ -100,7 +75,7 @@ int main(){
             ray r(camera_centre, ray_direction);
             
             //get colour for ray
-            colour pixel_colour = ray_colour(r);
+            colour pixel_colour = ray_colour(r, world);
 
             //write colour to output
             write_colour(std::cout, pixel_colour);
