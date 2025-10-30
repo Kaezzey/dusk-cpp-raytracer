@@ -4,7 +4,45 @@
 #include "../../include/core/vec3.h"
 #include "../../include/core/ray.h"
 
+double test_sphere(const point3& centre, double radius, const ray& r){
+
+    //vector from ray origin to sphere centre
+    vec3 oc = centre - r.origin();
+
+    //quadratic formula components
+    auto a = dot(r.direction(), r.direction());
+    auto b = -2.0 * dot(r.direction(), oc);
+    auto c = dot(oc, oc) - radius*radius;
+
+    //discriminant
+    auto discriminant = b * b - 4 * a * c;
+    
+    //if no real roots, ray misses sphere
+    if (discriminant < 0){
+
+        return -1.0;
+
+    //else return nearest t value
+    } else {
+
+        return (-b - std::sqrt(discriminant)) / (2.0 * a);
+    }
+
+}
+
+//returns colour based on ray direction
 colour ray_colour(const ray& r){
+
+    //check if ray hits sphere at centre (0,0,-1) with radius 0.5
+    auto t = test_sphere(point3(0,0,-1), 0.5, r);
+
+    //if hit, compute normal and return normals colour based on normal
+    if (t > 0.0){
+
+        vec3 N = unit_vector(r.at(t) - vec3(0,0,-1));
+        return 0.5 * colour(N.x() + 1, N.y() + 1, N.z() + 1);
+    }
+
     vec3 unit_direction = unit_vector(r.direction());
     auto a = 0.5 * (unit_direction.y() + 1.0);
     return (1.0 - a) * colour(1.0, 1.0, 1.0) + a * colour(0.5, 0.7, 1.0);
