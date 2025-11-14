@@ -8,7 +8,7 @@ class sphere : public hittable {
     public:
         sphere(const point3& centre, double radius) : centre(centre), radius(std::fmax(0, radius)) {}
 
-        bool hit(const ray& r, double t_min, double t_max, hit_record& rec) const override {
+        bool hit(const ray& r, interval ray_t, hit_record& rec) const override {
 
             //vector from ray origin to sphere centre
             vec3 oc = centre - r.origin();
@@ -32,13 +32,13 @@ class sphere : public hittable {
             auto root = (h - sqrtd) / a;
 
             //check if root is within t_min and t_max
-            if (root <= t_min || t_max <= root) {
+            if (!ray_t.surrounds(root)) {
 
                 //try the other root
                 root = (h + sqrtd) / a;
 
                 //check if this root is within t_min and t_max
-                if (root <= t_min || t_max <= root) {
+                if (!ray_t.surrounds(root)) {
                     return false;
                 }
             }
