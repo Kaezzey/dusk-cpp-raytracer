@@ -2,10 +2,11 @@
 #define CAMERA_H
 
 #include "hittable.h"
+#include "material.h"
 #include <cmath>
 
 class camera {
-    
+
   public:
     //ratio of image width over height
     double aspect_ratio = 1.0; 
@@ -13,6 +14,7 @@ class camera {
     //rendered image width in pixel count
     int image_width  = 100;
     int samples_per_pixel = 10;
+    int max_depth = 10; //max recursion depth for ray tracing
     // sampling method (choose HALTON for high-quality, efficient AA)
     enum sampling_method_e { RANDOM_SAMPLES = 0, HALTON_SAMPLES = 1 };
     sampling_method_e sampling_method = HALTON_SAMPLES;
@@ -29,7 +31,7 @@ class camera {
                 colour pixel_colour(0,0,0);
                 for (int sample = 0; sample < samples_per_pixel; sample++) {
                     ray r = get_ray(i, j, sample);
-                    pixel_colour += ray_colour(r, world);
+                    pixel_colour += ray_colour(r, max_depth, world);
                 }
                 write_colour(std::cout, pixel_samples_scale * pixel_colour);
             }
@@ -130,12 +132,20 @@ class camera {
         return double(nn) / double(0x7fffffffu);
     }
 
-    colour ray_colour(const ray& r, const hittable& world) const {
+    colour ray_colour(const ray& r, int depth, const hittable& world) const {
+
+        if (depth <= 0) {
+            return colour(0,0,0);
+        }
 
         hit_record rec;
 
-        if (world.hit(r, interval(0, infinity), rec)) {
-            return 0.5 * (rec.normal + colour(1,1,1));
+        if (world.hit(r, interval(0.001, infinity), rec)) {
+            ray scattered;
+            colour attenuation;
+            if (rec.mat->scatter(r, rec, attenuation, scattered))
+                return attenuation * ray_colour(scattered, depth-1, world);
+            return colour(0,0,0);
         }
 
         vec3 unit_direction = unit_vector(r.direction());
