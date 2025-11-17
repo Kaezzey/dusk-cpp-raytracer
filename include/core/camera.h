@@ -36,12 +36,12 @@ class camera {
     enum sampling_method_e { RANDOM_SAMPLES = 0, HALTON_SAMPLES = 1 };
     sampling_method_e sampling_method = HALTON_SAMPLES;
 
-    void render(const hittable& world) {
+    void render(const hittable& world, std::ostream& out = std::cout) {
 
         initialize();
 
-        std::cout << "P3\n" << image_width << ' ' << image_height << "\n255\n";
-
+        out << "P3\n" << image_width << ' ' << image_height << "\n255\n";
+        
         for (int j = 0; j < image_height; j++) {
             std::clog << "\rScanlines remaining: " << (image_height - j) << ' ' << std::flush;
             for (int i = 0; i < image_width; i++) {
@@ -50,7 +50,7 @@ class camera {
                     ray r = get_ray(i, j, sample);
                     pixel_colour += ray_colour(r, max_depth, world);
                 }
-                write_colour(std::cout, pixel_samples_scale * pixel_colour);
+                write_colour(out, pixel_samples_scale * pixel_colour);
             }
         }
 
