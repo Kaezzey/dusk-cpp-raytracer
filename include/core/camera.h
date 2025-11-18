@@ -4,6 +4,7 @@
 #include "hittable.h"
 #include "material.h"
 #include <cmath>
+#include <chrono>
 
 class camera {
 
@@ -40,21 +41,113 @@ class camera {
 
         initialize();
 
-        out << "P3\n" << image_width << ' ' << image_height << "\n255\n";
-        
+        out << "P3\n" << image_width << ' '
+            << image_height << "\n255\n";
+
+        using clock = std::chrono::steady_clock;
+
+        auto render_start = clock::now();
+
+        int total_scanlines = image_height;
+        int completed = 0;
+
+        // Rolling chunk settings
+        const int chunk_size = 4;   // update every N scanlines
+        int chunk_counter = 0;
+
+        auto chunk_start = clock::now();
+
+        // Long-term accumulators
+        double accumulated_time = 0.0;
+        int accumulated_lines = 0;
+
+        double eta_longterm = 0.0;
+        double eta_shortterm = 0.0;
+
+        // Progress bar settings
+        const int bar_width = 40;
+
         for (int j = 0; j < image_height; j++) {
-            std::clog << "\rScanlines remaining: " << (image_height - j) << ' ' << std::flush;
+
+            completed++;
+            chunk_counter++;
+
+            // ---- render scanline ----
             for (int i = 0; i < image_width; i++) {
+
                 colour pixel_colour(0,0,0);
-                for (int sample = 0; sample < samples_per_pixel; sample++) {
-                    ray r = get_ray(i, j, sample);
+
+                for (int s = 0; s < samples_per_pixel; s++) {
+                    ray r = get_ray(i, j, s);
                     pixel_colour += ray_colour(r, max_depth, world);
                 }
+
                 write_colour(out, pixel_samples_scale * pixel_colour);
+            }
+
+            // ---- ETA + progress bar update every chunk ----
+            if (chunk_counter >= chunk_size) {
+                chunk_counter = 0;
+
+                auto now = clock::now();
+                double chunk_seconds =
+                    std::chrono::duration<double>(now - chunk_start).count();
+
+                chunk_start = now;
+
+                // Short-term (chunk) average
+                double avg_chunk_time = chunk_seconds / chunk_size;
+                eta_shortterm = avg_chunk_time * (total_scanlines - completed);
+
+                // Long-term average
+                accumulated_time += chunk_seconds;
+                accumulated_lines += chunk_size;
+
+                double long_avg = accumulated_time / accumulated_lines;
+                eta_longterm = long_avg * (total_scanlines - completed);
+
+                // Blended estimate
+                double eta = 0.75 * eta_longterm + 0.25 * eta_shortterm;
+
+                // Elapsed
+                double elapsed =
+                    std::chrono::duration<double>(now - render_start).count();
+
+                // Progress %
+                double pct = double(completed) / total_scanlines;
+
+                // Draw progress bar
+                std::clog << "\r[";
+                int pos = int(bar_width * pct);
+                for (int k = 0; k < bar_width; k++) {
+                    if (k < pos) std::clog << "#";
+                    else std::clog << "-";
+                }
+
+                // Time formatting
+                int rem_i = int(eta);
+                int rem_m = rem_i / 60;
+                int rem_s = rem_i % 60;
+
+                std::clog << "] "
+                        << int(pct * 100.0) << "% "
+                        << "| Elapsed: " << int(elapsed) << "s "
+                        << "| Remaining: " << rem_m << ":"
+                        << (rem_s < 10 ? "0" : "") << rem_s
+                        << std::flush;
             }
         }
 
-        std::clog << "\rDone.                 \n";
+        // ---- Final time ----
+        auto end = clock::now();
+        double total_time =
+            std::chrono::duration<double>(end - render_start).count();
+
+        int tm = int(total_time) / 60;
+        int ts = int(total_time) % 60;
+
+        std::clog << "\nDone. Total time: "
+                << tm << ":" << (ts < 10 ? "0" : "") << ts << "\n";
     }
 
   private:
