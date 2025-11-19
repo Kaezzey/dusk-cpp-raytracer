@@ -4,7 +4,10 @@
 #include "hittable.h"
 #include "material.h"
 #include <cmath>
+#include <algorithm>
 #include <chrono>
+#include <vector>
+#include <atomic>
 
 class camera {
 
@@ -37,44 +40,40 @@ class camera {
     enum sampling_method_e { RANDOM_SAMPLES = 0, HALTON_SAMPLES = 1 };
     sampling_method_e sampling_method = HALTON_SAMPLES;
 
-    void render(const hittable& world, std::ostream& out = std::cout) {
-
+    void render(const hittable& world, std::ostream& out = std::cout){
+        
         initialize();
 
         out << "P3\n" << image_width << ' '
             << image_height << "\n255\n";
 
         using clock = std::chrono::steady_clock;
-
         auto render_start = clock::now();
 
+        // ---------- FRAMEBUFFER ----------
+        std::vector<colour> framebuffer(image_width * image_height);
+
+        // ---------- PROGRESS + ETA ----------
         int total_scanlines = image_height;
-        int completed = 0;
+        std::atomic<int> completed_scanlines{0};
 
-        // Rolling chunk settings
-        const int chunk_size = 4;   // update every N scanlines
-        int chunk_counter = 0;
+        const int bar_width = 40;
 
-        auto chunk_start = clock::now();
-
-        // Long-term accumulators
-        double accumulated_time = 0.0;
+        // Rolling ETA (shared, updated in critical section)
+        const int chunk_size = 4;
         int accumulated_lines = 0;
-
+        double accumulated_time = 0.0;
         double eta_longterm = 0.0;
         double eta_shortterm = 0.0;
 
-        // Progress bar settings
-        const int bar_width = 40;
+        auto chunk_start = clock::now();
 
-        for (int j = 0; j < image_height; j++) {
-
-            completed++;
-            chunk_counter++;
-
-            // ---- render scanline ----
-            for (int i = 0; i < image_width; i++) {
-
+        // ---------- PARALLEL RENDER ----------
+        #pragma omp parallel for schedule(dynamic)
+        for (int j = 0; j < image_height; j++)
+        {
+            for (int i = 0; i < image_width; i++)
+            {
                 colour pixel_colour(0,0,0);
 
                 for (int s = 0; s < samples_per_pixel; s++) {
@@ -82,66 +81,75 @@ class camera {
                     pixel_colour += ray_colour(r, max_depth, world);
                 }
 
-                write_colour(out, pixel_samples_scale * pixel_colour);
+                framebuffer[j * image_width + i] =
+                    pixel_samples_scale * pixel_colour;
             }
 
-            // ---- ETA + progress bar update every chunk ----
-            if (chunk_counter >= chunk_size) {
-                chunk_counter = 0;
+            // ONE scanline finished
+            int done = ++completed_scanlines;
 
-                auto now = clock::now();
-                double chunk_seconds =
-                    std::chrono::duration<double>(now - chunk_start).count();
+            // Progress + ETA update (guarded with critical)
+            if (done % chunk_size == 0) {
+                #pragma omp critical
+                {
+                    auto now = clock::now();
+                    double chunk_seconds =
+                        std::chrono::duration<double>(now - chunk_start).count();
 
-                chunk_start = now;
+                    chunk_start = now;
 
-                // Short-term (chunk) average
-                double avg_chunk_time = chunk_seconds / chunk_size;
-                eta_shortterm = avg_chunk_time * (total_scanlines - completed);
+                    // short-term ETA
+                    double short_avg = chunk_seconds / chunk_size;
+                    eta_shortterm = short_avg * (total_scanlines - done);
 
-                // Long-term average
-                accumulated_time += chunk_seconds;
-                accumulated_lines += chunk_size;
+                    // long-term ETA
+                    accumulated_time += chunk_seconds;
+                    accumulated_lines += chunk_size;
 
-                double long_avg = accumulated_time / accumulated_lines;
-                eta_longterm = long_avg * (total_scanlines - completed);
+                    double long_avg = accumulated_time / accumulated_lines;
+                    eta_longterm = long_avg * (total_scanlines - done);
 
-                // Blended estimate
-                double eta = 0.75 * eta_longterm + 0.25 * eta_shortterm;
+                    // blended ETA
+                    double eta = 0.75 * eta_longterm + 0.25 * eta_shortterm;
 
-                // Elapsed
-                double elapsed =
-                    std::chrono::duration<double>(now - render_start).count();
+                    double elapsed =
+                        std::chrono::duration<double>(now - render_start).count();
 
-                // Progress %
-                double pct = double(completed) / total_scanlines;
+                    double pct = double(done) / total_scanlines;
 
-                // Draw progress bar
-                std::clog << "\r[";
-                int pos = int(bar_width * pct);
-                for (int k = 0; k < bar_width; k++) {
-                    if (k < pos) std::clog << "#";
-                    else std::clog << "-";
+                    // ---------- PROGRESS BAR ----------
+                    std::clog << "\r[";
+
+                    int pos = int(bar_width * pct);
+                    for (int k = 0; k < bar_width; k++) {
+                        if (k < pos) std::clog << "#";
+                        else std::clog << "-";
+                    }
+
+                    int rem = int(eta);
+                    int rem_min = rem / 60;
+                    int rem_sec = rem % 60;
+
+                    std::clog << "] "
+                            << int(pct * 100.0) << "% "
+                            << "| Elapsed: " << int(elapsed) << "s "
+                            << "| Remaining: " << rem_min << ":"
+                            << (rem_sec < 10 ? "0" : "") << rem_sec
+                            << std::flush;
                 }
-
-                // Time formatting
-                int rem_i = int(eta);
-                int rem_m = rem_i / 60;
-                int rem_s = rem_i % 60;
-
-                std::clog << "] "
-                        << int(pct * 100.0) << "% "
-                        << "| Elapsed: " << int(elapsed) << "s "
-                        << "| Remaining: " << rem_m << ":"
-                        << (rem_s < 10 ? "0" : "") << rem_s
-                        << std::flush;
             }
         }
 
-        // ---- Final time ----
-        auto end = clock::now();
+        // ---------- OUTPUT THE FRAMEBUFFER ----------
+        for (int j = 0; j < image_height; j++) {
+            for (int i = 0; i < image_width; i++) {
+                write_colour(out, framebuffer[j * image_width + i]);
+            }
+        }
+
+        // ---------- FINAL TIME ----------
         double total_time =
-            std::chrono::duration<double>(end - render_start).count();
+            std::chrono::duration<double>(clock::now() - render_start).count();
 
         int tm = int(total_time) / 60;
         int ts = int(total_time) % 60;
@@ -211,8 +219,9 @@ class camera {
 
         auto ray_origin =  (defocus_angle <= 0) ? center : defocus_disk_sample();
         auto ray_direction = pixel_sample - ray_origin;
+        auto ray_time = random_double();
 
-        return ray(ray_origin, ray_direction);
+        return ray(ray_origin, ray_direction, ray_time);
 
     }
 
@@ -263,25 +272,58 @@ class camera {
         return double(nn) / double(0x7fffffffu);
     }
 
-    colour ray_colour(const ray& r, int depth, const hittable& world) const {
+    colour ray_colour(const ray& r0, int max_depth, const hittable& world) const {
+        ray current_ray = r0;
+        colour throughput(1.0, 1.0, 1.0);
+        colour result(0,0,0);
 
-        if (depth <= 0) {
-            return colour(0,0,0);
-        }
+        for (int depth = 0; depth < max_depth; depth++) {
 
-        hit_record rec;
+            hit_record rec;
 
-        if (world.hit(r, interval(0.001, infinity), rec)) {
+            if (!world.hit(current_ray, interval(0.001, infinity), rec)) {
+                // Background / sky shading
+                vec3 unit_dir = unit_vector(current_ray.direction());
+                double t = 0.5 * (unit_dir.y() + 1.0);
+                colour sky = (1.0 - t)*colour(1.0, 1.0, 1.0) +
+                            t * colour(0.5, 0.7, 1.0);
+
+                result += throughput * sky;
+                break;
+            }
+
             ray scattered;
             colour attenuation;
-            if (rec.mat->scatter(r, rec, attenuation, scattered))
-                return attenuation * ray_colour(scattered, depth-1, world);
-            return colour(0,0,0);
+            
+            if (!rec.mat->scatter(current_ray, rec, attenuation, scattered)) {
+                // Absorbed
+                break;
+            }
+
+            // Multiply contribution
+            throughput = throughput * attenuation;
+            current_ray = scattered;
+
+            if (depth > 25) {
+
+                // Use luminance-based survival probability
+                double luminance = 0.2126 * throughput.x()
+                                + 0.7152 * throughput.y()
+                                + 0.0722 * throughput.z();
+
+                // Clamp probability range (use std::min/std::max for compatibility)
+                double p = std::min(std::max(luminance, 0.1), 0.95);
+
+                // Terminate with probability 1-p
+                if (random_double() > p)
+                    break;
+
+                // Unbiased estimator
+                throughput /= p;
+            }
         }
 
-        vec3 unit_direction = unit_vector(r.direction());
-        auto a = 0.5*(unit_direction.y() + 1.0);
-        return (1.0-a)*colour(1.0, 1.0, 1.0) + a*colour(0.5, 0.7, 1.0);
+        return result;
     }
 };
 

@@ -6,19 +6,33 @@
 class sphere : public hittable {
 
     public:
-
-        point3 centre;
+        ray centre;
         double radius;
         shared_ptr<material> mat;
+        aabb bbox;
 
-        sphere(const point3& centre, double radius, shared_ptr<material> mat) : centre(centre), radius(std::fmax(0, radius)), mat(mat) {
-            //TODO
+        //Stationary sphere constructor
+        sphere(const point3& static_centre, double radius, shared_ptr<material> mat) : centre(static_centre, vec3(0, 0, 0), 0.0), radius(std::fmax(0, radius)), mat(mat) {
+
+            auto rvec = vec3(radius, radius, radius);
+            bbox = aabb(static_centre - rvec, static_centre + rvec);
+        }
+
+        //Moving sphere constructor
+        sphere(const point3& centre0, const point3& centre1, double radius, shared_ptr<material> mat) : centre(centre0, (centre1 - centre0), 0.0), radius(std::fmax(0, radius)), mat(mat) {
+
+            auto revec = vec3(radius, radius, radius);
+            aabb box0(centre.at(0.0) - revec, centre.at(0.0) + revec);
+            aabb box1(centre.at(1.0) - revec, centre.at(1.0) + revec);
+            bbox = aabb(box0, box1);
         }
 
         bool hit(const ray& r, interval ray_t, hit_record& rec) const override {
 
+            point3 current_centre = centre.at(r.time());
+
             //vector from ray origin to sphere centre
-            vec3 oc = centre - r.origin();
+            vec3 oc = current_centre - r.origin();
 
             //quadratic formula components
             auto a = r.direction().length_squared();
@@ -53,12 +67,19 @@ class sphere : public hittable {
             //record hit information
             rec.t = root;
             rec.p = r.at(rec.t);
-            vec3 outward_normal = (rec.p - centre) / radius;
+            vec3 outward_normal = (rec.p - current_centre) / radius;
             rec.set_face_normal(r, outward_normal);
             rec.mat = mat;
 
             return true;
         }
+
+        aabb bounding_box() const override {
+            return bbox;
+        }
+
+    private:
+        
         
 };
 

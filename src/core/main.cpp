@@ -1,5 +1,6 @@
 #include "../../include/core/dusktracer.h"
 
+#include "../../include/core/BVH.h"
 #include "../../include/core/camera.h"
 #include "../../include/core/editor_camera.h"
 #include "../../include/core/hittable.h"
@@ -9,12 +10,6 @@
 
 #include <fstream>
 #include <cmath>
-
-// Helper: return random integer in [min, max] using existing random_double
-inline int random_int(int min, int max) {
-    // random_double(a, b) is expected to return a double in [a, b)
-    return static_cast<int>(std::floor(random_double(static_cast<double>(min), static_cast<double>(max) + 1.0)));
-}
 
 hittable_list scene(){
 
@@ -141,11 +136,13 @@ int main() {
     
     hittable_list world = scene();
 
+    world = hittable_list(make_shared<bvh_node>(world));
+
     camera cam;
 
     cam.aspect_ratio      = 16.0 / 9.0;
-    cam.image_width       = 1280;
-    cam.samples_per_pixel = 100;
+    cam.image_width       = 1920;
+    cam.samples_per_pixel = 200;
     cam.max_depth         = 50;
 
 
@@ -158,7 +155,6 @@ int main() {
     cam.focus_dist    = 13.0;
 
     std::ofstream file("output.ppm");
-            
     cam.render(world, file);
     
 

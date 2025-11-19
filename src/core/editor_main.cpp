@@ -275,16 +275,10 @@ int main() {
 
             vec3 preview_col(0.8, 0.8, 0.8); // default
 
-            if (auto lam = std::dynamic_pointer_cast<lambertian>(mat))
-                preview_col = lam->albedo;   // lambertian colour
-
-            if (auto metal = std::dynamic_pointer_cast<metal>(mat))
-                preview_col = metal->albedo;
-
             if (auto glass = std::dynamic_pointer_cast<dielectric>(mat))
                 preview_col = vec3(0.5, 0.8, 1.0); // light blue for glass
 
-            preview_spheres.push_back({ sp->centre, sp->radius, preview_col });
+            preview_spheres.emplace_back(sp->centre, sp->radius, preview_col);
         }
     }
 
@@ -319,7 +313,7 @@ int main() {
 
         // Press R to render current camera view (still offline for now)
         if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
-            camera cam = build_duskcam(cam_state, 16.0/9.0, 400, 50, 50);
+            camera cam = build_duskcam(cam_state, 16.0/9.0, 800, 100, 50);
 
             std::ofstream file("output.ppm");
             
