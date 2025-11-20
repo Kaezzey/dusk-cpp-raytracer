@@ -6,6 +6,7 @@
 #include "../../include/core/hittable.h"
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/materials/material.h"
+#include "../../include/core/quad.h"
 #include "../../include/core/sphere.h"
 #include "../../include/core/materials/texture.h"
 
@@ -55,7 +56,7 @@ void bouncing_spheres(){
     auto material2 = make_shared<lambertian>(colour(0.4, 0.2, 0.1));
     world.add(make_shared<sphere>(point3(-4, 1, 0), 1.0, material2));
 
-    auto earth_metal = make_shared<metal>(earth_tex, 0.0);   // polished textured metal
+    auto earth_metal = make_shared<metal>(colour(1.0, 0, 1.0), 0.0);   // polished textured metal
     world.add(make_shared<sphere>(point3(4,1,0), 1.0, earth_metal));
 
     world = hittable_list(make_shared<bvh_node>(world));
@@ -66,6 +67,7 @@ void bouncing_spheres(){
     cam.image_width       = 1080;
     cam.samples_per_pixel = 200;
     cam.max_depth         = 50;
+    cam.background        = colour(0.70, 0.80, 1.00);
 
     cam.vfov     = 20;
     cam.lookfrom = point3(13,2,3);
@@ -97,6 +99,7 @@ void checkered_spheres() {
     cam.image_width       = 400;
     cam.samples_per_pixel = 100;
     cam.max_depth         = 50;
+    cam.background        = colour(0.70, 0.80, 1.00);
 
     cam.vfov     = 20;
     cam.lookfrom = point3(13,2,3);
@@ -122,6 +125,7 @@ void sphere_texture(){
     cam.image_width       = 400;
     cam.samples_per_pixel = 100;
     cam.max_depth         = 50;
+    cam.background        = colour(0.70, 0.80, 1.00);
 
     cam.vfov     = 20;
     cam.lookfrom = point3(13,2,3);
@@ -134,9 +138,147 @@ void sphere_texture(){
     cam.render(world, file);
 }
 
+void perlin_spheres(){
+    hittable_list world;
+
+    auto pertext = make_shared<noise_texture>(4.0);
+    world.add(make_shared<sphere>(point3(0,-1000,0), 1000, make_shared<lambertian>(pertext)));
+    world.add(make_shared<sphere>(point3(0,2,0), 2, make_shared<lambertian>(pertext)));
+
+    world = hittable_list(make_shared<bvh_node>(world));
+
+    camera cam;
+
+    cam.aspect_ratio      = 16.0 / 9.0;
+    cam.image_width       = 400;
+    cam.samples_per_pixel = 100;
+    cam.max_depth         = 50;
+    cam.background        = colour(0.70, 0.80, 1.00);
+
+    cam.vfov     = 20;
+    cam.lookfrom = point3(13,2,3);
+    cam.lookat   = point3(0,0,0);
+    cam.vup      = vec3(0,1,0);
+
+    cam.defocus_angle = 0;
+
+    std::ofstream file("output.ppm");
+
+    cam.render(world, file);
+}
+
+void quads() {
+    hittable_list world;
+
+    // Materials
+    auto left_red     = make_shared<lambertian>(colour(1.0, 0.2, 0.2));
+    auto back_green   = make_shared<lambertian>(colour(0.2, 1.0, 0.2));
+    auto right_blue   = make_shared<lambertian>(colour(0.2, 0.2, 1.0));
+    auto upper_orange = make_shared<lambertian>(colour(1.0, 0.5, 0.0));
+    auto lower_teal   = make_shared<lambertian>(colour(0.2, 0.8, 0.8));
+
+    // Quads
+    world.add(make_shared<quad>(point3(-3,-2, 5), vec3(0, 0,-4), vec3(0, 4, 0), left_red));
+    world.add(make_shared<quad>(point3(-2,-2, 0), vec3(4, 0, 0), vec3(0, 4, 0), back_green));
+    world.add(make_shared<quad>(point3( 3,-2, 1), vec3(0, 0, 4), vec3(0, 4, 0), right_blue));
+    world.add(make_shared<quad>(point3(-2, 3, 1), vec3(4, 0, 0), vec3(0, 0, 4), upper_orange));
+    world.add(make_shared<quad>(point3(-2,-3, 5), vec3(4, 0, 0), vec3(0, 0,-4), lower_teal));
+
+    world = hittable_list(make_shared<bvh_node>(world));
+
+    camera cam;
+
+    cam.aspect_ratio      = 1.0;
+    cam.image_width       = 800;
+    cam.samples_per_pixel = 200;
+    cam.max_depth         = 50;
+    cam.background        = colour(0.70, 0.80, 1.00);
+
+    cam.vfov     = 80;
+    cam.lookfrom = point3(0,0,9);
+    cam.lookat   = point3(0,0,0);
+    cam.vup      = vec3(0,1,0);
+
+    cam.defocus_angle = 0;
+
+    std::ofstream file("output.ppm");
+    cam.render(world, file);
+}
+
+void simple_light() {
+    hittable_list world;
+
+    auto pertext = make_shared<noise_texture>(4);
+    world.add(make_shared<sphere>(point3(0,-1000,0), 1000, make_shared<lambertian>(pertext)));
+    world.add(make_shared<sphere>(point3(0,2,0), 2, make_shared<lambertian>(pertext)));
+
+    auto difflight = make_shared<diffuse_light>(colour(4,4,4));
+    world.add(make_shared<sphere>(point3(0,7,0), 2, difflight));
+    world.add(make_shared<quad>(point3(3,1,-2), vec3(2,0,0), vec3(0,2,0), difflight));
+
+    world = hittable_list(make_shared<bvh_node>(world));
+
+    camera cam;
+
+    cam.aspect_ratio      = 16.0 / 9.0;
+    cam.image_width       = 1920;
+    cam.samples_per_pixel = 200;
+    cam.max_depth         = 50;
+    cam.background        = colour(0,0,0);
+
+    cam.vfov     = 20;
+    cam.lookfrom = point3(26,3,6);
+    cam.lookat   = point3(0,2,0);
+    cam.vup      = vec3(0,1,0);
+
+    cam.defocus_angle = 0;
+
+    std::ofstream file("output.ppm");
+    cam.render(world, file);
+}
+
+void cornell_box() {
+    hittable_list world;
+
+    auto red   = make_shared<lambertian>(colour(.65, .05, .05));
+    auto white = make_shared<lambertian>(colour(.73, .73, .73));
+    auto green = make_shared<lambertian>(colour(.12, .45, .15));
+    auto light = make_shared<diffuse_light>(colour(15, 15, 15));
+
+    world.add(make_shared<quad>(point3(555,0,0), vec3(0,555,0), vec3(0,0,555), green));
+    world.add(make_shared<quad>(point3(0,0,0), vec3(0,555,0), vec3(0,0,555), red));
+    world.add(make_shared<quad>(point3(343, 554, 332), vec3(-130,0,0), vec3(0,0,-105), light));
+    world.add(make_shared<quad>(point3(0,0,0), vec3(555,0,0), vec3(0,0,555), white));
+    world.add(make_shared<quad>(point3(555,555,555), vec3(-555,0,0), vec3(0,0,-555), white));
+    world.add(make_shared<quad>(point3(0,0,555), vec3(555,0,0), vec3(0,555,0), white));
+
+    world.add(box(point3(130, 0, 65), point3(295, 165, 230), white));
+    world.add(box(point3(265, 0, 295), point3(430, 330, 460), white));
+
+    world = hittable_list(make_shared<bvh_node>(world));
+
+    camera cam;
+
+    cam.aspect_ratio      = 1.0;
+    cam.image_width       = 1080;
+    cam.samples_per_pixel = 200;
+    cam.max_depth         = 50;
+    cam.background        = colour(0,0,0);
+
+    cam.vfov     = 40;
+    cam.lookfrom = point3(278, 278, -800);
+    cam.lookat   = point3(278, 278, 0);
+    cam.vup      = vec3(0,1,0);
+
+    cam.defocus_angle = 0;
+
+    std::ofstream file("output.ppm");
+    cam.render(world, file);
+}
+
 int main() {
 
-    int scene = 0;
+    int scene = 6;
 
     switch (scene){
         case 0: bouncing_spheres();
@@ -144,6 +286,14 @@ int main() {
         case 1: checkered_spheres();
             break;
         case 2: sphere_texture();
+            break;
+        case 3: perlin_spheres();
+            break;
+        case 4: quads();
+            break;
+        case 5: simple_light();
+            break;
+        case 6: cornell_box();
             break;
     }
 

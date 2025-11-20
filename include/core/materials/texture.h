@@ -2,6 +2,8 @@
 #define TEXTURE_H
 
 #include "dusk_image.h"
+#include "perlin.h"
+#include "dusk_image.h"
 
 class texture {
   public:
@@ -46,6 +48,19 @@ class checker_texture : public texture {
     double inv_scale;
     shared_ptr<texture> even;
     shared_ptr<texture> odd;
+};
+
+class noise_texture : public texture {
+  public:
+    noise_texture(double scale) : scale(scale) {}
+
+    colour value(double u, double v, const point3& p) const override {
+        return colour(.5, .5, .5) * (1 + std::sin(scale * p.z() + 10 * noise.turb(p, 7)));
+    }
+
+  private:
+    perlin noise;
+    double scale;
 };
 
 class image_texture : public texture {

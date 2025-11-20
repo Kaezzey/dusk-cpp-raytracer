@@ -20,6 +20,8 @@ class camera {
     int samples_per_pixel = 10;
     int max_depth = 10; //max recursion depth for ray tracing
 
+    colour background = colour(0.70, 0.80, 1.00); //default sky color
+
     //vertical field of view in degrees
     double vfov = 90.0; 
 
@@ -54,6 +56,7 @@ class camera {
         std::vector<colour> framebuffer(image_width * image_height);
 
         // ---------- PROGRESS + ETA ----------
+        std::clog << "\x1b[?25l" << std::flush; //hide cursor
         int total_scanlines = image_height;
         std::atomic<int> completed_scanlines{0};
 
@@ -156,6 +159,8 @@ class camera {
 
         std::clog << "\nDone. Total time: "
                 << tm << ":" << (ts < 10 ? "0" : "") << ts << "\n";
+
+        std::clog << "\x1b[?25h" << std::flush; //show cursor again
     }
 
   private:
@@ -273,58 +278,55 @@ class camera {
     }
 
     colour ray_colour(const ray& r0, int max_depth, const hittable& world) const {
-        ray current_ray = r0;
+        ray    current_ray = r0;
         colour throughput(1.0, 1.0, 1.0);
         colour result(0,0,0);
 
-        for (int depth = 0; depth < max_depth; depth++) {
+        for (int depth = 0; depth < max_depth; ++depth) {
 
             hit_record rec;
 
+            // Miss: accumulate background and stop
             if (!world.hit(current_ray, interval(0.001, infinity), rec)) {
-                // Background / sky shading
-                vec3 unit_dir = unit_vector(current_ray.direction());
-                double t = 0.5 * (unit_dir.y() + 1.0);
-                colour sky = (1.0 - t)*colour(1.0, 1.0, 1.0) +
-                            t * colour(0.5, 0.7, 1.0);
-
-                result += throughput * sky;
+                result += throughput * background;
                 break;
             }
 
-            ray scattered;
+            // Emission at the hit point
+            colour emitted = rec.mat->emitted(rec.u, rec.v, rec.p);
+            result += throughput * emitted;
+
+            // Scatter
+            ray    scattered;
             colour attenuation;
-            
+
             if (!rec.mat->scatter(current_ray, rec, attenuation, scattered)) {
-                // Absorbed
+                // No scattering (pure light or absorption) – we're done
                 break;
             }
 
-            // Multiply contribution
+            // Update throughput & ray
             throughput = throughput * attenuation;
             current_ray = scattered;
 
+            // Russian roulette after some depth
             if (depth > 25) {
-
-                // Use luminance-based survival probability
                 double luminance = 0.2126 * throughput.x()
                                 + 0.7152 * throughput.y()
                                 + 0.0722 * throughput.z();
 
-                // Clamp probability range (use std::min/std::max for compatibility)
                 double p = std::min(std::max(luminance, 0.1), 0.95);
 
-                // Terminate with probability 1-p
                 if (random_double() > p)
                     break;
 
-                // Unbiased estimator
                 throughput /= p;
             }
         }
 
         return result;
     }
+
 };
 
 #endif
