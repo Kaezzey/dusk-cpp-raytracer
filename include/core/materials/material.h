@@ -1,7 +1,8 @@
 #ifndef MATERIAL_H
 #define MATERIAL_H
 
-#include "hittable.h"
+#include "../hittable.h"
+#include "texture.h"
 
 inline vec3 refract(const vec3& uv, const vec3& n, double etai_over_etat) {
     double cos_theta = fmin(dot(-uv, n), 1.0);
@@ -23,7 +24,8 @@ class material {
 
 class lambertian : public material {
   public:
-    lambertian(const colour& albedo) : albedo(albedo) {}
+    lambertian(const colour& albedo) : tex(make_shared<solid_colour>(albedo)) {}
+    lambertian(shared_ptr<texture> tex) : tex(tex) {}
 
     bool scatter(const ray& r_in, const hit_record& rec, colour& attenuation, ray& scattered)
     const override {
@@ -33,40 +35,68 @@ class lambertian : public material {
             scatter_direction = rec.normal;
 
         scattered = ray(rec.p, scatter_direction, r_in.time());
-        attenuation = albedo;
+        attenuation = tex->value(rec.u, rec.v, rec.p);
         return true;
     }
 
   private:
-    colour albedo;
+    shared_ptr<texture> tex;
 };
 
 class metal : public material {
   public:
-    metal(const colour& albedo, double fuzz) : albedo(albedo), fuzz(fuzz < 1 ? fuzz : 1) {}
+    // Existing "flat colour" ctor still works
+    metal(const colour& albedo, double fuzz)
+        : tex(make_shared<solid_colour>(albedo)),
+          fuzz(fuzz < 1 ? fuzz : 1) {}
 
-    bool scatter(const ray& r_in, const hit_record& rec, colour& attenuation, ray& scattered)
-    const override {
+    // New: textured metal
+    metal(shared_ptr<texture> tex, double fuzz)
+        : tex(std::move(tex)),
+          fuzz(fuzz < 1 ? fuzz : 1) {}
+
+    bool scatter(const ray& r_in, const hit_record& rec,
+                 colour& attenuation, ray& scattered) const override
+    {
         vec3 reflected = reflect(r_in.direction(), rec.normal);
         reflected = unit_vector(reflected) + (fuzz * random_unit_vector());
         scattered = ray(rec.p, reflected, r_in.time());
-        attenuation = albedo;
+
+        // Sample from the texture instead of a flat colour
+        attenuation = tex->value(rec.u, rec.v, rec.p);
+
         return (dot(scattered.direction(), rec.normal) > 0);
     }
 
   private:
-    colour albedo;
+    shared_ptr<texture> tex;
     double fuzz;
 };
 
 class dielectric : public material {
   public:
-    dielectric(double refraction_index) : refraction_index(refraction_index) {}
+    // Default: clear glass (white attenuation)
+    dielectric(double refraction_index)
+        : refraction_index(refraction_index),
+          tex(make_shared<solid_colour>(colour(1.0, 1.0, 1.0))) {}
 
-    bool scatter(const ray& r_in, const hit_record& rec, colour& attenuation, ray& scattered)
-    const override {
-        attenuation = colour(1.0, 1.0, 1.0);
-        double ri = rec.front_face ? (1.0/refraction_index) : refraction_index;
+    // Coloured glass with flat colour
+    dielectric(double refraction_index, const colour& tint)
+        : refraction_index(refraction_index),
+          tex(make_shared<solid_colour>(tint)) {}
+
+    // Textured “stained” glass
+    dielectric(double refraction_index, shared_ptr<texture> tex)
+        : refraction_index(refraction_index),
+          tex(std::move(tex)) {}
+
+    bool scatter(const ray& r_in, const hit_record& rec,
+                 colour& attenuation, ray& scattered) const override
+    {
+        // Sample attenuation from texture
+        attenuation = tex->value(rec.u, rec.v, rec.p);
+
+        double ri = rec.front_face ? (1.0 / refraction_index) : refraction_index;
 
         vec3 unit_direction = unit_vector(r_in.direction());
         double cos_theta = std::fmin(dot(-unit_direction, rec.normal), 1.0);
@@ -85,12 +115,10 @@ class dielectric : public material {
     }
 
   private:
-    // Refractive index in vacuum or air, or the ratio of the material's refractive index over
-    // the refractive index of the enclosing media
     double refraction_index;
+    shared_ptr<texture> tex;
 
     static double reflectance(double cosine, double refraction_index) {
-        // Use Schlick's approximation for reflectance.
         auto r0 = (1 - refraction_index) / (1 + refraction_index);
         r0 = r0*r0;
         return r0 + (1-r0)*std::pow((1 - cosine),5);

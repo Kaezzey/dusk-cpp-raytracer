@@ -23,3 +23,10 @@ find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
     target_link_libraries(dusktracer PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+# Copy textures into the same folder as the built executable
+add_custom_command(TARGET dusktracer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/textures"
+        "$<TARGET_FILE_DIR:dusktracer>/textures"
+)

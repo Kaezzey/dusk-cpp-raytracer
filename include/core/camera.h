@@ -2,7 +2,7 @@
 #define CAMERA_H
 
 #include "hittable.h"
-#include "material.h"
+#include "materials/material.h"
 #include <cmath>
 #include <algorithm>
 #include <chrono>
