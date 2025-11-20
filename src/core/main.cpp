@@ -252,8 +252,33 @@ void cornell_box() {
     world.add(make_shared<quad>(point3(555,555,555), vec3(-555,0,0), vec3(0,0,-555), white));
     world.add(make_shared<quad>(point3(0,0,555), vec3(555,0,0), vec3(0,555,0), white));
 
-    world.add(box(point3(130, 0, 65), point3(295, 165, 230), white));
-    world.add(box(point3(265, 0, 295), point3(430, 330, 460), white));
+    // ---------------- Tall box ----------------
+    auto tall_box = box(
+        point3(0, 0, 0),
+        point3(165, 330, 165),
+        white
+    );
+
+    world.add(make_shared<transform>(
+        tall_box,
+        vec3(265, 0, 295),   // translation
+        vec3(0, 15, 0),      // rotation (deg): +15° about Y
+        1.0                  // scale
+    ));
+
+    // ---------------- Short box ----------------
+    auto short_box = box(
+        point3(0, 0, 0),
+        point3(165, 165, 165),
+        white
+    );
+
+    world.add(make_shared<transform>(
+        short_box,
+        vec3(130, 0, 65),    // translation
+        vec3(0, -18, 0),     // rotation (deg): -18° about Y
+        1.0                  // scale
+    ));
 
     world = hittable_list(make_shared<bvh_node>(world));
 
