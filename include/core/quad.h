@@ -51,9 +51,13 @@ class quad : public hittable {
 
         rec.t = t;
         rec.p = intersection;
-        rec.mat = mat;
         rec.set_face_normal(r, normal);
 
+        // u and v are your edge vectors for the quad
+        rec.tangent   = unit_vector(u);
+        rec.bitangent = unit_vector(v);
+
+        rec.mat = mat;
         return true;
     }
 

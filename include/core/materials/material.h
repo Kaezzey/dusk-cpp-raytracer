@@ -15,6 +15,7 @@ class material {
   public:
     virtual ~material() = default;
 
+    //emission colour, default black
     virtual colour emitted(double u, double v, const point3& p) const {
         return colour(0,0,0);
     }
@@ -23,6 +24,11 @@ class material {
         const ray& r_in, const hit_record& rec, colour& attenuation, ray& scattered
     ) const {
         return false;
+    }
+
+    //diffuse "base color" hook (used later for direct lighting)
+    virtual colour albedo(const hit_record& rec) const {
+        return colour(1,1,1);
     }
 };
 
@@ -42,6 +48,10 @@ class lambertian : public material {
         attenuation = tex->value(rec.u, rec.v, rec.p);
         return true;
     }
+
+    colour albedo(const hit_record& rec) const override {
+        return tex->value(rec.u, rec.v, rec.p);
+    } 
 
   private:
     shared_ptr<texture> tex;
@@ -70,6 +80,10 @@ class metal : public material {
         attenuation = tex->value(rec.u, rec.v, rec.p);
 
         return (dot(scattered.direction(), rec.normal) > 0);
+    }
+
+    colour albedo(const hit_record& rec) const override {
+        return tex->value(rec.u, rec.v, rec.p);
     }
 
   private:
@@ -118,6 +132,10 @@ class dielectric : public material {
         return true;
     }
 
+    colour albedo(const hit_record& rec) const override {
+        return tex->value(0, 0, 0);
+    }
+
   private:
     double refraction_index;
     shared_ptr<texture> tex;
@@ -138,8 +156,32 @@ class diffuse_light : public material {
         return tex->value(u, v, p);
     }
 
+    colour albedo(const hit_record& rec) const override {
+        return tex->value(0, 0, 0);
+    }
+
   private:
     shared_ptr<texture> tex;
 };
 
-#endif
+class isotropic : public material {
+  public:
+    isotropic(const colour& albedo) : tex(make_shared<solid_colour>(albedo)) {}
+    isotropic(shared_ptr<texture> tex) : tex(tex) {}
+
+    bool scatter(const ray& r_in, const hit_record& rec, colour& attenuation, ray& scattered)
+    const override {
+        scattered = ray(rec.p, random_unit_vector(), r_in.time());
+        attenuation = tex->value(rec.u, rec.v, rec.p);
+        return true;
+    }
+
+    colour albedo(const hit_record& rec) const override {
+        return tex->value(rec.u, rec.v, rec.p);
+    }
+
+  private:
+    shared_ptr<texture> tex;
+};
+
+#endif // MATERIAL_H

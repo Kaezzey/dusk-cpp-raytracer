@@ -16,6 +16,9 @@ class hit_record{
         double v;
         bool front_face;
 
+        vec3 tangent;
+        vec3 bitangent;
+
         void set_face_normal(const ray& r, const vec3& outward_normal){
 
             front_face = dot(r.direction(), outward_normal) < 0;
@@ -116,11 +119,30 @@ class transform : public hittable {
             if (!ptr->hit(r_local, t_range, rec))
                 return false;
 
-            // Transform point + normal back into world space
+            // Transform point
             rec.p = apply(M, rec.p) + t;
 
-            vec3 normal_world = unit_vector(apply(M, rec.normal));
-            rec.set_face_normal(r_in, normal_world);
+            // Transform frame
+            vec3 n_world = unit_vector(apply(M, rec.normal));
+            vec3 t_world = unit_vector(apply(M, rec.tangent));
+            vec3 b_world = unit_vector(apply(M, rec.bitangent));
+
+            rec.normal   = n_world;
+            rec.tangent  = t_world;
+            rec.bitangent = b_world;
+
+            // Re-orient to face the ray
+            rec.set_face_normal(r_in, rec.normal);
+
+            // Rebuild tangent frame to be orthogonal to the final normal
+            vec3 N = rec.normal;
+            rec.tangent = rec.tangent - dot(rec.tangent, N) * N;
+            if (rec.tangent.length_squared() < 1e-6) {
+                vec3 up = (std::fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+                rec.tangent = cross(up, N);
+            }
+            rec.tangent   = unit_vector(rec.tangent);
+            rec.bitangent = cross(N, rec.tangent);
 
             return true;
         }
