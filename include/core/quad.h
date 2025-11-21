@@ -50,12 +50,24 @@ class quad : public hittable {
             return false;
 
         rec.t = t;
-        rec.p = intersection;
+        rec.p = r.at(t);
         rec.set_face_normal(r, normal);
 
-        // u and v are your edge vectors for the quad
-        rec.tangent   = unit_vector(u);
-        rec.bitangent = unit_vector(v);
+        // These are the texture coords a, b they compute
+        rec.u = alpha;   // or rec.u = a;
+        rec.v = beta;    // or rec.v = b;
+
+        // Build TBN
+        vec3 T = u;
+        vec3 B = v;
+        vec3 N = rec.normal;
+
+        // Orthonormalise: Gram–Schmidt to avoid skewed basis
+        T = unit_vector(T - dot(T, N) * N);
+        B = unit_vector(cross(N, T));   // right-handed basis
+
+        rec.tangent   = T;
+        rec.bitangent = B;
 
         rec.mat = mat;
         return true;

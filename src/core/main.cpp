@@ -344,8 +344,21 @@ void final_scene(int image_width, int samples_per_pixel, int max_depth) {
     boundary = make_shared<sphere>(point3(0,0,0), 5000, make_shared<dielectric>(1.5));
     world.add(make_shared<constant_medium>(boundary, .0001, colour(1,1,1)));
 
-    auto emat = make_shared<lambertian>(make_shared<image_texture>("textures/moon.jpg"));
-    world.add(make_shared<sphere>(point3(400,200,400), 100, emat));
+    auto albedo_tex    = make_shared<image_texture>("textures/steel-vented-siding_albedo.png");
+    auto metallic_tex  = make_shared<image_texture>("textures/steel-vented-siding_metallic.png");
+    auto roughness_tex = make_shared<image_texture>("textures/steel-vented-siding_roughness.png");
+    auto normal_tex    = make_shared<image_texture>("textures/steel-vented-siding_normal-ogl.png");
+
+    auto rough = make_shared<pbr_material>(
+        albedo_tex,   // same baseColor
+        metallic_tex,
+        roughness_tex,
+        normal_tex,
+        1.0                     // normal strength          
+    );
+
+    world.add(make_shared<sphere>(point3( 400, 200, 400), 100, rough));
+
     auto pertext = make_shared<noise_texture>(0.2);
     world.add(make_shared<sphere>(point3(220,280,300), 80, make_shared<lambertian>(pertext)));
 
@@ -386,9 +399,62 @@ void final_scene(int image_width, int samples_per_pixel, int max_depth) {
     cam.render(world, file);
 }
 
+void PBR_Scene() {
+    hittable_list world;
+
+    auto checker = make_shared<checker_texture>(0.32, colour(0.2, 0.2, 0.2), colour(.9, .9, .9));
+    world.add(make_shared<sphere>(point3(0,-1000,0), 1000, make_shared<lambertian>(checker)));
+
+    auto difflight = make_shared<diffuse_light>(colour(4,4,4));
+    world.add(make_shared<sphere>(point3(0,7,0), 2, difflight));
+
+    auto albedo_tex    = make_shared<image_texture>("textures/steel-vented-siding_albedo.png");
+    auto metallic_tex  = make_shared<image_texture>("textures/steel-vented-siding_metallic.png");
+    auto roughness_tex = make_shared<image_texture>("textures/steel-vented-siding_roughness.png");
+    auto normal_tex    = make_shared<image_texture>("textures/steel-vented-siding_normal-ogl.png");
+
+    auto shiny = make_shared<pbr_material>(
+        colour(0.8, 0.2, 0.2),   // red
+        0.0,                     // non-metal
+        0.02,
+        nullptr                    // very glossy
+    );
+
+    auto rough = make_shared<pbr_material>(
+        albedo_tex,   // same baseColor
+        metallic_tex,
+        roughness_tex,
+        normal_tex,
+        1.0                     // normal strength          
+    );
+
+    world.add(make_shared<sphere>(point3(-1.5, 1, 0), 1.0, shiny));
+    world.add(make_shared<sphere>(point3( 1.5, 1, 0), 1.0, rough));
+
+    world = hittable_list(make_shared<bvh_node>(world));
+
+    camera cam;
+
+    cam.aspect_ratio      = 16.0 / 9.0;
+    cam.image_width       = 1080;
+    cam.samples_per_pixel = 400;
+    cam.max_depth         = 50;
+    cam.background        = colour(0.70, 0.80, 1.00);
+
+    cam.vfov     = 20;
+    cam.lookfrom = point3(8,2,3);
+    cam.lookat   = point3(2,1,0);
+    cam.vup      = vec3(0,1,0);
+
+    cam.defocus_angle = 0;
+
+    std::ofstream file("output.ppm");
+    cam.render(world, file);
+}
+
 int main() {
 
-    int scene = 7;
+    int scene = 8;
 
     switch (scene){
         case 0: bouncing_spheres();
@@ -405,7 +471,9 @@ int main() {
             break;
         case 6: cornell_box();
             break;
-        case 7: final_scene(800, 150, 50);
+        case 7: final_scene(1920, 150, 50);
+            break;
+        case 8: PBR_Scene();
             break;
     }
 

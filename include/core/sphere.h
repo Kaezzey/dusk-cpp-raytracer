@@ -65,22 +65,27 @@ class sphere : public hittable {
             }
 
             rec.t = root;
-            rec.p = r.at(rec.t);
-            vec3 outward_normal = (rec.p - current_centre) / radius;
-
-            // Orients rec.normal toward the *incoming ray*
+            rec.p = r.at(root);
+            vec3 outward_normal = (rec.p - centre.at(r.time())) / radius;
             rec.set_face_normal(r, outward_normal);
+
             get_sphere_uv(outward_normal, rec.u, rec.v);
 
-            // Build tangent frame from the oriented shading normal
             vec3 N = rec.normal;
-            vec3 up = (std::fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
 
-            rec.tangent   = unit_vector(cross(up, N));
-            rec.bitangent = cross(N, rec.tangent);
+            // Step 1: choose a reference up vector
+            vec3 up = (fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+
+            // Step 2: tangent is perpendicular to N and up
+            vec3 T = unit_vector(cross(up, N));
+
+            // Step 3: bitangent completes the right-handed basis
+            vec3 B = cross(N, T);
+
+            rec.tangent   = T;
+            rec.bitangent = B;
 
             rec.mat = mat;
-
             return true;
         }
 
