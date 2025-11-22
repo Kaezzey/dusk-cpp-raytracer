@@ -432,38 +432,15 @@ void PBR_Scene() {
     );
 
     auto metal_normal = make_shared<pbr_material>(
-        colour(0.6, 0.6, 0.6),   // same baseColor
-        0.0,
-        0.0,
+        albedo_tex,   // same baseColor
+        metallic_tex,
+        roughness_tex,
         normal_tex,
         1.0                     // normal strength          
     );
 
     world.add(make_shared<sphere>(point3(-1.5, 1, 0), 1.0, shiny));
     world.add(make_shared<sphere>(point3( 1.5, 1, 0), 1.0, metal_normal));
-
-    
-    // Quad vertices in world space
-    point3 qv0(3.5, 0.0, -1.0);  // bottom-left
-    point3 qv1(3.5, 2.0, -1.0);  // top-left
-    point3 qv2(3.5, 2.0,  1.0);  // top-right
-    point3 qv3(3.5, 0.0,  1.0);  // bottom-right
-
-    // First triangle (qv0, qv1, qv2)
-    auto tri1 = make_shared<triangle>(
-        qv0, qv1, qv2,
-        0.0, 0.0,   // qv0 UV
-        0.0, 1.0,   // qv1 UV
-        1.0, 1.0,   // qv2 UV
-        metal_normal
-    );
-
-    world.add(make_shared<transform>(
-        tri1,
-        vec3(0, 0, 0),    // translation
-        vec3(30, 90, 0),     // rotation (deg): -18° about Y
-        1.0                  // scale
-    ));
 
 
     world = hittable_list(make_shared<bvh_node>(world));

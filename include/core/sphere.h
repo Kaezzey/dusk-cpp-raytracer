@@ -28,62 +28,44 @@ class sphere : public hittable {
         }
 
         bool hit(const ray& r, interval ray_t, hit_record& rec) const override {
-
             point3 current_centre = centre.at(r.time());
-
-            //vector from ray origin to sphere centre
             vec3 oc = current_centre - r.origin();
-
-            //quadratic formula components
             auto a = r.direction().length_squared();
             auto h = dot(r.direction(), oc);
             auto c = oc.length_squared() - radius * radius;
-
-            //discriminant
             auto discriminant = h * h - a * c;
 
-            //if no real roots, ray misses sphere
-            if (discriminant < 0) {
-                return false;
-            }
-
+            if (discriminant < 0) return false;
             auto sqrtd = std::sqrt(discriminant);
 
-            //find nearest root in acceptable range
             auto root = (h - sqrtd) / a;
-
-            //check if root is within t_min and t_max
             if (!ray_t.surrounds(root)) {
-
-                //try the other root
                 root = (h + sqrtd) / a;
-
-                //check if this root is within t_min and t_max
-                if (!ray_t.surrounds(root)) {
-                    return false;
-                }
+                if (!ray_t.surrounds(root)) return false;
             }
 
             rec.t = root;
             rec.p = r.at(root);
-            vec3 outward_normal = (rec.p - centre.at(r.time())) / radius;
+            vec3 outward_normal = (rec.p - current_centre) / radius;
             rec.set_face_normal(r, outward_normal);
-
+            
+            // 1. GET UVs
             get_sphere_uv(outward_normal, rec.u, rec.v);
 
-            vec3 N = rec.normal;
+            // 2. FIX: Calculate Analytical Tangents for a Sphere
+            // This ensures the Tangent (T) aligns perfectly with the U texture direction
+            // Tangent is derivative of position with respect to phi (horizontal)
+            // T = (-z, 0, x) derived from spherical coords
+            rec.tangent = vec3(-outward_normal.z(), 0.0, outward_normal.x());
+            
+            if (rec.tangent.length_squared() < 1e-8) {
+                rec.tangent = vec3(1,0,0); // Handle poles
+            } else {
+                rec.tangent = unit_vector(rec.tangent);
+            }
 
-            // Step 1: choose a reference up vector
-            vec3 up = (fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
-
-            // Step 2: tangent is perpendicular to N and up
-            vec3 T = unit_vector(cross(up, N));
-
-            // Step 3: bitangent completes the right-handed basis
-            vec3 B = cross(N, T);
-
-            rec.tangent   = T;
-            rec.bitangent = B;
+            // 3. Bitangent
+            rec.bitangent = cross(rec.normal, rec.tangent);
 
             rec.mat = mat;
             return true;
@@ -109,7 +91,6 @@ class sphere : public hittable {
         u = phi / (2*pi);
         v = theta / pi;
     }
-        
         
 };
 

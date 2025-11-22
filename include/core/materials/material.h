@@ -58,6 +58,10 @@ inline vec3 sample_cosine_hemisphere(double xi1, double xi2) {
     return vec3(x, y, z);
 }
 
+inline double luminance(const colour& c) {
+    return clamp01(0.2126*c.x() + 0.7152*c.y() + 0.0722*c.z());
+}
+
 class material {
   public:
     virtual ~material() = default;
@@ -322,14 +326,15 @@ public:
             : colour(1,1,1);
 
         double metallic = metallic_tex
-            ? metallic_tex->value(rec.u, rec.v, rec.p).x()
-            : 0.0;
-        metallic = clamp01(metallic);
+        ? luminance(metallic_tex->value(rec.u, rec.v, rec.p))
+        : 0.0;
 
         double rough = roughness_tex
-            ? roughness_tex->value(rec.u, rec.v, rec.p).x()
-            : 0.5;
-        rough = clamp01(rough);
+        ? luminance(roughness_tex->value(rec.u, rec.v, rec.p))
+        : 0.5;
+
+        metallic = clamp01(metallic);
+        rough    = clamp01(rough);
 
         double alpha = perceptual_to_alpha(rough);
 
@@ -374,14 +379,36 @@ public:
             );
         }
 
+        // --- NEW FIX: GRAZING ANGLE DAMPING ---
+        // As the view angle gets shallower, we fade the normal map out.
+        // This prevents the "Impossible Reflection" paradox before it happens.
+        
+        vec3 view_dir = -unit_vector(r_in.direction());
+        
+        // Calculate how much we are facing the geometry (0.0 = edge, 1.0 = center)
+        double NdotV = std::max(0.0, dot(Ngeom, view_dir));
+        
+        // Fade factor: Start fading when within the last 20% of the edge.
+        // smoothstep helps make it look organic.
+        double strength = NdotV * 5.0; 
+        strength = std::clamp(strength, 0.0, 1.0);
+
+        // Blend the Bumpy Normal (N) into the Safe Geometry Normal (Ngeom)
+        N = unit_vector(N * strength + Ngeom * (1.0 - strength));
+
         vec3 wo = -unit_vector(r_in.direction()); // view dir in world space
 
         // ---------------
         // Lobe selection
         // ---------------
         // Simple heuristic: more metallic = more likely specular
-        double spec_prob = 0.25 + 0.7 * metallic;  // [0.25, 0.95] roughly
-        spec_prob = clamp01(spec_prob);
+        double spec_prob;
+        if (metallic > 0.9) {
+            spec_prob = 1.0;
+        } else {
+            spec_prob = 0.25 + 0.7 * metallic;
+            spec_prob = clamp01(spec_prob);
+        }
 
         double xi_lobe = random_double();
 
@@ -389,38 +416,54 @@ public:
         colour weight;  // BRDF-ish weight used as attenuation
 
         if (xi_lobe < spec_prob) {
-            // --------------------------
-            // Specular GGX reflection
-            // --------------------------
+            // 1. Generate GGX Sample
             double xi1 = random_double();
             double xi2 = random_double();
-
-            // Sample half-vector in local coordinates (around +Z)
             vec3 h_local = sample_ggx_half_vector(alpha, xi1, xi2);
+            vec3 h = unit_vector(h_local.x() * T + h_local.y() * B + h_local.z() * N);
 
-            // Transform to world space using the same T,B,N basis
-            vec3 h = unit_vector(
-                  h_local.x() * T
-                + h_local.y() * B
-                + h_local.z() * N
-            );
-
-            // Reflect wo about h
+            // 2. Calculate Reflection Direction
             wi = reflect(-wo, h);
 
-            // If below the surface, kill the ray
+            // --- HORIZON LIFTING FIX ---
+            
+            // Check: Is this ray pointing "underground" relative to the REAL geometry?
+            double dot_geom = dot(wi, rec.normal);
+            double geometry_shadowing = 1.0; // Default to keeping all light
+
+            if (dot_geom < 0.0) {
+                // 1. Always Lift the ray to avoid pitch-black artifacts
+                // Subtract the underground component so it skids along the surface
+                wi = wi - (dot_geom * rec.normal);
+                wi = unit_vector(wi);
+                
+                // 2. Penalize the energy based on Roughness
+                // The deeper the ray was pointing (dot_geom), the more we darken it.
+                // If Roughness is 0.0 (Mirror), we don't darken at all.
+                // If Roughness is 1.0 (Matte), we darken significantly.
+                
+                // This creates a "Soft Shadow" that removes the dark spots 
+                // but keeps the matte look at the bottom.
+                double lift_amount = -dot_geom; 
+                geometry_shadowing = 1.0 - (rough * lift_amount);
+                geometry_shadowing = std::clamp(geometry_shadowing, 0.0, 1.0);
+            }
+            // -------------------------------------------
+
+            // Safety Check (for the shading normal)
             if (dot(wi, N) <= 0.0) {
-                return false;
+                 wi = reflect(-wo, N);
+                 if (dot(wi, N) <= 0.0) return false;
             }
 
+            // Standard Fresnel & Weight
             double cosTheta = std::max(0.0, dot(wi, N));
             colour F = schlick_fresnel(std::max(0.0, dot(h, wo)), F0);
-
-            // This is not a fully correct BRDF/pdf ratio, but good enough visually:
-            colour spec_col = F;
-            spec_col *= 1.0 / std::max(0.05, spec_prob); // roughly compensate lobe prob
-
-            weight = spec_col;
+            
+            weight = F * (1.0 / std::max(0.001, spec_prob));
+            
+            // 3. Apply the Soft Shadowing Factor
+            weight *= geometry_shadowing;
         } else {
             // --------------------------
             // Diffuse (Lambertian) lobe
