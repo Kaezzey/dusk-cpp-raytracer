@@ -9,6 +9,7 @@
 #include "../../include/core/materials/material.h"
 #include "../../include/core/quad.h"
 #include "../../include/core/sphere.h"
+#include "../../include/core/triangle.h"
 #include "../../include/core/materials/texture.h"
 
 #include <fstream>
@@ -253,11 +254,24 @@ void cornell_box() {
     world.add(make_shared<quad>(point3(555,555,555), vec3(-555,0,0), vec3(0,0,-555), white));
     world.add(make_shared<quad>(point3(0,0,555), vec3(555,0,0), vec3(0,555,0), white));
 
+    auto albedo_tex    = make_shared<image_texture>("textures/steel-vented-siding_albedo.png");
+    auto metallic_tex  = make_shared<image_texture>("textures/steel-vented-siding_metallic.png");
+    auto roughness_tex = make_shared<image_texture>("textures/steel-vented-siding_roughness.png");
+    auto normal_tex    = make_shared<image_texture>("textures/steel-vented-siding_normal-ogl.png");
+
+    auto pbr_metal = make_shared<pbr_material>(
+        albedo_tex,   // same baseColor
+        metallic_tex,
+        roughness_tex,
+        normal_tex,
+        1.0                     // normal strength          
+    );
+
     // ---------------- Tall box ----------------
     auto tall_box = box(
         point3(0, 0, 0),
         point3(165, 330, 165),
-        white
+        pbr_metal
     );
 
     world.add(make_shared<transform>(
@@ -287,7 +301,7 @@ void cornell_box() {
 
     cam.aspect_ratio      = 1.0;
     cam.image_width       = 1080;
-    cam.samples_per_pixel = 200;
+    cam.samples_per_pixel = 150;
     cam.max_depth         = 50;
     cam.background        = colour(0,0,0);
 
@@ -405,9 +419,6 @@ void PBR_Scene() {
     auto checker = make_shared<checker_texture>(0.32, colour(0.2, 0.2, 0.2), colour(.9, .9, .9));
     world.add(make_shared<sphere>(point3(0,-1000,0), 1000, make_shared<lambertian>(checker)));
 
-    auto difflight = make_shared<diffuse_light>(colour(4,4,4));
-    world.add(make_shared<sphere>(point3(0,7,0), 2, difflight));
-
     auto albedo_tex    = make_shared<image_texture>("textures/steel-vented-siding_albedo.png");
     auto metallic_tex  = make_shared<image_texture>("textures/steel-vented-siding_metallic.png");
     auto roughness_tex = make_shared<image_texture>("textures/steel-vented-siding_roughness.png");
@@ -420,16 +431,40 @@ void PBR_Scene() {
         nullptr                    // very glossy
     );
 
-    auto rough = make_shared<pbr_material>(
-        albedo_tex,   // same baseColor
-        metallic_tex,
-        roughness_tex,
+    auto metal_normal = make_shared<pbr_material>(
+        colour(0.6, 0.6, 0.6),   // same baseColor
+        0.0,
+        0.0,
         normal_tex,
         1.0                     // normal strength          
     );
 
     world.add(make_shared<sphere>(point3(-1.5, 1, 0), 1.0, shiny));
-    world.add(make_shared<sphere>(point3( 1.5, 1, 0), 1.0, rough));
+    world.add(make_shared<sphere>(point3( 1.5, 1, 0), 1.0, metal_normal));
+
+    
+    // Quad vertices in world space
+    point3 qv0(3.5, 0.0, -1.0);  // bottom-left
+    point3 qv1(3.5, 2.0, -1.0);  // top-left
+    point3 qv2(3.5, 2.0,  1.0);  // top-right
+    point3 qv3(3.5, 0.0,  1.0);  // bottom-right
+
+    // First triangle (qv0, qv1, qv2)
+    auto tri1 = make_shared<triangle>(
+        qv0, qv1, qv2,
+        0.0, 0.0,   // qv0 UV
+        0.0, 1.0,   // qv1 UV
+        1.0, 1.0,   // qv2 UV
+        metal_normal
+    );
+
+    world.add(make_shared<transform>(
+        tri1,
+        vec3(0, 0, 0),    // translation
+        vec3(30, 90, 0),     // rotation (deg): -18° about Y
+        1.0                  // scale
+    ));
+
 
     world = hittable_list(make_shared<bvh_node>(world));
 
@@ -441,8 +476,8 @@ void PBR_Scene() {
     cam.max_depth         = 50;
     cam.background        = colour(0.70, 0.80, 1.00);
 
-    cam.vfov     = 20;
-    cam.lookfrom = point3(8,2,3);
+    cam.vfov     = 30;
+    cam.lookfrom = point3(6,5,7);
     cam.lookat   = point3(2,1,0);
     cam.vup      = vec3(0,1,0);
 
@@ -450,6 +485,10 @@ void PBR_Scene() {
 
     std::ofstream file("output.ppm");
     cam.render(world, file);
+}
+
+void model_Scene(){
+    // To be implemented: Load and render a 3D model with PBR materials
 }
 
 int main() {
@@ -471,9 +510,11 @@ int main() {
             break;
         case 6: cornell_box();
             break;
-        case 7: final_scene(1920, 150, 50);
+        case 7: final_scene(1920, 9000, 50);
             break;
         case 8: PBR_Scene();
+            break;
+        case 9: model_Scene();
             break;
     }
 

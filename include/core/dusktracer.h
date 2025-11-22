@@ -6,7 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
-
+#include <algorithm>
 #include <cstdint>
 #include <thread>
 #include <functional>
