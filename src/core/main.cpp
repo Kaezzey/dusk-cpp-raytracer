@@ -11,7 +11,9 @@
 #include "../../include/core/sphere.h"
 #include "../../include/core/triangle.h"
 #include "../../include/core/materials/texture.h"
+#include "../../include/core/mesh_loader.h"
 
+#include <unordered_map>
 #include <fstream>
 #include <cmath>
 
@@ -419,10 +421,10 @@ void PBR_Scene() {
     auto checker = make_shared<checker_texture>(0.32, colour(0.2, 0.2, 0.2), colour(.9, .9, .9));
     world.add(make_shared<sphere>(point3(0,-1000,0), 1000, make_shared<lambertian>(checker)));
 
-    auto albedo_tex    = make_shared<image_texture>("textures/rustediron2_basecolor.png");
-    auto metallic_tex  = make_shared<image_texture>("textures/rustediron2_metallic.png");
-    auto roughness_tex = make_shared<image_texture>("textures/rustediron2_roughness.png");
-    auto normal_tex    = make_shared<image_texture>("textures/rustediron2_normal.png");
+    auto albedo_tex    = make_shared<image_texture>("textures/rusted-panels_albedo.png");
+    auto metallic_tex  = make_shared<image_texture>("textures/rusted-panels_metallic.png");
+    auto roughness_tex = make_shared<image_texture>("textures/rusted-panels_roughness.png");
+    auto normal_tex    = make_shared<image_texture>("textures/rusted-panels_normal-ogl.png");
 
     auto shiny = make_shared<pbr_material>(
         colour(0.8, 0.2, 0.2),   // red
@@ -465,12 +467,117 @@ void PBR_Scene() {
 }
 
 void model_Scene(){
-    // To be implemented: Load and render a 3D model with PBR materials
+    
+    hittable_list world;
+
+    auto checker = make_shared<checker_texture>(0.32, colour(0.2, 0.2, 0.2), colour(.9, .9, .9));
+    world.add(make_shared<sphere>(point3(0,-1000,0), 1000, make_shared<lambertian>(checker)));
+
+    auto legs_albedo_tex    = make_shared<image_texture>("models/Legs_Base_color.png");
+    auto legs_metallic_tex  = make_shared<image_texture>("models/Legs_Metallic.png");
+    auto legs_roughness_tex = make_shared<image_texture>("models/Legs_Roughness.png");
+    auto legs_normal_tex    = make_shared<image_texture>("models/Legs_Normal_OpenGL.png");
+
+    auto chest_albedo_tex    = make_shared<image_texture>("models/Chest_Base_color.png");
+    auto chest_metallic_tex  = make_shared<image_texture>("models/Chest_Metallic.png");
+    auto chest_roughness_tex = make_shared<image_texture>("models/Chest_Roughness.png");
+    auto chest_normal_tex    = make_shared<image_texture>("models/Chest_Normal_OpenGL.png");
+
+    auto arms_albedo_tex    = make_shared<image_texture>("models/Arms_Base_color.png");
+    auto arms_metallic_tex  = make_shared<image_texture>("models/Arms_Metallic.png");
+    auto arms_roughness_tex = make_shared<image_texture>("models/Arms_Roughness.png");
+    auto arms_normal_tex    = make_shared<image_texture>("models/Arms_Normal_OpenGL.png");
+
+    auto helmet_albedo_tex    = make_shared<image_texture>("models/Helmet_Base_color.png");
+    auto helmet_metallic_tex  = make_shared<image_texture>("models/Helmet_Metallic.png");
+    auto helmet_roughness_tex = make_shared<image_texture>("models/Helmet_Roughness.png");
+    auto helmet_normal_tex    = make_shared<image_texture>("models/Helmet_Normal_OpenGL.png");
+
+    auto legs_mat = make_shared<pbr_material>(
+        legs_albedo_tex,   
+        legs_metallic_tex,
+        legs_roughness_tex,
+        legs_normal_tex,
+        1.0                     
+    );
+
+    auto chest_mat = make_shared<pbr_material>(
+        chest_albedo_tex,   
+        chest_metallic_tex,
+        chest_roughness_tex,
+        chest_normal_tex,
+        1.0                     
+    );
+
+    auto arms_mat = make_shared<pbr_material>(
+        arms_albedo_tex,   
+        arms_metallic_tex,
+        arms_roughness_tex,
+        arms_normal_tex,
+        1.0                     
+    );
+
+    auto helmet_mat = make_shared<pbr_material>(
+        helmet_albedo_tex,   
+        helmet_metallic_tex,
+        helmet_roughness_tex,
+        helmet_normal_tex,
+        1.0                     
+    );
+
+    auto difflight = make_shared<diffuse_light>(colour(5,5,5));
+    world.add(make_shared<sphere>(point3(0,2,5), 2, difflight));
+
+
+    std::unordered_map<std::string, std::shared_ptr<material>> material_map;
+
+    material_map["Legs"]   = legs_mat;
+    material_map["Chest"]  = chest_mat;
+    material_map["Arms"]   = arms_mat;
+    material_map["Helmet"] = helmet_mat;
+
+    auto body_mat = make_shared<lambertian>(colour(0.8, 0.1, 0.1));
+
+    auto default_mat = body_mat;
+
+    std::shared_ptr<hittable_list> mesh_tris;
+
+    try {
+        mesh_tris = load_mesh_as_triangles("models/AtlastedMKIV.fbx", material_map, default_mat, true, true, 1.5);
+    } catch (const std::exception& e) {
+        std::cerr << "Mesh load failed: " << e.what() << "\n";
+    }
+
+    auto mesh_bvh = std::make_shared<bvh_node>(
+        mesh_tris->objects,
+        0,
+        mesh_tris->objects.size()
+    );
+
+    world.add(mesh_bvh);
+
+    camera cam;
+
+    cam.aspect_ratio      = 16.0 / 9.0;
+    cam.image_width       = 1080;
+    cam.samples_per_pixel = 150;
+    cam.max_depth         = 50;
+    cam.background        = colour(0.70, 0.80, 1.00);
+
+    cam.vfov     = 16;
+    cam.lookfrom = point3(2.5, 1.5, 0);
+    cam.lookat   = point3(0, 1.3, 0);
+    cam.vup      = vec3(0,1,0);
+
+    cam.defocus_angle = 0;
+
+    std::ofstream file("output.ppm");
+    cam.render(world, file);
 }
 
 int main() {
 
-    int scene = 7;
+    int scene = 9;
 
     switch (scene){
         case 0: bouncing_spheres();
