@@ -42,6 +42,11 @@ class camera {
     enum sampling_method_e { RANDOM_SAMPLES = 0, HALTON_SAMPLES = 1 };
     sampling_method_e sampling_method = HALTON_SAMPLES;
 
+    bool   use_sun = false;
+    vec3   sun_dir = vec3(0,0,0);
+    colour sun_radiance = colour(0,0,0);
+    double sun_angular_radius = 0.0;
+
     void render(const hittable& world, std::ostream& out = std::cout){
         
         initialize();
@@ -304,6 +309,33 @@ class camera {
                 // No scattering (pure light or absorption) – we're done
                 break;
             }
+
+            //reimplement later
+            // if (use_sun) {
+
+            //     vec3 L = unit_vector(sun_dir);
+            //     double NdotL = dot(rec.normal, L);
+
+            //     if (NdotL > 0.0) {
+
+            //         // IMPORTANT: ray has THREE args: origin, dir, time
+            //         ray shadow_ray(
+            //             rec.p + rec.normal * 0.001,
+            //             L,
+            //             current_ray.time()
+            //         );
+
+            //         hit_record shadow_rec;
+
+            //         if (!world.hit(shadow_ray, interval(0.001, infinity), shadow_rec)) {
+
+            //             colour base = rec.mat->albedo(rec);
+            //             colour direct = base * sun_radiance * (NdotL / pi);
+
+            //             result += throughput * direct;
+            //         }
+            //     }
+            // }
 
             // Update throughput & ray
             throughput = throughput * attenuation;

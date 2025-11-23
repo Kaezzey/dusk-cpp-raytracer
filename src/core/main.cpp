@@ -10,6 +10,7 @@
 #include "../../include/core/quad.h"
 #include "../../include/core/sphere.h"
 #include "../../include/core/triangle.h"
+#include "../../include/core/sun.h"
 #include "../../include/core/materials/texture.h"
 #include "../../include/core/mesh_loader.h"
 
@@ -470,6 +471,9 @@ void model_Scene(){
     
     hittable_list world;
 
+    auto difflight = make_shared<diffuse_light>(colour(5, 5, 5));
+    world.add(make_shared<sphere>(point3(2,5,2), 2, difflight));
+
     auto checker = make_shared<checker_texture>(0.32, colour(0.2, 0.2, 0.2), colour(.9, .9, .9));
     world.add(make_shared<sphere>(point3(0,-1000,0), 1000, make_shared<lambertian>(checker)));
 
@@ -525,10 +529,6 @@ void model_Scene(){
         1.0                     
     );
 
-    auto difflight = make_shared<diffuse_light>(colour(5,5,5));
-    world.add(make_shared<sphere>(point3(0,2,5), 2, difflight));
-
-
     std::unordered_map<std::string, std::shared_ptr<material>> material_map;
 
     material_map["Legs"]   = legs_mat;
@@ -564,8 +564,8 @@ void model_Scene(){
     cam.max_depth         = 50;
     cam.background        = colour(0.70, 0.80, 1.00);
 
-    cam.vfov     = 16;
-    cam.lookfrom = point3(2.5, 1.5, 0);
+    cam.vfov     = 20;
+    cam.lookfrom = point3(2, 1.5, 0);
     cam.lookat   = point3(0, 1.3, 0);
     cam.vup      = vec3(0,1,0);
 
