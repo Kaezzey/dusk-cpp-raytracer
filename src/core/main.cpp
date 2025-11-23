@@ -358,10 +358,10 @@ void final_scene(int image_width, int samples_per_pixel, int max_depth) {
     boundary = make_shared<sphere>(point3(0,0,0), 5000, make_shared<dielectric>(1.5));
     world.add(make_shared<constant_medium>(boundary, .0001, colour(1,1,1)));
 
-    auto albedo_tex    = make_shared<image_texture>("textures/steel-vented-siding_albedo.png");
-    auto metallic_tex  = make_shared<image_texture>("textures/steel-vented-siding_metallic.png");
-    auto roughness_tex = make_shared<image_texture>("textures/steel-vented-siding_roughness.png");
-    auto normal_tex    = make_shared<image_texture>("textures/steel-vented-siding_normal-ogl.png");
+    auto albedo_tex    = make_shared<image_texture>("textures/rusted-panels_albedo.png");
+    auto metallic_tex  = make_shared<image_texture>("textures/rusted-panels_metallic.png");
+    auto roughness_tex = make_shared<image_texture>("textures/rusted-panels_roughness.png");
+    auto normal_tex    = make_shared<image_texture>("textures/rusted-panels_normal-ogl.png");
 
     auto rough = make_shared<pbr_material>(
         albedo_tex,   // same baseColor
@@ -419,10 +419,10 @@ void PBR_Scene() {
     auto checker = make_shared<checker_texture>(0.32, colour(0.2, 0.2, 0.2), colour(.9, .9, .9));
     world.add(make_shared<sphere>(point3(0,-1000,0), 1000, make_shared<lambertian>(checker)));
 
-    auto albedo_tex    = make_shared<image_texture>("textures/steel-vented-siding_albedo.png");
-    auto metallic_tex  = make_shared<image_texture>("textures/steel-vented-siding_metallic.png");
-    auto roughness_tex = make_shared<image_texture>("textures/steel-vented-siding_roughness.png");
-    auto normal_tex    = make_shared<image_texture>("textures/steel-vented-siding_normal-ogl.png");
+    auto albedo_tex    = make_shared<image_texture>("textures/rustediron2_basecolor.png");
+    auto metallic_tex  = make_shared<image_texture>("textures/rustediron2_metallic.png");
+    auto roughness_tex = make_shared<image_texture>("textures/rustediron2_roughness.png");
+    auto normal_tex    = make_shared<image_texture>("textures/rustediron2_normal.png");
 
     auto shiny = make_shared<pbr_material>(
         colour(0.8, 0.2, 0.2),   // red
@@ -470,7 +470,7 @@ void model_Scene(){
 
 int main() {
 
-    int scene = 8;
+    int scene = 7;
 
     switch (scene){
         case 0: bouncing_spheres();
@@ -487,7 +487,7 @@ int main() {
             break;
         case 6: cornell_box();
             break;
-        case 7: final_scene(1920, 9000, 50);
+        case 7: final_scene(800, 140, 50);
             break;
         case 8: PBR_Scene();
             break;
