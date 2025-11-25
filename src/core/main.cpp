@@ -3,7 +3,6 @@
 #include "../../include/core/BVH.h"
 #include "../../include/core/camera.h"
 #include "../../include/core/constant_medium.h"
-#include "../../include/core/editor_camera.h"
 #include "../../include/core/hittable.h"
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/materials/material.h"
