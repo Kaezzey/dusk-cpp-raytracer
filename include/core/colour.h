@@ -1,36 +1,43 @@
 #ifndef COLOUR_H
 #define COLOUR_H
 
-#include "interval.h"
+#include <iostream>
+#include <cmath>
+
 #include "vec3.h"
 
+// Alias
 using colour = vec3;
 
-inline double linear_to_gamma(double linear_component){
-    //sRGB gamma correction
-    if (linear_component <= 0.0031308){
-        return 12.92 * linear_component;
-    } else {
-        return 1.055 * std::pow(linear_component, 1.0/2.4) - 0.055;
-    }
+// Gamma correction helper (gamma 2.0)
+inline double linear_to_gamma(double linear_component) {
+    if (linear_component <= 0.0) return 0.0;
+    return std::sqrt(linear_component);
 }
 
-void write_colour(std::ostream& out, const colour& pixel_colour){
+// Simple clamp to [0.0, 0.999]
+inline double clamp01_999(double x) {
+    if (x < 0.0)   return 0.0;
+    if (x > 0.999) return 0.999;
+    return x;
+}
+
+// Write a colour to an output stream with gamma correction and [0,255] clamp
+inline void write_colour(std::ostream& out, const colour& pixel_colour) {
     auto r = pixel_colour.x();
     auto g = pixel_colour.y();
     auto b = pixel_colour.z();
-    
-    //apply gamma correction
+
+    // gamma-correct from linear space
     r = linear_to_gamma(r);
     g = linear_to_gamma(g);
     b = linear_to_gamma(b);
 
-    static const interval intensity(0.000, 0.999);
-    int rbyte = int(256 * intensity.clamp(r));
-    int gbyte = int(256 * intensity.clamp(g));    
-    int bbyte = int(256 * intensity.clamp(b));
+    int ir = static_cast<int>(256 * clamp01_999(r));
+    int ig = static_cast<int>(256 * clamp01_999(g));
+    int ib = static_cast<int>(256 * clamp01_999(b));
 
-    out << rbyte << ' ' << gbyte << ' ' << bbyte << '\n';
+    out << ir << ' ' << ig << ' ' << ib << '\n';
 }
 
-#endif //COLOUR_H
+#endif // COLOUR_H

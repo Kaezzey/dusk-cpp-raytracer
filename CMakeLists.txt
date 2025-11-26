@@ -12,7 +12,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # Sources
 file(GLOB_RECURSE DUSK_SOURCES CONFIGURE_DEPENDS
-    "src/core/main.cpp"
+    "src/core/*.cpp"
 )
 
 add_executable(dusktracer ${DUSK_SOURCES})

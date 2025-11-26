@@ -1,6 +1,9 @@
 #ifndef VEC3_H
 #define VEC3_H
 
+#include <cmath>        
+#include <iostream>   
+#include "../../include/core/dusktracer.h" 
 
 class vec3 {
     public:

@@ -1,6 +1,8 @@
 #ifndef INTERVAL_H
 #define INTERVAL_H
 
+#include "../../include/core/dusktracer.h"
+
 class interval {
   public:
     double min, max;
@@ -43,15 +45,11 @@ class interval {
     static const interval empty, universe;
 };
 
-//static constant intervals
-const interval interval::empty    = interval(+infinity, -infinity);
-const interval interval::universe = interval(-infinity, +infinity);
-
-interval operator+(const interval& ival, double displacement) {
+inline interval operator+(const interval& ival, double displacement) {
     return interval(ival.min + displacement, ival.max + displacement);
 }
 
-interval operator+(double displacement, const interval& ival) {
+inline interval operator+(double displacement, const interval& ival) {
     return ival + displacement;
 }
 

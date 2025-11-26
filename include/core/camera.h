@@ -9,9 +9,13 @@
 #include <vector>
 #include <atomic>
 
+class renderer;
+
 class camera {
 
   public:
+    friend class renderer;
+
     //ratio of image width over height
     double aspect_ratio = 1.0; 
     

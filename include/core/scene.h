@@ -1,22 +1,85 @@
-#ifndef SCENE_H
-#define SCENE_H
+#ifndef DUSK_SCENE_H
+#define DUSK_SCENE_H
 
-#include "hittable.h"
-#include "hittable_list.h"
-#include "material.h"
-#include "texture.h"
+#include <string>
+#include <vector>
 #include <memory>
 
-class scene {
-public:
-    std::shared_ptr<hittable> world;   // usually a hittable_list or BVH root
-    colour background = colour(0.70, 0.80, 1.00);
+#include "vec3.h"    // for vec3 / point3
 
-    scene() = default;
+// Forward declaration: we don't need full definition here
+class texture;
 
-    scene(std::shared_ptr<hittable> world_in,
-          const colour& background_in = colour(0.70, 0.80, 1.00))
-        : world(std::move(world_in)), background(background_in) {}
+// ----------------------------------------
+// Material “model” types the editor can pick
+// ----------------------------------------
+enum class scene_material_model {
+    lambert,
+    metal,
+    dielectric,
+    diffuse_light,
+    isotropic,
+    pbr          // uses your pbr_material class
 };
 
-#endif
+// ----------------------------------------
+// Editor-facing material description
+// ----------------------------------------
+struct scene_material {
+    std::string name;
+    scene_material_model model = scene_material_model::lambert;
+
+    // --- Shared scalar parameters ---
+    vec3  base_color      = vec3(0.8, 0.8, 0.8);    // lambert/metal/pbr/etc.
+    double metallic       = 0.0;                    // [0,1] PBR
+    double roughness      = 0.5;                    // [0,1] PBR
+    double fuzz           = 0.0;                    // metal fuzz
+    double ior            = 1.5;                    // dielectric IOR
+    vec3  emission        = vec3(0, 0, 0);          // diffuse_light color
+    vec3  dielectric_F0   = vec3(0.04, 0.04, 0.04); // PBR dielectric F0
+    double normal_strength = 1.0;                   // PBR normal strength
+
+    // --- Textures (editor fills these) ---
+    // If nullptr, fall back to scalar params.
+    std::shared_ptr<texture> base_tex      = nullptr;
+    std::shared_ptr<texture> metallic_tex  = nullptr;  // greyscale [0,1]
+    std::shared_ptr<texture> roughness_tex = nullptr;  // greyscale [0,1]
+    std::shared_ptr<texture> normal_tex    = nullptr;  // tangent-space normal
+};
+
+// ----------------------------------------
+// Geometry types
+// ----------------------------------------
+enum class scene_object_type {
+    sphere,
+    // TODO: mesh, triangle, instanced model, etc.
+};
+
+// ----------------------------------------
+// Editor-facing object description
+// ----------------------------------------
+struct scene_object {
+    std::string name;
+    scene_object_type type = scene_object_type::sphere;
+
+    int material_index = -1;   // index into scene.materials
+
+    // Sphere params (used when type == sphere)
+    point3 center = point3(0,0,0);
+    double radius = 0.5;
+};
+
+// ----------------------------------------
+// Whole scene: what the editor owns
+// ----------------------------------------
+struct scene {
+    std::vector<scene_material> materials;
+    std::vector<scene_object>   objects;
+};
+
+// Forward-declare hittable_list, then provide the builder
+class hittable_list;
+
+hittable_list build_world_from_scene(const scene& scn);
+
+#endif // DUSK_SCENE_H
