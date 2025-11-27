@@ -3,7 +3,7 @@
 
 #include <cmath>        
 #include <iostream>   
-#include "../../include/core/dusktracer.h" 
+#include "dusktracer.h" 
 
 class vec3 {
     public:

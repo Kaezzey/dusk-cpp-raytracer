@@ -8,6 +8,7 @@
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/image_io.h"
 #include "../../include/core/editor_camera.h"
+#include "../../include/core/editor_scene.h"
 
 int main() {
     scene scn;

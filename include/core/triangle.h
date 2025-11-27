@@ -2,6 +2,9 @@
 #define TRIANGLE_H
 
 #include "hittable.h"
+#include "BVH.h"
+#include "AABB.h"
+#include "vec3.h"
 
 inline void compute_triangle_tangent_bitangent(
     const point3& p0, const point3& p1, const point3& p2,
