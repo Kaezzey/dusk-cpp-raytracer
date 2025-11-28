@@ -8,10 +8,12 @@
 #include "vec3.h"    // for vec3 / point3
 
 // Forward declarations
-class texture;
 class material;
 class hittable;
 class hittable_list;
+
+// Forward declare scene so we can reference it in build_rt_material.
+struct scene;
 
 // ----------------------------------------
 // Material “model” types the editor can pick
@@ -23,6 +25,16 @@ enum class scene_material_model {
     diffuse_light,
     isotropic,
     pbr          // uses your pbr_material class
+};
+
+// ----------------------------------------
+// Texture asset owned by the scene
+// ----------------------------------------
+// The editor will manage this list (add/remove, rename, etc.);
+// materials just hold indices into this array.
+struct scene_texture {
+    std::string name;  // UI/display name, e.g. "Rust_Albedo"
+    std::string path;  // file path on disk, e.g. "textures/rust_albedo.png"
 };
 
 // ----------------------------------------
@@ -42,16 +54,18 @@ struct scene_material {
     vec3   dielectric_F0    = vec3(0.04, 0.04, 0.04); // PBR dielectric F0
     double normal_strength  = 1.0;                    // PBR normal strength
 
-    // --- Textures (editor fills these) ---
-    // If nullptr, fall back to scalar params.
-    std::shared_ptr<texture> base_tex      = nullptr;
-    std::shared_ptr<texture> metallic_tex  = nullptr;  // greyscale [0,1]
-    std::shared_ptr<texture> roughness_tex = nullptr;  // greyscale [0,1]
-    std::shared_ptr<texture> normal_tex    = nullptr;  // tangent-space normal
+    // --- Texture bindings (indices into scene.textures) ---
+    // -1 = no texture; renderer should fall back to scalar params above.
+    int albedo_tex    = -1;   // base color map
+    int metallic_tex  = -1;   // greyscale in [0,1]
+    int roughness_tex = -1;   // greyscale in [0,1]
+    int normal_tex    = -1;   // tangent-space normal map
 };
 
 // Convert an editor-facing scene_material into a runtime material*
-std::shared_ptr<material> build_rt_material(const scene_material& desc);
+// using the scene's texture list (scene.textures[...] indices).
+std::shared_ptr<material> build_rt_material(const scene& scn,
+                                            const scene_material& desc);
 
 // ----------------------------------------
 // Geometry types
@@ -120,10 +134,13 @@ struct scene_light {
 // Whole scene: what the editor owns
 // ----------------------------------------
 struct scene {
-    std::vector<scene_material>   materials;
-    std::vector<scene_object>     objects;
+    // NEW: texture assets
+    std::vector<scene_texture>   textures;  // texture library for this scene
+
+    std::vector<scene_material>  materials;
+    std::vector<scene_object>    objects;
     std::vector<scene_mesh_asset> meshes;   // mesh assets (FBX/OBJ etc.)
-    std::vector<scene_light>      lights;   // lights in the scene
+    std::vector<scene_light>     lights;    // lights in the scene
 };
 
 // Convert editor scene into runtime hittables for the renderer.

@@ -47,6 +47,9 @@ static float g_camera_look_sens  = 0.2f;   // mouse sensitivity
 // Currently selected object in the Scene Hierarchy (-1 = none)
 static int g_selected_object = -1;
 
+// List of files dropped onto the GLFW window this frame
+static std::vector<std::string> g_dropped_files;
+
 // -----------------------------------------------------------------------------
 // GPU texture for displaying the ray-traced image
 // -----------------------------------------------------------------------------
@@ -69,6 +72,7 @@ static void glfw_error_callback(int error, const char* description)
 // Build a simple test scene using your scene.h material/object system
 static void build_default_scene(scene& scn)
 {
+    scn.textures.clear();   // Start with NO textures – users will drag & drop
     scn.materials.clear();
     scn.objects.clear();
     scn.meshes.clear();
@@ -98,13 +102,22 @@ static void build_default_scene(scene& scn)
 
     int pbr_metal_mat = (int)scn.materials.size();
     scn.materials.push_back({});
-    scn.materials.back().name            = "PBR Metal";
-    scn.materials.back().model           = scene_material_model::pbr;
-    scn.materials.back().base_color      = colour(0.8, 0.6, 0.2);
-    scn.materials.back().metallic        = 1.0;
-    scn.materials.back().roughness       = 0.2;
-    scn.materials.back().normal_strength = 1.0;
-    scn.materials.back().dielectric_F0   = colour(0.04, 0.04, 0.04);
+    {
+        auto& m = scn.materials.back();
+        m.name            = "PBR Metal";
+        m.model           = scene_material_model::pbr;
+        m.base_color      = colour(0.8, 0.6, 0.2);
+        m.metallic        = 1.0;
+        m.roughness       = 0.2;
+        m.normal_strength = 1.0;
+        m.dielectric_F0   = colour(0.04, 0.04, 0.04);
+
+        // No default textures bound – user must assign via drag & drop
+        m.albedo_tex    = -1;
+        m.metallic_tex  = -1;
+        m.roughness_tex = -1;
+        m.normal_tex    = -1;
+    }
 
     // -------------------------
     // Spheres
@@ -187,6 +200,7 @@ static void init_engine_once()
     // Ray-tracer camera base params
     g_camera.aspect_ratio      = 16.0 / 9.0;
     g_camera.image_width       = 800;
+    g_camera.image_height      = 450; // keep consistent with aspect ratio
     g_camera.samples_per_pixel = 20;   // default sampling
     g_camera.max_depth         = 20;   // default bounce depth
     g_camera.background        = colour(0.70, 0.80, 1.00);
@@ -203,8 +217,6 @@ static void sync_camera_from_editor(float viewport_width, float viewport_height)
     if (viewport_width > 0.0f && viewport_height > 0.0f) {
         g_camera.aspect_ratio = viewport_width / viewport_height;
     }
-
-    // Resolution binding could go here later if you want.
 
     to_shirley_camera(g_editor_cam, g_camera);
 }
@@ -334,6 +346,52 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
     }
 }
 
+// GLFW file-drop callback: collects dropped file paths
+static void glfw_drop_callback(GLFWwindow* /*window*/, int count, const char** paths)
+{
+    for (int i = 0; i < count; ++i) {
+        if (paths[i]) {
+            g_dropped_files.emplace_back(paths[i]);
+        }
+    }
+}
+
+// Turn any newly dropped files into scene textures
+static void process_dropped_files()
+{
+    if (g_dropped_files.empty())
+        return;
+
+    for (const std::string& full_path : g_dropped_files) {
+        // Derive a nice texture name from the filename
+        std::string name = full_path;
+
+        // Strip directory
+        size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) {
+            name = name.substr(slash + 1);
+        }
+
+        // Strip extension
+        size_t dot = name.find_last_of('.');
+        if (dot != std::string::npos) {
+            name = name.substr(0, dot);
+        }
+
+        scene_texture tex;
+        tex.name = name;
+        tex.path = full_path;  // use absolute path from OS
+
+        g_scene.textures.push_back(std::move(tex));
+
+        std::printf("Imported texture: %s (%s)\n",
+                    g_scene.textures.back().name.c_str(),
+                    g_scene.textures.back().path.c_str());
+    }
+
+    g_dropped_files.clear();
+}
+
 // -----------------------------------------------------------------------------
 // main
 // -----------------------------------------------------------------------------
@@ -363,6 +421,8 @@ int main()
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // vsync
+
+    glfwSetDropCallback(window, glfw_drop_callback);
 
     // GLEW init (after context)
     glewExperimental = GL_TRUE;
@@ -410,6 +470,8 @@ int main()
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
+
+        process_dropped_files();
 
         double current_time = glfwGetTime();
         double dt = current_time - last_time;
@@ -489,6 +551,27 @@ int main()
         ImGui::End();
 
         // -------------------------------------------------
+        // Textures window (drag sources)
+        // -------------------------------------------------
+        ImGui::Begin("Textures");
+        ImGui::Text("Drag textures onto PBR slots.");
+        ImGui::Separator();
+
+        for (int i = 0; i < (int)g_scene.textures.size(); ++i) {
+            auto& tex = g_scene.textures[i];
+            ImGui::Selectable(tex.name.c_str());
+            if (ImGui::BeginDragDropSource()) {
+                ImGui::SetDragDropPayload("TEXTURE_ASSET_ID", &i, sizeof(int));
+                ImGui::Text("Texture: %s", tex.name.c_str());
+                ImGui::EndDragDropSource();
+            }
+        }
+        if (g_scene.textures.empty()) {
+            ImGui::TextDisabled("No textures in scene.");
+        }
+        ImGui::End();
+
+        // -------------------------------------------------
         // Inspector
         // -------------------------------------------------
         ImGui::Begin("Inspector");
@@ -523,7 +606,7 @@ int main()
         }
 
         // -------------------------------------------------
-        // Render Settings (sampling)
+        // Render Settings (sampling + resolution)
         // -------------------------------------------------
         ImGui::Separator();
         ImGui::Text("Render Settings");
@@ -558,6 +641,8 @@ int main()
         if (ImGui::Button("Apply Resolution")) {
             g_camera.image_width  = res_w;
             g_camera.image_height = res_h;
+            // you can also update aspect here if you want:
+            // g_camera.aspect_ratio = (float)res_w / (float)res_h;
         }
         ImGui::TextDisabled("Changes take effect next render.");
 
@@ -588,7 +673,6 @@ int main()
             ImGui::Separator();
             ImGui::Text("Material Binding");
 
-            // -------- Material index combo (which material this object uses) --------
             int current_mat = obj.material_index;
             if (current_mat < 0 || current_mat >= (int)g_scene.materials.size()) {
                 current_mat = -1;
@@ -602,7 +686,6 @@ int main()
             if (ImGui::BeginCombo("Material", current_label)) {
                 for (int i = 0; i < (int)g_scene.materials.size(); ++i) {
                     bool is_sel = (i == current_mat);
-                    // Unique label in case names repeat
                     std::string label = g_scene.materials[i].name + "##mat_" + std::to_string(i);
                     if (ImGui::Selectable(label.c_str(), is_sel)) {
                         obj.material_index = i;
@@ -615,7 +698,6 @@ int main()
                 ImGui::EndCombo();
             }
 
-            // If we have a valid material bound, expose its class + params
             if (obj.material_index >= 0 &&
                 obj.material_index < (int)g_scene.materials.size())
             {
@@ -624,7 +706,6 @@ int main()
                 ImGui::Separator();
                 ImGui::Text("Material Class");
 
-                // -------- Material class (maps to concrete classes in material.h) ----
                 const char* model_label = "Unknown";
                 switch (mat.model) {
                     case scene_material_model::lambert:    model_label = "Lambert";    break;
@@ -659,7 +740,6 @@ int main()
                 ImGui::Separator();
                 ImGui::Text("Material Parameters");
 
-                // Base color (used by basically everything)
                 {
                     float base[3] = {
                         (float)mat.base_color.x(),
@@ -671,7 +751,6 @@ int main()
                     }
                 }
 
-                // Class-specific controls
                 switch (mat.model) {
                 case scene_material_model::lambert:
                     ImGui::TextDisabled("Lambert: pure diffuse (Shirley lambertian).");
@@ -679,7 +758,7 @@ int main()
 
                 case scene_material_model::metal:
                     ImGui::TextDisabled("Metal: colored metal BRDF (Shirley metal).");
-                    // Hook up fuzz here if you add it to scene_material.
+                    // You can expose fuzz here if you wire it through.
                     break;
 
                 case scene_material_model::dielectric:
@@ -719,7 +798,50 @@ int main()
                         mat.dielectric_F0 = colour(f0[0], f0[1], f0[2]);
                     }
 
-                    ImGui::TextDisabled("Normal map / textures are still driven by scene/asset system.");
+                    ImGui::Separator();
+                    ImGui::Text("PBR Texture Maps (drag from Textures window)");
+
+                    auto draw_tex_slot = [&](const char* label, int& tex_index)
+                    {
+                        ImGui::Text("%s", label);
+                        ImGui::SameLine();
+                        const char* btn_label = "<none>";
+                        if (tex_index >= 0 &&
+                            tex_index < (int)g_scene.textures.size()) {
+                            btn_label = g_scene.textures[tex_index].name.c_str();
+                        }
+                        ImGui::Button(btn_label, ImVec2(140.0f, 0.0f));
+
+                        if (ImGui::BeginDragDropTarget()) {
+                            if (const ImGuiPayload* payload =
+                                    ImGui::AcceptDragDropPayload("TEXTURE_ASSET_ID"))
+                            {
+                                int asset_index = *(const int*)payload->Data;
+                                if (asset_index >= 0 &&
+                                    asset_index < (int)g_scene.textures.size()) {
+                                    tex_index = asset_index;
+                                }
+                            }
+                            ImGui::EndDragDropTarget();
+                        }
+
+                        if (tex_index >= 0) {
+                            ImGui::SameLine();
+                            std::string clear_id = std::string("X##clear_") + label;
+                            if (ImGui::SmallButton(clear_id.c_str())) {
+                                tex_index = -1;
+                            }
+                        }
+                    };
+
+                    draw_tex_slot("Albedo",    mat.albedo_tex);
+                    draw_tex_slot("Metallic",  mat.metallic_tex);
+                    draw_tex_slot("Roughness", mat.roughness_tex);
+                    draw_tex_slot("Normal",    mat.normal_tex);
+
+                    ImGui::TextDisabled("These indices map to scene.textures; "
+                                        "build_world_from_scene must bind them "
+                                        "into pbr_material.");
                 } break;
 
                 default:
@@ -728,7 +850,7 @@ int main()
                 }
 
                 ImGui::Separator();
-                ImGui::TextDisabled("Edit transform/material/sampling, then re-render.");
+                ImGui::TextDisabled("Edit transform/material/textures, then re-render.");
             }
             else {
                 ImGui::TextDisabled("Object has no valid material bound.");
@@ -741,7 +863,7 @@ int main()
         ImGui::End();
 
         // -------------------------------------------------
-        // Debug Camera window: shows editor camera + viewport state
+        // Debug Camera window
         // -------------------------------------------------
         ImGui::Begin("Debug Camera");
         ImGui::Text("Editor cam position:");
@@ -770,10 +892,8 @@ int main()
         ImVec2 vp_size = ImGui::GetContentRegionAvail();
 
         if (ImGui::Button("Render Current View")) {
-            // Sync camera to current viewport aspect and editor pose
             sync_camera_from_editor(vp_size.x, vp_size.y);
 
-            // Build world from scene and run the ray tracer
             hittable_list world = build_world_from_scene(g_scene);
 
             g_cancel_flag.store(false);
@@ -783,12 +903,11 @@ int main()
         }
 
         ImGui::SameLine();
-        ImGui::TextDisabled("Move camera / edit objects / sampling, then click Render.");
+        ImGui::TextDisabled("Move camera / edit objects / materials, then click Render.");
 
         ImGui::Separator();
 
         if (g_rtHasImage && g_rtTexture != 0) {
-            // Preserve aspect ratio inside available viewport
             float img_aspect = (float)g_rtWidth / (float)g_rtHeight;
             float vp_aspect  = vp_size.x / vp_size.y;
 
