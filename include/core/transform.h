@@ -1,0 +1,183 @@
+#ifndef TRANSFORM_H
+#define TRANSFORM_H
+
+#include <memory>
+#include <cmath>
+#include "hittable.h"
+#include "aabb.h"
+
+// Convert degrees → radians
+inline double deg2rad(double d) {
+    return d * 0.017453292519943295; // π/180
+}
+
+class transform : public hittable {
+public:
+    transform(std::shared_ptr<hittable> p,
+              const vec3& translate,
+              const vec3& rotate_deg,  // *** editor uses DEGREES ***
+              double      scale = 1.0)
+        : ptr(std::move(p)), t(translate)
+    {
+        //----------------------------------------------------------------------
+        // 1. Build rotation matrices from DEGREES
+        //----------------------------------------------------------------------
+
+        double rx = deg2rad(rotate_deg.x());
+        double ry = deg2rad(rotate_deg.y());
+        double rz = deg2rad(rotate_deg.z());
+
+        double cx = std::cos(rx), sx = std::sin(rx);
+        double cy = std::cos(ry), sy = std::sin(ry);
+        double cz = std::cos(rz), sz = std::sin(rz);
+
+        double Rx[3][3], Ry[3][3], Rz[3][3];
+        double Rtemp[3][3];
+        double R[3][3];
+
+        // Rot X
+        Rx[0][0] = 1;  Rx[0][1] = 0;   Rx[0][2] = 0;
+        Rx[1][0] = 0;  Rx[1][1] = cx;  Rx[1][2] = -sx;
+        Rx[2][0] = 0;  Rx[2][1] = sx;  Rx[2][2] = cx;
+
+        // Rot Y
+        Ry[0][0] = cy; Ry[0][1] = 0;   Ry[0][2] = sy;
+        Ry[1][0] = 0;  Ry[1][1] = 1;   Ry[1][2] = 0;
+        Ry[2][0] = -sy;Ry[2][1] = 0;   Ry[2][2] = cy;
+
+        // Rot Z
+        Rz[0][0] = cz; Rz[0][1] = -sz; Rz[0][2] = 0;
+        Rz[1][0] = sz; Rz[1][1] =  cz; Rz[1][2] = 0;
+        Rz[2][0] = 0;  Rz[2][1] =  0;  Rz[2][2] = 1;
+
+        // Combine R = Rz * Ry * Rx
+        mat_mul(Ry, Rx, Rtemp);
+        mat_mul(Rz, Rtemp, R);
+
+        //----------------------------------------------------------------------
+        // 2. Build M and M_inv (forward + inverse transform)
+        //----------------------------------------------------------------------
+
+        double s = scale;
+        double inv_s = (s == 0.0) ? 1.0 : 1.0 / s;
+
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) {
+                M[i][j]     = R[i][j] * s;
+                M_inv[i][j] = R[j][i] * inv_s; // transpose(R) * (1/s)
+            }
+
+        //----------------------------------------------------------------------
+        // 3. Build transformed bounding box
+        //----------------------------------------------------------------------
+
+        aabb box_local = ptr->bounding_box();
+
+        vec3 minp(  infinity,  infinity,  infinity);
+        vec3 maxp( -infinity, -infinity, -infinity);
+
+        for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j)
+        for (int k = 0; k < 2; ++k)
+        {
+            double x = i ? box_local.x.max : box_local.x.min;
+            double y = j ? box_local.y.max : box_local.y.min;
+            double z = k ? box_local.z.max : box_local.z.min;
+
+            vec3 p_local(x,y,z);
+            vec3 p_world = apply(M, p_local) + t;
+
+            minp = vmin(minp, p_world);
+            maxp = vmax(maxp, p_world);
+        }
+
+        bbox_world = aabb(minp, maxp);
+    }
+
+    //----------------------------------------------------------------------
+    // hit()
+    //----------------------------------------------------------------------
+    bool hit(const ray& r_in, interval t_range, hit_record& rec) const override {
+        // Ray → local
+        vec3 origin_local    = apply(M_inv, r_in.origin() - t);
+        vec3 direction_local = apply(M_inv, r_in.direction());
+
+        ray r_local(origin_local, direction_local, r_in.time());
+
+        if (!ptr->hit(r_local, t_range, rec))
+            return false;
+
+        // Point → world
+        rec.p = apply(M, rec.p) + t;
+
+        // Frame → world
+        vec3 n_world = unit_vector(apply(M, rec.normal));
+        vec3 t_world = unit_vector(apply(M, rec.tangent));
+        vec3 b_world = unit_vector(apply(M, rec.bitangent));
+
+        rec.normal    = n_world;
+        rec.tangent   = t_world;
+        rec.bitangent = b_world;
+
+        rec.set_face_normal(r_in, rec.normal);
+
+        // Re-orthogonalise tangent frame
+        vec3 N = rec.normal;
+        rec.tangent = rec.tangent - dot(rec.tangent, N) * N;
+
+        if (rec.tangent.length_squared() < 1e-6) {
+            vec3 up = (fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+            rec.tangent = cross(up, N);
+        }
+
+        rec.tangent   = unit_vector(rec.tangent);
+        rec.bitangent = cross(N, rec.tangent);
+
+        return true;
+    }
+
+    aabb bounding_box() const override {
+        return bbox_world;
+    }
+
+private:
+    std::shared_ptr<hittable> ptr;
+    vec3 t;
+    double M[3][3];
+    double M_inv[3][3];
+    aabb bbox_world;
+
+    // A * B = out
+    static void mat_mul(const double A[3][3], const double B[3][3],
+                        double out[3][3])
+    {
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) {
+                out[i][j] = 0.0;
+                for (int k = 0; k < 3; ++k)
+                    out[i][j] += A[i][k] * B[k][j];
+            }
+    }
+
+    static vec3 apply(const double M[3][3], const vec3& v) {
+        return vec3(
+            M[0][0]*v.x() + M[0][1]*v.y() + M[0][2]*v.z(),
+            M[1][0]*v.x() + M[1][1]*v.y() + M[1][2]*v.z(),
+            M[2][0]*v.x() + M[2][1]*v.y() + M[2][2]*v.z()
+        );
+    }
+
+    static vec3 vmin(const vec3& a, const vec3& b) {
+        return vec3(fmin(a.x(), b.x()),
+                    fmin(a.y(), b.y()),
+                    fmin(a.z(), b.z()));
+    }
+
+    static vec3 vmax(const vec3& a, const vec3& b) {
+        return vec3(fmax(a.x(), b.x()),
+                    fmax(a.y(), b.y()),
+                    fmax(a.z(), b.z()));
+    }
+};
+
+#endif // TRANSFORM_H

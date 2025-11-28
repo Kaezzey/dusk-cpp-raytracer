@@ -11,7 +11,9 @@
 struct render_result {
     int width  = 0;
     int height = 0;
-    std::vector<unsigned char> pixels;    // packed RGB8
+
+    // float RGB per pixel (your existing colour/vec3 type)
+    std::vector<uint8_t> pixels;
 };
 
 class renderer {

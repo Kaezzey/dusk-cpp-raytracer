@@ -6,23 +6,21 @@
 #include "../../include/core/mesh_loader.h"
 #include "../../include/core/BVH.h"
 #include "../../include/core/triangle.h"
+#include "../../include/core/transform.h"
 
 static void ensure_mesh_loaded(scene_mesh_asset& asset,
                                const scene_material& mat_desc)
 {
-    if (asset.mesh_bvh)
-        return; // already loaded
+    if (asset.mesh_bvh) return;
 
-    // Build runtime material from scene material
     auto mat = build_rt_material(mat_desc);
 
-    // Load all triangles from file
     auto tri_list = load_mesh_as_triangles(
         asset.file_path,
         mat,
-        /*z_up*/ true,            // you know your asset orientation
+        /*z_up*/ true,
         /*normalise_to_unit*/ true,
-        /*user_scale*/ 1.0
+        /*user_scale*/ 2.0
     );
 
     if (!tri_list || tri_list->objects.empty()) {
@@ -30,11 +28,11 @@ static void ensure_mesh_loaded(scene_mesh_asset& asset,
         return;
     }
 
-    // Wrap in BVH
     asset.mesh_bvh = std::make_shared<bvh_node>(
         tri_list->objects, 0, tri_list->objects.size()
     );
 }
+
 
 // Helper: build one concrete material from a scene_material
 std::shared_ptr<material> build_rt_material(const scene_material& m)
@@ -147,20 +145,29 @@ hittable_list build_world_from_scene(const scene& scn)
 
         case scene_object_type::mesh_instance: {
             if (obj.mesh_index < 0 ||
-                obj.mesh_index >= (int)scn.meshes.size())
+                obj.mesh_index >= static_cast<int>(scn.meshes.size())) {
+                break;
+            }
+
+            auto& asset = const_cast<scene_mesh_asset&>(scn.meshes[obj.mesh_index]);
+
+            // Load mesh BVH once (if not already)
+            ensure_mesh_loaded(asset, scn.materials[obj.material_index]);
+            if (!asset.mesh_bvh)
                 break;
 
-            auto& mesh_asset = const_cast<scene_mesh_asset&>(scn.meshes[obj.mesh_index]);
+            // Use translation, rotation_deg (degrees), and UNIFORM scale from x
+            double s = obj.scale.x();
+            if (s <= 0.0) s = 1.0;
 
-            // Ensure geometry is loaded
-            ensure_mesh_loaded(mesh_asset, scn.materials[obj.material_index]);
+            auto inst = std::make_shared<transform>(
+                asset.mesh_bvh,
+                obj.translation,
+                obj.rotation_deg,  // degrees
+                s
+            );
 
-            if (!mesh_asset.mesh_bvh)
-                break;
-
-            // NOTE: For now we ignore translation/rotation/scale and just drop the mesh at the origin.
-            // We'll introduce a transform wrapper later.
-            world.add(mesh_asset.mesh_bvh);
+            world.add(inst);
             break;
         }
 

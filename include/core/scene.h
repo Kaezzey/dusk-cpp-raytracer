@@ -77,7 +77,7 @@ struct scene_object {
     // Mesh instance params (used when type == mesh_instance)
     int  mesh_index   = -1;           // index into scene.meshes
     vec3 translation  = vec3(0,0,0);  // world-space translation
-    vec3 rotation_eul = vec3(0,0,0);  // radians, XYZ order
+    vec3 rotation_deg = vec3(0,0,0);  // degrees, XYZ order
     vec3 scale        = vec3(1,1,1);  // non-uniform scale allowed
 };
 
