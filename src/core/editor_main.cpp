@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdint>
 #include <cmath>
+#include <string>   // for material labels
 
 #include "../../external/glew/include/GL/glew.h"   // GLEW (OpenGL loader)
 #include "../../include/external/GLFW/glfw3.h"     // our local GLFW
@@ -42,6 +43,9 @@ static bool g_viewport_hovered = false;
 // Editor camera tuning
 static float g_camera_move_speed = 4.0f;   // units per second
 static float g_camera_look_sens  = 0.2f;   // mouse sensitivity
+
+// Currently selected object in the Scene Hierarchy (-1 = none)
+static int g_selected_object = -1;
 
 // -----------------------------------------------------------------------------
 // GPU texture for displaying the ray-traced image
@@ -183,8 +187,8 @@ static void init_engine_once()
     // Ray-tracer camera base params
     g_camera.aspect_ratio      = 16.0 / 9.0;
     g_camera.image_width       = 800;
-    g_camera.samples_per_pixel = 20;
-    g_camera.max_depth         = 20;
+    g_camera.samples_per_pixel = 20;   // default sampling
+    g_camera.max_depth         = 20;   // default bounce depth
     g_camera.background        = colour(0.70, 0.80, 1.00);
 
     // Ensure camera uses the editor cam pose
@@ -200,9 +204,7 @@ static void sync_camera_from_editor(float viewport_width, float viewport_height)
         g_camera.aspect_ratio = viewport_width / viewport_height;
     }
 
-    // If you later want resolution to track viewport size, you'd add:
-    // g_camera.image_width  = (int)viewport_width;
-    // g_camera.image_height = (int)viewport_height;
+    // Resolution binding could go here later if you want.
 
     to_shirley_camera(g_editor_cam, g_camera);
 }
@@ -304,7 +306,7 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
         if (!rotating) {
             rotating = true;
 
-            // Optional: lock/hide cursor while looking
+            // Lock/hide cursor while looking
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
             last_x = x;
@@ -470,13 +472,19 @@ int main()
         }
 
         // -------------------------------------------------
-        // Scene Hierarchy
+        // Scene Hierarchy (with selection)
         // -------------------------------------------------
         ImGui::Begin("Scene Hierarchy");
         ImGui::Text("Objects:");
         ImGui::Separator();
         for (size_t i = 0; i < g_scene.objects.size(); ++i) {
-            ImGui::BulletText("%s", g_scene.objects[i].name.c_str());
+            bool is_selected = (int)i == g_selected_object;
+            if (ImGui::Selectable(g_scene.objects[i].name.c_str(), is_selected)) {
+                g_selected_object = (int)i;
+            }
+        }
+        if (g_scene.objects.empty()) {
+            ImGui::TextDisabled("No objects in scene.");
         }
         ImGui::End();
 
@@ -514,10 +522,226 @@ int main()
             g_editor_cam.update_basis();
         }
 
+        // -------------------------------------------------
+        // Render Settings (sampling)
+        // -------------------------------------------------
+        ImGui::Separator();
+        ImGui::Text("Render Settings");
+
+        int spp = g_camera.samples_per_pixel;
+        if (ImGui::DragInt("Samples per pixel", &spp, 1, 1, 4096)) {
+            if (spp < 1)  spp = 1;
+            g_camera.samples_per_pixel = spp;
+        }
+
+        int max_depth = g_camera.max_depth;
+        if (ImGui::DragInt("Max bounce depth", &max_depth, 1, 1, 128)) {
+            if (max_depth < 1) max_depth = 1;
+            g_camera.max_depth = max_depth;
+        }
+
+        ImGui::TextDisabled("Higher = cleaner but slower.");
+
+        ImGui::Separator();
+        ImGui::Text("Render Resolution");
+
+        static int res_w = g_camera.image_width;
+        static int res_h = g_camera.image_height;
+
+        if (ImGui::InputInt("Width", &res_w)) {
+            if (res_w < 16) res_w = 16;
+        }
+        if (ImGui::InputInt("Height", &res_h)) {
+            if (res_h < 16) res_h = 16;
+        }
+
+        if (ImGui::Button("Apply Resolution")) {
+            g_camera.image_width  = res_w;
+            g_camera.image_height = res_h;
+        }
+        ImGui::TextDisabled("Changes take effect next render.");
+
+        ImGui::Separator();
+        ImGui::Text("Selection");
+
+        if (g_selected_object >= 0 &&
+            g_selected_object < (int)g_scene.objects.size())
+        {
+            auto& obj = g_scene.objects[g_selected_object];
+            ImGui::Text("Selected object:");
+            ImGui::BulletText("Name: %s", obj.name.c_str());
+
+            // -----------------------------
+            // Simple transform controls
+            // -----------------------------
+            point3 pos = obj.center;
+            float pos_f[3] = { (float)pos.x(), (float)pos.y(), (float)pos.z() };
+            if (ImGui::DragFloat3("Position", pos_f, 0.05f)) {
+                obj.center = point3(pos_f[0], pos_f[1], pos_f[2]);
+            }
+
+            float radius_f = (float)obj.radius;
+            if (ImGui::DragFloat("Radius", &radius_f, 0.01f, 0.01f, 1000.0f)) {
+                obj.radius = radius_f;
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Material Binding");
+
+            // -------- Material index combo (which material this object uses) --------
+            int current_mat = obj.material_index;
+            if (current_mat < 0 || current_mat >= (int)g_scene.materials.size()) {
+                current_mat = -1;
+            }
+
+            const char* current_label = "<none>";
+            if (current_mat >= 0) {
+                current_label = g_scene.materials[current_mat].name.c_str();
+            }
+
+            if (ImGui::BeginCombo("Material", current_label)) {
+                for (int i = 0; i < (int)g_scene.materials.size(); ++i) {
+                    bool is_sel = (i == current_mat);
+                    // Unique label in case names repeat
+                    std::string label = g_scene.materials[i].name + "##mat_" + std::to_string(i);
+                    if (ImGui::Selectable(label.c_str(), is_sel)) {
+                        obj.material_index = i;
+                        current_mat        = i;
+                    }
+                    if (is_sel) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            // If we have a valid material bound, expose its class + params
+            if (obj.material_index >= 0 &&
+                obj.material_index < (int)g_scene.materials.size())
+            {
+                auto& mat = g_scene.materials[obj.material_index];
+
+                ImGui::Separator();
+                ImGui::Text("Material Class");
+
+                // -------- Material class (maps to concrete classes in material.h) ----
+                const char* model_label = "Unknown";
+                switch (mat.model) {
+                    case scene_material_model::lambert:    model_label = "Lambert";    break;
+                    case scene_material_model::metal:      model_label = "Metal";      break;
+                    case scene_material_model::dielectric: model_label = "Dielectric"; break;
+                    case scene_material_model::pbr:        model_label = "PBR";        break;
+                    default:                               model_label = "Unknown";    break;
+                }
+
+                if (ImGui::BeginCombo("Class", model_label)) {
+                    struct Option { const char* label; scene_material_model model; };
+                    Option opts[] = {
+                        { "Lambert (Shirley diffuse)",   scene_material_model::lambert    },
+                        { "Metal (Shirley metal)",       scene_material_model::metal      },
+                        { "Dielectric (glass)",          scene_material_model::dielectric },
+                        { "PBR GGX (your shader)",       scene_material_model::pbr        },
+                    };
+
+                    for (const auto& opt : opts) {
+                        bool selected = (mat.model == opt.model);
+                        if (ImGui::Selectable(opt.label, selected)) {
+                            mat.model = opt.model;
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+
+                    ImGui::EndCombo();
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Material Parameters");
+
+                // Base color (used by basically everything)
+                {
+                    float base[3] = {
+                        (float)mat.base_color.x(),
+                        (float)mat.base_color.y(),
+                        (float)mat.base_color.z()
+                    };
+                    if (ImGui::ColorEdit3("Base Color", base)) {
+                        mat.base_color = colour(base[0], base[1], base[2]);
+                    }
+                }
+
+                // Class-specific controls
+                switch (mat.model) {
+                case scene_material_model::lambert:
+                    ImGui::TextDisabled("Lambert: pure diffuse (Shirley lambertian).");
+                    break;
+
+                case scene_material_model::metal:
+                    ImGui::TextDisabled("Metal: colored metal BRDF (Shirley metal).");
+                    // Hook up fuzz here if you add it to scene_material.
+                    break;
+
+                case scene_material_model::dielectric:
+                {
+                    ImGui::TextDisabled("Dielectric: refractive material (glass).");
+
+                    float ior_f = (float)mat.ior;
+                    if (ImGui::SliderFloat("IOR", &ior_f, 1.0f, 2.5f)) {
+                        mat.ior = ior_f;
+                    }
+                } break;
+
+                case scene_material_model::pbr:
+                {
+                    ImGui::TextDisabled("PBR GGX: uses your pbr_material in material.h");
+
+                    float metallic_f  = (float)mat.metallic;
+                    float roughness_f = (float)mat.roughness;
+                    float norm_str_f  = (float)mat.normal_strength;
+
+                    if (ImGui::SliderFloat("Metallic", &metallic_f, 0.0f, 1.0f)) {
+                        mat.metallic = metallic_f;
+                    }
+                    if (ImGui::SliderFloat("Roughness", &roughness_f, 0.02f, 1.0f)) {
+                        mat.roughness = roughness_f;
+                    }
+                    if (ImGui::SliderFloat("Normal Strength", &norm_str_f, 0.0f, 4.0f)) {
+                        mat.normal_strength = norm_str_f;
+                    }
+
+                    float f0[3] = {
+                        (float)mat.dielectric_F0.x(),
+                        (float)mat.dielectric_F0.y(),
+                        (float)mat.dielectric_F0.z()
+                    };
+                    if (ImGui::ColorEdit3("Dielectric F0", f0)) {
+                        mat.dielectric_F0 = colour(f0[0], f0[1], f0[2]);
+                    }
+
+                    ImGui::TextDisabled("Normal map / textures are still driven by scene/asset system.");
+                } break;
+
+                default:
+                    ImGui::TextDisabled("Unknown material model – extend UI if you add more.");
+                    break;
+                }
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Edit transform/material/sampling, then re-render.");
+            }
+            else {
+                ImGui::TextDisabled("Object has no valid material bound.");
+            }
+        }
+        else {
+            ImGui::TextDisabled("No object selected.");
+        }
+
         ImGui::End();
 
         // -------------------------------------------------
-        // Debug Camera window: shows editor camera changing
+        // Debug Camera window: shows editor camera + viewport state
         // -------------------------------------------------
         ImGui::Begin("Debug Camera");
         ImGui::Text("Editor cam position:");
@@ -530,6 +754,9 @@ int main()
         ImGui::Separator();
         ImGui::Text("Viewport focused: %s", g_viewport_focused ? "true" : "false");
         ImGui::Text("Viewport hovered: %s", g_viewport_hovered ? "true" : "false");
+        ImGui::Separator();
+        ImGui::Text("Samples per pixel: %d", g_camera.samples_per_pixel);
+        ImGui::Text("Max depth:         %d", g_camera.max_depth);
         ImGui::End();
 
         // -------------------------------------------------
@@ -556,7 +783,7 @@ int main()
         }
 
         ImGui::SameLine();
-        ImGui::TextDisabled("Move camera in this window, then click Render.");
+        ImGui::TextDisabled("Move camera / edit objects / sampling, then click Render.");
 
         ImGui::Separator();
 
