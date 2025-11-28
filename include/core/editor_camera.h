@@ -11,7 +11,7 @@ struct editor_camera_state {
     double pitch    = 0.0;
 
     // Lens
-    double vfov     = 40.0;
+    float vfov     = 40.0;
 
     // World up
     vec3 world_up   = vec3(0, 1, 0);

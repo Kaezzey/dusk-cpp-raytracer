@@ -35,6 +35,14 @@ static editor_camera_state g_editor_cam;
 static std::atomic<bool>   g_cancel_flag{false};
 static bool                g_scene_initialized = false;
 
+// Viewport focus/hover state
+static bool g_viewport_focused = false;
+static bool g_viewport_hovered = false;
+
+// Editor camera tuning
+static float g_camera_move_speed = 4.0f;   // units per second
+static float g_camera_look_sens  = 0.2f;   // mouse sensitivity
+
 // -----------------------------------------------------------------------------
 // GPU texture for displaying the ray-traced image
 // -----------------------------------------------------------------------------
@@ -252,13 +260,15 @@ static void UploadRenderToTexture(const render_result& img)
 static void update_editor_camera_from_input(GLFWwindow* window, double dt)
 {
     ImGuiIO& io = ImGui::GetIO();
+    (void)io;
+
+    // Only move camera when viewport is focused/hovered
+    if (!g_viewport_focused && !g_viewport_hovered)
+        return;
 
     // -----------------------------
     // Keyboard movement (WASD/QE)
     // -----------------------------
-
-    // TEMP: don't block on ImGui taking keyboard.
-    // Later you can gate this based on "viewport focused".
     float move_forward = 0.0f;
     float move_right   = 0.0f;
     float move_up      = 0.0f;
@@ -271,15 +281,17 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
     if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) move_up      -= 1.0f;
 
     if (move_forward != 0.0f || move_right != 0.0f || move_up != 0.0f) {
-        g_editor_cam.move_from_input(move_forward, move_right, move_up, dt);
+        g_editor_cam.move_from_input(
+            move_forward,
+            move_right,
+            move_up,
+            (float)(dt * g_camera_move_speed)
+        );
     }
 
     // -----------------------------
     // Mouse look (hold RMB)
     // -----------------------------
-
-    // Don’t let ImGui block this while we’re debugging:
-    // remove the !io.WantCaptureMouse guard.
     static bool   rotating = false;
     static double last_x   = 0.0;
     static double last_y   = 0.0;
@@ -290,11 +302,14 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
         glfwGetCursorPos(window, &x, &y);
 
         if (!rotating) {
-            // First frame of RMB down: initialise
             rotating = true;
-            last_x   = x;
-            last_y   = y;
-            return; // no jump on first click
+
+            // Optional: lock/hide cursor while looking
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+
+            last_x = x;
+            last_y = y;
+            return; // avoid jump on first frame
         }
 
         double dx = x - last_x;
@@ -302,21 +317,20 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
         last_x = x;
         last_y = y;
 
-        float sensitivity = 0.2f;
-
-        // Flip both axes
-        float yaw_delta   = (float)(dx * sensitivity);
-        float pitch_delta = (float)(-dy * sensitivity);
-
+        float sensitivity = g_camera_look_sens;
+        float yaw_delta   =  (float)( dx * sensitivity);  // right -> +yaw
+        float pitch_delta =  (float)(-dy * sensitivity);  // up   -> +pitch
         g_editor_cam.look(yaw_delta, pitch_delta);
     }
     else
     {
-        // RMB released -> next press will re-initialise
+        if (rotating) {
+            // Restore cursor
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        }
         rotating = false;
     }
 }
-
 
 // -----------------------------------------------------------------------------
 // main
@@ -467,18 +481,39 @@ int main()
         ImGui::End();
 
         // -------------------------------------------------
-        // Inspector (stub)
+        // Inspector
         // -------------------------------------------------
         ImGui::Begin("Inspector");
-        ImGui::Text("TODO: show transform / material for selected object");
+        ImGui::Text("Camera");
         ImGui::Separator();
-        ImGui::Text("Camera position: (%.2f, %.2f, %.2f)",
+        ImGui::Text("Position: (%.2f, %.2f, %.2f)",
             g_editor_cam.position.x(),
             g_editor_cam.position.y(),
             g_editor_cam.position.z());
         ImGui::Text("Yaw: %.2f, Pitch: %.2f", g_editor_cam.yaw, g_editor_cam.pitch);
+
         ImGui::Separator();
-        ImGui::Text("Controls: WASD = move, Q/E = down/up, RMB drag = look");
+        ImGui::Text("Controls:");
+        ImGui::Text("  WASD = move, Q/E = down/up");
+        ImGui::Text("  RMB drag in Viewport = look");
+
+        ImGui::Separator();
+        ImGui::Text("Editor Camera Settings");
+        ImGui::SliderFloat("Move speed",  &g_camera_move_speed, 0.1f, 20.0f);
+        ImGui::SliderFloat("Look sens",   &g_camera_look_sens,  0.01f, 1.0f);
+        ImGui::SliderFloat("FOV",         &g_editor_cam.vfov,   20.0f, 90.0f);
+
+        if (ImGui::Button("Reset Camera")) {
+            g_editor_cam.position = point3(3, 3, 2);
+            g_editor_cam.vfov     = 40.0;
+
+            point3 target  = point3(0, 0, -1);
+            vec3   forward = unit_vector(target - g_editor_cam.position);
+            g_editor_cam.yaw   = std::atan2(forward.z(), forward.x());
+            g_editor_cam.pitch = std::asin(forward.y());
+            g_editor_cam.update_basis();
+        }
+
         ImGui::End();
 
         // -------------------------------------------------
@@ -493,13 +528,17 @@ int main()
         ImGui::Text("Yaw   = %.3f", g_editor_cam.yaw);
         ImGui::Text("Pitch = %.3f", g_editor_cam.pitch);
         ImGui::Separator();
-        ImGui::TextDisabled("Hold WASD/QE and RMB, watch these change.");
+        ImGui::Text("Viewport focused: %s", g_viewport_focused ? "true" : "false");
+        ImGui::Text("Viewport hovered: %s", g_viewport_hovered ? "true" : "false");
         ImGui::End();
 
         // -------------------------------------------------
         // Viewport: Render button + display ray-traced texture
         // -------------------------------------------------
         ImGui::Begin("Viewport");
+
+        g_viewport_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        g_viewport_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
 
         ImVec2 vp_size = ImGui::GetContentRegionAvail();
 
@@ -517,7 +556,7 @@ int main()
         }
 
         ImGui::SameLine();
-        ImGui::TextDisabled("Move camera, then click Render.");
+        ImGui::TextDisabled("Move camera in this window, then click Render.");
 
         ImGui::Separator();
 
