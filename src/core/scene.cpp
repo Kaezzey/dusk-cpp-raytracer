@@ -1,6 +1,8 @@
 #include <unordered_map>
+#include <cstring>
+#include <cctype>
 
-#include "../../include/core/dusktracer.h"          // brings in colour, texture, materials, point3, etc.
+#include "../../include/core/dusktracer.h"          // colour, texture, materials, point3, etc.
 #include "../../include/core/scene.h"
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/sphere.h"
@@ -9,6 +11,23 @@
 #include "../../include/core/BVH.h"
 #include "../../include/core/triangle.h"
 #include "../../include/core/transform.h"
+
+// ------------------------------------------------------------
+// Case-insensitive extension check
+// ------------------------------------------------------------
+static bool has_extension_ci(const std::string& path, const char* ext)
+{
+    size_t lenp = path.size();
+    size_t lene = std::strlen(ext);
+    if (lenp < lene) return false;
+    size_t off = lenp - lene;
+    for (size_t i = 0; i < lene; ++i) {
+        char c1 = (char)std::tolower(path[off + i]);
+        char c2 = (char)std::tolower(ext[i]);
+        if (c1 != c2) return false;
+    }
+    return true;
+}
 
 // ------------------------------------------------------------
 // Texture cache: map file path -> shared_ptr<texture>
@@ -30,7 +49,6 @@ static std::shared_ptr<texture> load_scene_texture(const scene& scn, int tex_ind
         }
     }
 
-    // NOTE: adjust this ctor if your image_texture uses (const char*) or something else
     std::shared_ptr<texture> tex = std::make_shared<image_texture>(t.path.c_str());
     tex_cache[t.path] = tex;
     return tex;
@@ -77,9 +95,12 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
     case scene_material_model::dielectric:
     {
         // assuming your dielectric ctor is (double ior, colour tint)
-        return std::make_shared<dielectric>(m.ior, colour(
-            m.base_color.x(), m.base_color.y(), m.base_color.z()
-        ));
+        return std::make_shared<dielectric>(
+            m.ior,
+            colour(m.base_color.x(),
+                   m.base_color.y(),
+                   m.base_color.z())
+        );
     }
 
     case scene_material_model::diffuse_light:
@@ -146,36 +167,9 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 }
 
 // ------------------------------------------------------------
-// Mesh loading helper
-// ------------------------------------------------------------
-static void ensure_mesh_loaded(const scene& scn,
-                               scene_mesh_asset& asset,
-                               const scene_material& mat_desc)
-{
-    if (asset.mesh_bvh) return;
-
-    auto mat = build_rt_material(scn, mat_desc);
-
-    auto tri_list = load_mesh_as_triangles(
-        asset.file_path,
-        mat,
-        /*z_up*/ true,
-        /*normalise_to_unit*/ true,
-        /*user_scale*/ 2.0
-    );
-
-    if (!tri_list || tri_list->objects.empty()) {
-        asset.mesh_bvh.reset();
-        return;
-    }
-
-    asset.mesh_bvh = std::make_shared<bvh_node>(
-        tri_list->objects, 0, tri_list->objects.size()
-    );
-}
-
-// ------------------------------------------------------------
 // Convert editor scene into runtime hittables for the renderer.
+// Uses per-slot mesh materials via mesh_loader's multi-material
+// overload.
 // ------------------------------------------------------------
 hittable_list build_world_from_scene(const scene& scn)
 {
@@ -185,10 +179,11 @@ hittable_list build_world_from_scene(const scene& scn)
     std::vector<std::shared_ptr<material>> built_materials(scn.materials.size());
 
     auto get_material = [&](int idx) -> std::shared_ptr<material> {
-        if (idx < 0 || idx >= static_cast<int>(scn.materials.size()))
+        if (idx < 0 || idx >= static_cast<int>(scn.materials.size())) {
             return std::make_shared<lambertian>(
                 std::make_shared<solid_colour>(colour(0.5, 0.5, 0.5))
             );
+        }
 
         if (!built_materials[idx])
             built_materials[idx] = build_rt_material(scn, scn.materials[idx]);
@@ -196,57 +191,96 @@ hittable_list build_world_from_scene(const scene& scn)
         return built_materials[idx];
     };
 
-    // Build objects
+    // --------------------------------------------------------
+    // 1) Spheres / simple objects (single material_index)
+    // --------------------------------------------------------
     for (const auto& obj : scn.objects) {
+        if (obj.type != scene_object_type::sphere)
+            continue;
+
         auto mat = get_material(obj.material_index);
 
-        switch (obj.type) {
-        case scene_object_type::sphere:
-            world.add(std::make_shared<sphere>(obj.center, obj.radius, mat));
-            break;
+        world.add(std::make_shared<sphere>(
+            obj.center,
+            obj.radius,
+            mat
+        ));
+    }
 
-        case scene_object_type::mesh_instance:
-        {
-            if (obj.mesh_index < 0 ||
-                obj.mesh_index >= static_cast<int>(scn.meshes.size())) {
-                break;
-            }
+    // --------------------------------------------------------
+    // 2) Mesh instances with per-slot materials (Legs/Chest/…)
+    // --------------------------------------------------------
+    for (const auto& obj : scn.objects) {
+        if (obj.type != scene_object_type::mesh_instance)
+            continue;
 
-            auto& asset = const_cast<scene_mesh_asset&>(scn.meshes[obj.mesh_index]);
+        if (obj.mesh_index < 0 ||
+            obj.mesh_index >= static_cast<int>(scn.meshes.size()))
+            continue;
 
-            // Load mesh BVH once (if not already)
-            if (obj.material_index >= 0 &&
-                obj.material_index < (int)scn.materials.size()) {
-                ensure_mesh_loaded(scn, asset, scn.materials[obj.material_index]);
-            } else {
-                // Fallback: use some default material if needed
-                scene_material dummy = {};
-                dummy.model      = scene_material_model::lambert;
-                dummy.base_color = vec3(0.7, 0.2, 0.2);
-                ensure_mesh_loaded(scn, asset, dummy);
-            }
+        const scene_mesh_asset& asset = scn.meshes[obj.mesh_index];
 
-            if (!asset.mesh_bvh)
-                break;
+        // Build mapping: FBX material name ("Legs", "Chest", ...)
+        // -> runtime material.
+        std::unordered_map<std::string, std::shared_ptr<material>> mat_table;
 
-            // Use translation, rotation_deg (degrees), and UNIFORM scale from x
-            double s = obj.scale.x();
-            if (s <= 0.0) s = 1.0;
+        size_t num_slots = asset.slot_names.size();
+        if (obj.mesh_slot_materials.size() < num_slots)
+            num_slots = obj.mesh_slot_materials.size();
 
-            auto inst = std::make_shared<transform>(
-                asset.mesh_bvh,
-                obj.translation,
-                obj.rotation_deg,  // degrees
-                s
+        for (size_t s = 0; s < num_slots; ++s) {
+            int scene_mat_idx = obj.mesh_slot_materials[s];
+            if (scene_mat_idx < 0 ||
+                scene_mat_idx >= static_cast<int>(scn.materials.size()))
+                continue;
+
+            const std::string& fbx_mat_name = asset.slot_names[s]; // "Legs", "Chest", ...
+
+            mat_table[fbx_mat_name] = get_material(scene_mat_idx);
+        }
+
+        // Default fallback material for any FBX material name not in the table.
+        auto default_mat =
+            (obj.material_index >= 0 &&
+             obj.material_index < static_cast<int>(scn.materials.size()))
+            ? get_material(obj.material_index)
+            : std::make_shared<lambertian>(
+                  std::make_shared<solid_colour>(colour(1.0, 0.0, 1.0))
+              ); // magenta debug
+
+        bool z_up = has_extension_ci(asset.file_path, ".fbx");
+
+        // This uses the multi-material overload from mesh_loader.h
+        std::shared_ptr<hittable_list> tri_list =
+            load_mesh_as_triangles(
+                asset.file_path,
+                mat_table,
+                default_mat,
+                z_up,
+                /*normalise_to_unit=*/true,
+                /*user_scale=*/2.0
             );
 
-            world.add(inst);
-            break;
-        }
+        if (!tri_list || tri_list->objects.empty())
+            continue;
 
-        default:
-            break;
-        }
+        // Build BVH for this instance's triangles
+        auto bvh = std::make_shared<bvh_node>(
+            tri_list->objects, 0, tri_list->objects.size()
+        );
+
+        // Apply instance transform (translation, rotation_deg, uniform scale)
+        double s = obj.scale.x();
+        if (s <= 0.0) s = 1.0;
+
+        auto inst = std::make_shared<transform>(
+            bvh,
+            obj.translation,
+            obj.rotation_deg,  // degrees
+            s
+        );
+
+        world.add(inst);
     }
 
     return world;
