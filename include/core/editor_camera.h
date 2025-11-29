@@ -7,44 +7,46 @@
 struct editor_camera_state {
     // Pose
     point3 position = point3(0, 0, 5);
-    double yaw      = 0.0;
-    double pitch    = 0.0;
+    double yaw      = 0.0;  // radians
+    double pitch    = 0.0;  // radians
 
     // Lens
-    float vfov     = 40.0;
+    float vfov      = 40.0f;   // vertical FOV in degrees
 
     // World up
     vec3 world_up   = vec3(0, 1, 0);
 
-    // Derived basis
+    // Derived basis (right-handed, -Z forward when yaw=0, pitch=0)
     vec3 forward    = vec3(0, 0, -1);
     vec3 right      = vec3(1, 0, 0);
     vec3 up         = vec3(0, 1, 0);
 
     // Limits
-    double min_pitch = -1.4;
-    double max_pitch = +1.4;
+    double min_pitch = -1.4;   // ~ -80deg
+    double max_pitch = +1.4;   // ~ +80deg
 
     // Tunables
-    double mouse_sensitivity = 0.0025;
-    double move_speed        = 5.0;
+    double move_speed = 5.0;   // units per second
 
     void update_basis()
     {
+        // yaw, pitch are in radians
         double cp = std::cos(pitch);
         double sp = std::sin(pitch);
         double cy = std::cos(yaw);
         double sy = std::sin(yaw);
 
+        // Standard FPS-style forward:
+        // yaw=0, pitch=0 -> (0,0,-1)
         forward = vec3(
-            cp * cy,
-            sp,
-            cp * sy
+            cp * sy,    // x
+            sp,         // y
+            -cp * cy    // z
         );
         forward = unit_vector(forward);
 
         right = unit_vector(cross(forward, world_up));
-        up    = cross(right, forward);
+        up    = unit_vector(cross(right, forward));
     }
 
     // Initialise from lookfrom/lookat style
@@ -53,16 +55,23 @@ struct editor_camera_state {
         position = pos;
         vec3 f = unit_vector(target - pos);
 
-        yaw   = std::atan2(f.z(), f.x());
+        // Inverse of the above forward() convention
+        // forward = (cp*sy, sp, -cp*cy)
+        // yaw from x and z:
+        yaw   = std::atan2(f.x(), -f.z());
         pitch = std::asin(f.y());
+
+        if (pitch < min_pitch) pitch = min_pitch;
+        if (pitch > max_pitch) pitch = max_pitch;
 
         update_basis();
     }
 
-    void look(double dx, double dy)
+    // dx, dy should already be scaled by your chosen sensitivity (in radians)
+    void look(double yaw_delta, double pitch_delta)
     {
-        yaw   += dx * mouse_sensitivity;
-        pitch += dy * mouse_sensitivity;
+        yaw   += yaw_delta;
+        pitch += pitch_delta;
 
         if (pitch < min_pitch) pitch = min_pitch;
         if (pitch > max_pitch) pitch = max_pitch;
@@ -93,12 +102,13 @@ struct editor_camera_state {
     }
 };
 
+// Sync from editor camera into your Shirley-style camera
 inline void to_shirley_camera(const editor_camera_state& s, camera& cam)
 {
     cam.lookfrom = s.position;
     cam.lookat   = s.position + s.forward;
     cam.vup      = s.up;
-    cam.vfov     = s.vfov;
+    cam.vfov     = s.vfov;   // degrees, as camera expects
 }
 
 #endif // EDITOR_CAMERA_H

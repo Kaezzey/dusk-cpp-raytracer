@@ -80,19 +80,15 @@ enum class scene_object_type {
 // ----------------------------------------
 struct scene_object {
     std::string       name;
-    scene_object_type type = scene_object_type::sphere;
-
-    int material_index = -1;   // index into scene.materials
-
-    // Sphere params (used when type == sphere)
-    point3 center = point3(0,0,0);
-    double radius = 0.5;
-
-    // Mesh instance params (used when type == mesh_instance)
-    int  mesh_index   = -1;           // index into scene.meshes
-    vec3 translation  = vec3(0,0,0);  // world-space translation
-    vec3 rotation_deg = vec3(0,0,0);  // degrees, XYZ order
-    vec3 scale        = vec3(1,1,1);  // non-uniform scale allowed
+    scene_object_type type;
+    int   material_index;
+    point3 center;
+    double radius;
+    int   mesh_index;
+    vec3  translation;
+    vec3  rotation_deg;
+    vec3  scale;
+    std::vector<int> mesh_slot_materials;
 };
 
 // ----------------------------------------
@@ -102,9 +98,9 @@ struct scene_object {
 struct scene_mesh_asset {
     std::string name;
     std::string file_path;
-
-    // Baked geometry for this mesh (BVH over triangles)
     std::shared_ptr<hittable> mesh_bvh;
+    std::vector<std::string> slot_names;
+    std::vector<int>         slot_default_materials;
 };
 
 // ----------------------------------------

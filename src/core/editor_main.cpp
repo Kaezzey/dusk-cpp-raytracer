@@ -6,10 +6,14 @@
 #include <vector>
 #include <cstdint>
 #include <cmath>
-#include <string>   // for material labels
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <cctype>
+#include <cstring>
 
-#include "../../external/glew/include/GL/glew.h"   // GLEW (OpenGL loader)
-#include "../../include/external/GLFW/glfw3.h"     // our local GLFW
+#include "../../external/glew/include/GL/glew.h"
+#include "../../include/external/GLFW/glfw3.h"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -20,6 +24,11 @@
 #include "../../include/core/scene.h"
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/editor_camera.h"
+
+// Assimp for FBX/OBJ mesh import
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
 
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
@@ -41,17 +50,17 @@ static bool g_viewport_focused = false;
 static bool g_viewport_hovered = false;
 
 // Editor camera tuning
-static float g_camera_move_speed = 4.0f;   // units per second
-static float g_camera_look_sens  = 0.2f;   // mouse sensitivity
+static float g_camera_move_speed = 4.0f;    // units per second
+static float g_camera_look_sens  = 0.002f;  // radians per pixel
 
 // Currently selected object in the Scene Hierarchy (-1 = none)
 static int g_selected_object = -1;
 
-// List of files dropped onto the GLFW window this frame
+// Files dropped this frame
 static std::vector<std::string> g_dropped_files;
 
 // -----------------------------------------------------------------------------
-// GPU texture for displaying the ray-traced image
+// Ray-traced image texture
 // -----------------------------------------------------------------------------
 
 static GLuint                    g_rtTexture  = 0;
@@ -59,6 +68,35 @@ static int                       g_rtWidth    = 0;
 static int                       g_rtHeight   = 0;
 static bool                      g_rtHasImage = false;
 static std::vector<std::uint8_t> g_rtPixels;   // RGBA8
+
+// -----------------------------------------------------------------------------
+// Rasterised preview: sphere mesh, GPU meshes, FBO
+// -----------------------------------------------------------------------------
+
+struct gpu_mesh {
+    GLuint vao          = 0;
+    GLuint vbo          = 0;
+    GLuint ebo          = 0;
+    GLsizei index_count = 0;
+};
+
+static GLuint  g_rasterShader           = 0;
+static GLuint  g_rasterSphereVAO        = 0;
+static GLuint  g_rasterSphereVBO        = 0;
+static GLuint  g_rasterSphereEBO        = 0;
+static GLsizei g_rasterSphereIndexCount = 0;
+
+// One gpu_mesh per scene mesh asset, same index as g_scene.meshes
+static std::vector<gpu_mesh> g_gpu_meshes;
+
+static GLuint g_rasterFBO      = 0;
+static GLuint g_rasterColorTex = 0;
+static GLuint g_rasterDepthRBO = 0;
+static int    g_rasterWidth    = 0;
+static int    g_rasterHeight   = 0;
+
+// 0 = Ray Traced, 1 = Rasterised
+static int g_viewport_mode = 0;
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -69,18 +107,49 @@ static void glfw_error_callback(int error, const char* description)
     std::fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
-// Build a simple test scene using your scene.h material/object system
+static inline double dot3(const vec3& a, const vec3& b)
+{
+    return a.x()*b.x() + a.y()*b.y() + a.z()*b.z();
+}
+
+// Case-insensitive extension check
+static bool has_extension_ci(const std::string& path, const char* ext)
+{
+    size_t lenp = path.size();
+    size_t lene = std::strlen(ext);
+    if (lenp < lene) return false;
+    size_t off = lenp - lene;
+    for (size_t i = 0; i < lene; ++i) {
+        char c1 = (char)std::tolower(path[off + i]);
+        char c2 = (char)std::tolower(ext[i]);
+        if (c1 != c2) return false;
+    }
+    return true;
+}
+
+static inline void zup_to_yup(float& x, float& y, float& z)
+{
+    float nx = x;
+    float ny = z;
+    float nz = -y;
+    x = nx;
+    y = ny;
+    z = nz;
+}
+
+// -----------------------------------------------------------------------------
+// Default scene
+// -----------------------------------------------------------------------------
+
 static void build_default_scene(scene& scn)
 {
-    scn.textures.clear();   // Start with NO textures – users will drag & drop
+    scn.textures.clear();
     scn.materials.clear();
     scn.objects.clear();
     scn.meshes.clear();
     scn.lights.clear();
 
-    // -------------------------
     // Materials
-    // -------------------------
     int ground_mat = (int)scn.materials.size();
     scn.materials.push_back({});
     scn.materials.back().name       = "Ground";
@@ -112,26 +181,24 @@ static void build_default_scene(scene& scn)
         m.normal_strength = 1.0;
         m.dielectric_F0   = colour(0.04, 0.04, 0.04);
 
-        // No default textures bound – user must assign via drag & drop
         m.albedo_tex    = -1;
         m.metallic_tex  = -1;
         m.roughness_tex = -1;
         m.normal_tex    = -1;
     }
 
-    // -------------------------
     // Spheres
-    // -------------------------
     scn.objects.push_back({
         "GroundSphere",
         scene_object_type::sphere,
         ground_mat,
         point3(0, -100.5, -1),
         100.0,
-        -1,                    // mesh_index
-        vec3(0,0,0),
-        vec3(0,0,0),
-        vec3(1,1,1)
+        -1,                   // mesh_index
+        vec3(0,0,0),          // translation
+        vec3(0,0,0),          // rotation_deg
+        vec3(1,1,1),          // scale
+        {}                    // mesh_slot_materials (unused for spheres)
     });
 
     scn.objects.push_back({
@@ -143,7 +210,8 @@ static void build_default_scene(scene& scn)
         -1,
         vec3(0,0,0),
         vec3(0,0,0),
-        vec3(1,1,1)
+        vec3(1,1,1),
+        {}
     });
 
     scn.objects.push_back({
@@ -155,7 +223,8 @@ static void build_default_scene(scene& scn)
         -1,
         vec3(0,0,0),
         vec3(0,0,0),
-        vec3(1,1,1)
+        vec3(1,1,1),
+        {}
     });
 
     scn.objects.push_back({
@@ -167,10 +236,11 @@ static void build_default_scene(scene& scn)
         -1,
         vec3(0,0,0),
         vec3(0,0,0),
-        vec3(1,1,1)
+        vec3(1,1,1),
+        {}
     });
 
-    // Optional light placeholder
+    // Light (for RT; raster uses hard-coded sun dir)
     scene_light sun;
     sun.name      = "Sun";
     sun.type      = scene_light_type::directional;
@@ -179,6 +249,580 @@ static void build_default_scene(scene& scn)
     scn.lights.push_back(std::move(sun));
 }
 
+// -----------------------------------------------------------------------------
+// Raster shader + math
+// -----------------------------------------------------------------------------
+
+static GLuint CompileShader(const char* vs, const char* fs)
+{
+    GLint status;
+    char  log[1024];
+
+    GLuint v = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(v, 1, &vs, nullptr);
+    glCompileShader(v);
+    glGetShaderiv(v, GL_COMPILE_STATUS, &status);
+    if (!status) {
+        glGetShaderInfoLog(v, sizeof(log), nullptr, log);
+        std::fprintf(stderr, "Vertex shader error: %s\n", log);
+    }
+
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, nullptr);
+    glCompileShader(f);
+    glGetShaderiv(f, GL_COMPILE_STATUS, &status);
+    if (!status) {
+        glGetShaderInfoLog(f, sizeof(log), nullptr, log);
+        std::fprintf(stderr, "Fragment shader error: %s\n", log);
+    }
+
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, v);
+    glAttachShader(prog, f);
+    glBindAttribLocation(prog, 0, "aPos");
+    glBindAttribLocation(prog, 1, "aNormal");
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &status);
+    if (!status) {
+        glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+        std::fprintf(stderr, "Program link error: %s\n", log);
+    }
+
+    glDeleteShader(v);
+    glDeleteShader(f);
+    return prog;
+}
+
+static void BuildRasterShader()
+{
+    const char* vs = R"(#version 130
+        in vec3 aPos;
+        in vec3 aNormal;
+
+        uniform mat4 uModel;
+        uniform mat4 uView;
+        uniform mat4 uProj;
+
+        out vec3 vNormal;
+
+        void main() {
+            mat3 normalMat = mat3(uModel);
+            vNormal = normalize(normalMat * aNormal);
+            gl_Position = uProj * uView * uModel * vec4(aPos, 1.0);
+        }
+    )";
+
+    const char* fs = R"(#version 130
+        in vec3 vNormal;
+
+        uniform vec3 uColor;
+        uniform vec3 uLightDir; // direction from light toward scene
+
+        out vec4 FragColor;
+
+        void main() {
+            vec3 n = normalize(vNormal);
+            vec3 l = normalize(-uLightDir); // light→scene
+
+            float NdotL   = max(dot(n, l), 0.0);
+            float ambient = 0.2;
+            float diffuse = NdotL;
+
+            vec3 shaded = uColor * (ambient + diffuse);
+            FragColor   = vec4(shaded, 1.0);
+        }
+    )";
+
+    g_rasterShader = CompileShader(vs, fs);
+}
+
+static void make_lookat(const vec3& eye, const vec3& center, const vec3& up, float out[16])
+{
+    vec3 f = unit_vector(center - eye);
+    vec3 s = unit_vector(cross(f, up));
+    vec3 u = cross(s, f);
+
+    out[0]  = (float)s.x();  out[1]  = (float)u.x();  out[2]  = (float)-f.x(); out[3]  = 0.0f;
+    out[4]  = (float)s.y();  out[5]  = (float)u.y();  out[6]  = (float)-f.y(); out[7]  = 0.0f;
+    out[8]  = (float)s.z();  out[9]  = (float)u.z();  out[10] = (float)-f.z(); out[11] = 0.0f;
+
+    out[12] = (float)-dot3(s, eye);
+    out[13] = (float)-dot3(u, eye);
+    out[14] = (float) dot3(f, eye);
+    out[15] = 1.0f;
+}
+
+static void make_perspective(float fov_deg, float aspect, float znear, float zfar, float out[16])
+{
+    const float PI  = 3.14159265359f;
+    float fov_rad   = fov_deg * (PI / 180.0f);
+    float f         = 1.0f / std::tan(fov_rad * 0.5f);
+
+    out[0]  = f / aspect; out[1]  = 0.0f; out[2]  = 0.0f;                                out[3]  = 0.0f;
+    out[4]  = 0.0f;       out[5]  = f;    out[6]  = 0.0f;                                out[7]  = 0.0f;
+    out[8]  = 0.0f;       out[9]  = 0.0f; out[10] = (zfar + znear) / (znear - zfar);     out[11] = -1.0f;
+    out[12] = 0.0f;       out[13] = 0.0f; out[14] = (2.0f * zfar * znear) / (znear - zfar); out[15] = 0.0f;
+}
+
+// translate + uniform scale sphere
+static void make_model_sphere(const point3& c, double radius, float out[16])
+{
+    float s = (float)radius;
+
+    out[0]  = s;    out[1]  = 0.0f; out[2]  = 0.0f; out[3]  = 0.0f;
+    out[4]  = 0.0f; out[5]  = s;    out[6]  = 0.0f; out[7]  = 0.0f;
+    out[8]  = 0.0f; out[9]  = 0.0f; out[10] = s;    out[11] = 0.0f;
+    out[12] = (float)c.x(); out[13] = (float)c.y(); out[14] = (float)c.z(); out[15] = 1.0f;
+}
+
+static void make_model_translate_only(const vec3& t, float out[16])
+{
+    out[0]  = 1.0f; out[1]  = 0.0f; out[2]  = 0.0f; out[3]  = 0.0f;
+    out[4]  = 0.0f; out[5]  = 1.0f; out[6]  = 0.0f; out[7]  = 0.0f;
+    out[8]  = 0.0f; out[9]  = 0.0f; out[10] = 1.0f; out[11] = 0.0f;
+    out[12] = (float)t.x(); out[13] = (float)t.y(); out[14] = (float)t.z(); out[15] = 1.0f;
+}
+
+// Unit sphere mesh with normals
+static void BuildUnitSphereMesh(int segments = 32, int rings = 16)
+{
+    struct SphereVertex {
+        float px, py, pz;
+        float nx, ny, nz;
+    };
+
+    std::vector<SphereVertex> verts;
+    std::vector<unsigned int> inds;
+
+    const float PI = 3.14159265359f;
+
+    for (int y = 0; y <= rings; ++y) {
+        float v   = float(y) / float(rings);
+        float phi = v * PI;
+
+        for (int x = 0; x <= segments; ++x) {
+            float u     = float(x) / float(segments);
+            float theta = u * 2.0f * PI;
+
+            float xp = std::cos(theta) * std::sin(phi);
+            float yp = std::cos(phi);
+            float zp = std::sin(theta) * std::sin(phi);
+
+            SphereVertex vtx;
+            vtx.px = xp;
+            vtx.py = yp;
+            vtx.pz = zp;
+            vtx.nx = xp;
+            vtx.ny = yp;
+            vtx.nz = zp;
+            verts.push_back(vtx);
+        }
+    }
+
+    for (int y = 0; y < rings; ++y) {
+        for (int x = 0; x < segments; ++x) {
+            int i0 =  y      * (segments+1) + x;
+            int i1 =  i0 + 1;
+            int i2 = (y+1)   * (segments+1) + x;
+            int i3 =  i2 + 1;
+
+            inds.push_back(i0); inds.push_back(i2); inds.push_back(i1);
+            inds.push_back(i1); inds.push_back(i2); inds.push_back(i3);
+        }
+    }
+
+    g_rasterSphereIndexCount = (GLsizei)inds.size();
+
+    glGenVertexArrays(1, &g_rasterSphereVAO);
+    glBindVertexArray(g_rasterSphereVAO);
+
+    glGenBuffers(1, &g_rasterSphereVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_rasterSphereVBO);
+    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(SphereVertex),
+                 verts.data(), GL_STATIC_DRAW);
+
+    glGenBuffers(1, &g_rasterSphereEBO);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_rasterSphereEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, inds.size() * sizeof(unsigned int),
+                 inds.data(), GL_STATIC_DRAW);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(SphereVertex), (void*)0);
+
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(SphereVertex), (void*)(3 * sizeof(float)));
+
+    glBindVertexArray(0);
+}
+
+// -----------------------------------------------------------------------------
+// Assimp-based mesh → gpu_mesh loader (FBX/OBJ)
+// -----------------------------------------------------------------------------
+
+struct MeshLoadResult {
+    gpu_mesh mesh;
+    float    approx_radius = 1.0f;
+
+    // One per Assimp material index – used as material slots.
+    std::vector<std::string> material_slot_names;
+};
+
+// z_up           : set true for FBX that is authored Z-up
+// normalise_unit : match your mesh_loader.h behaviour
+// user_scale     : extra scale factor if you ever want it
+static MeshLoadResult load_assimp_mesh_as_gpu_mesh(
+    const std::string& full_path,
+    bool               z_up,
+    bool               normalise_unit,
+    double             user_scale)
+{
+    MeshLoadResult result{};
+
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(
+        full_path,
+        aiProcess_Triangulate |
+        aiProcess_JoinIdenticalVertices |
+        aiProcess_GenSmoothNormals |
+        aiProcess_ImproveCacheLocality |
+        aiProcess_OptimizeMeshes
+    );
+
+    if (!scene || !scene->mRootNode || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE)) {
+        std::fprintf(stderr, "Assimp load failed for '%s': %s\n",
+                     full_path.c_str(), importer.GetErrorString());
+        return result;
+    }
+
+    // Material slot names (per aiMaterial)
+    result.material_slot_names.clear();
+    result.material_slot_names.reserve(scene->mNumMaterials);
+    for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
+        aiString nm;
+        scene->mMaterials[i]->Get(AI_MATKEY_NAME, nm);
+        result.material_slot_names.emplace_back(nm.C_Str());
+    }
+
+    // -------------------------
+    // PASS 1: bounds (after optional Z->Y rotation)
+    // -------------------------
+    point3 minp( 1e30, 1e30, 1e30 );
+    point3 maxp(-1e30,-1e30,-1e30 );
+
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        aiMesh* mesh = scene->mMeshes[m];
+        for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+            float x = mesh->mVertices[v].x;
+            float y = mesh->mVertices[v].y;
+            float z = mesh->mVertices[v].z;
+
+            if (z_up) {
+                zup_to_yup(x, y, z);
+            }
+
+            minp = point3(
+                std::min(minp.x(), (double)x),
+                std::min(minp.y(), (double)y),
+                std::min(minp.z(), (double)z)
+            );
+            maxp = point3(
+                std::max(maxp.x(), (double)x),
+                std::max(maxp.y(), (double)y),
+                std::max(maxp.z(), (double)z)
+            );
+        }
+    }
+
+    vec3 extent = maxp - minp;
+
+    double base_scale = 1.0;
+    if (normalise_unit) {
+        double max_extent = std::max({ extent.x(), extent.y(), extent.z() });
+        if (max_extent <= 0.0) max_extent = 1.0;
+        base_scale = 1.0 / max_extent;
+    }
+    double scale = base_scale * user_scale;
+
+    // Pivot: centre in X/Z, feet on y=0 (same as mesh_loader.h)
+    double pivot_x = 0.5 * (minp.x() + maxp.x());
+    double pivot_z = 0.5 * (minp.z() + maxp.z());
+    double pivot_y = minp.y();
+    vec3   pivot(pivot_x, pivot_y, pivot_z);
+
+    std::printf("Raster mesh '%s'\n", full_path.c_str());
+    std::printf("  min = (%.3f, %.3f, %.3f)\n", minp.x(), minp.y(), minp.z());
+    std::printf("  max = (%.3f, %.3f, %.3f)\n", maxp.x(), maxp.y(), maxp.z());
+    std::printf("  z_up = %s, normalise_unit = %s, base_scale = %.4f, user_scale = %.4f\n",
+                z_up ? "true" : "false",
+                normalise_unit ? "true" : "false",
+                base_scale, user_scale);
+
+    struct Vertex {
+        float px, py, pz;
+        float nx, ny, nz;
+    };
+
+    std::vector<Vertex> verts;
+    std::vector<unsigned int> inds;
+    verts.reserve(65536);
+    inds.reserve(65536);
+
+    float max_r2 = 0.0f;
+    unsigned int running_index = 0;
+
+    // -------------------------
+    // PASS 2: build flattened vertex/index buffers in transformed space
+    // -------------------------
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        aiMesh* mesh = scene->mMeshes[m];
+        bool has_normals = mesh->HasNormals();
+
+        for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+            const aiFace& face = mesh->mFaces[f];
+            if (face.mNumIndices != 3) continue;
+
+            for (unsigned int k = 0; k < 3; ++k) {
+                unsigned int idx = face.mIndices[k];
+                if (idx >= mesh->mNumVertices) continue;
+
+                float x = mesh->mVertices[idx].x;
+                float y = mesh->mVertices[idx].y;
+                float z = mesh->mVertices[idx].z;
+
+                if (z_up) {
+                    zup_to_yup(x, y, z);
+                }
+
+                // apply pivot + scale to position
+                vec3 p_local((double)x, (double)y, (double)z);
+                p_local = (p_local - pivot) * scale;
+
+                float px = (float)p_local.x();
+                float py = (float)p_local.y();
+                float pz = (float)p_local.z();
+
+                float nx = 0.0f, ny = 1.0f, nz = 0.0f;
+                if (has_normals) {
+                    nx = mesh->mNormals[idx].x;
+                    ny = mesh->mNormals[idx].y;
+                    nz = mesh->mNormals[idx].z;
+                    if (z_up) {
+                        zup_to_yup(nx, ny, nz);
+                    }
+                }
+
+                Vertex v;
+                v.px = px; v.py = py; v.pz = pz;
+                v.nx = nx; v.ny = ny; v.nz = nz;
+                verts.push_back(v);
+
+                float r2 = px*px + py*py + pz*pz;
+                if (r2 > max_r2) max_r2 = r2;
+
+                inds.push_back(running_index++);
+            }
+        }
+    }
+
+    if (verts.empty() || inds.empty()) {
+        std::fprintf(stderr, "Assimp mesh has no geometry after processing: %s\n",
+                     full_path.c_str());
+        return result;
+    }
+
+    result.approx_radius = max_r2 > 0.0f ? std::sqrt(max_r2) : 1.0f;
+
+    glGenVertexArrays(1, &result.mesh.vao);
+    glBindVertexArray(result.mesh.vao);
+
+    glGenBuffers(1, &result.mesh.vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, result.mesh.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 verts.size() * sizeof(Vertex),
+                 verts.data(),
+                 GL_STATIC_DRAW);
+
+    glGenBuffers(1, &result.mesh.ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, result.mesh.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                 inds.size() * sizeof(unsigned int),
+                 inds.data(),
+                 GL_STATIC_DRAW);
+
+    result.mesh.index_count = (GLsizei)inds.size();
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(Vertex), (void*)0);
+
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(Vertex), (void*)(3 * sizeof(float)));
+
+    glBindVertexArray(0);
+
+    std::printf("Raster imported mesh: verts=%zu, tris=%zu, approx_radius=%.3f\n",
+                verts.size(), inds.size() / 3, result.approx_radius);
+
+    return result;
+}
+
+// -----------------------------------------------------------------------------
+// Raster FBO
+// -----------------------------------------------------------------------------
+
+static void EnsureRasterFBO(int width, int height)
+{
+    if (width <= 0 || height <= 0) return;
+
+    if (g_rasterFBO == 0) {
+        glGenFramebuffers(1, &g_rasterFBO);
+        glGenTextures(1, &g_rasterColorTex);
+        glGenRenderbuffers(1, &g_rasterDepthRBO);
+    }
+
+    if (width != g_rasterWidth || height != g_rasterHeight) {
+        g_rasterWidth  = width;
+        g_rasterHeight = height;
+
+        glBindTexture(GL_TEXTURE_2D, g_rasterColorTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                     width, height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+        glBindRenderbuffer(GL_RENDERBUFFER, g_rasterDepthRBO);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8,
+                              width, height);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, g_rasterFBO);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, g_rasterColorTex, 0);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                                  GL_RENDERBUFFER, g_rasterDepthRBO);
+
+        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            std::fprintf(stderr, "Raster FBO incomplete: 0x%X\n", status);
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+}
+
+// Render rasterised scene into g_rasterColorTex
+static void RenderRasterToTexture(int width, int height)
+{
+    if (g_rasterShader == 0 || g_rasterSphereVAO == 0)
+        return;
+
+    EnsureRasterFBO(width, height);
+    if (g_rasterFBO == 0) return;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_rasterFBO);
+    glViewport(0, 0, width, height);
+    glEnable(GL_DEPTH_TEST);
+    glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    float view[16];
+    float proj[16];
+
+    const vec3& pos = g_editor_cam.position;
+    const vec3& f   = g_editor_cam.forward;
+    const vec3& u   = g_editor_cam.up;
+
+    make_lookat(pos, pos + f, u, view);
+    make_perspective(g_editor_cam.vfov,
+                     (float)width / (float)height,
+                     0.01f, 500.0f, proj);
+
+    glUseProgram(g_rasterShader);
+
+    GLint locModel    = glGetUniformLocation(g_rasterShader, "uModel");
+    GLint locView     = glGetUniformLocation(g_rasterShader, "uView");
+    GLint locProj     = glGetUniformLocation(g_rasterShader, "uProj");
+    GLint locColor    = glGetUniformLocation(g_rasterShader, "uColor");
+    GLint locLightDir = glGetUniformLocation(g_rasterShader, "uLightDir");
+
+    glUniformMatrix4fv(locView, 1, GL_FALSE, view);
+    glUniformMatrix4fv(locProj, 1, GL_FALSE, proj);
+
+    vec3 L = unit_vector(vec3(-1.0, -1.0, -0.5));
+    glUniform3f(locLightDir, (float)L.x(), (float)L.y(), (float)L.z());
+
+    for (const auto& obj : g_scene.objects)
+    {
+        float model[16];
+
+        // Decide which material index to use for raster colouring
+        int mat_index_for_raster = obj.material_index;
+
+        if (obj.type == scene_object_type::mesh_instance &&
+            !obj.mesh_slot_materials.empty())
+        {
+            // Prefer first valid slot binding for *preview* colour
+            for (int idx : obj.mesh_slot_materials) {
+                if (idx >= 0 && idx < (int)g_scene.materials.size()) {
+                    mat_index_for_raster = idx;
+                    break;
+                }
+            }
+        }
+
+        float cr = 0.8f, cg = 0.8f, cb = 0.8f;
+        if (mat_index_for_raster >= 0 &&
+            mat_index_for_raster < (int)g_scene.materials.size())
+        {
+            const auto& m = g_scene.materials[mat_index_for_raster];
+            cr = (float)m.base_color.x();
+            cg = (float)m.base_color.y();
+            cb = (float)m.base_color.z();
+        }
+        glUniform3f(locColor, cr, cg, cb);
+
+        if (obj.type == scene_object_type::sphere)
+        {
+            make_model_sphere(obj.center, obj.radius, model);
+            glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
+
+            glBindVertexArray(g_rasterSphereVAO);
+            glDrawElements(GL_TRIANGLES, g_rasterSphereIndexCount,
+                           GL_UNSIGNED_INT, (void*)0);
+        }
+        else if (obj.type == scene_object_type::mesh_instance)
+        {
+            if (obj.mesh_index < 0 ||
+                obj.mesh_index >= (int)g_gpu_meshes.size())
+                continue;
+
+            const gpu_mesh& gm = g_gpu_meshes[obj.mesh_index];
+            if (gm.vao == 0 || gm.index_count == 0)
+                continue;
+
+            make_model_translate_only(obj.translation, model);
+            glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
+
+            glBindVertexArray(gm.vao);
+            glDrawElements(GL_TRIANGLES, gm.index_count,
+                           GL_UNSIGNED_INT, (void*)0);
+        }
+    }
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// -----------------------------------------------------------------------------
+// Engine init
+// -----------------------------------------------------------------------------
+
 static void init_engine_once()
 {
     if (g_scene_initialized)
@@ -186,48 +830,42 @@ static void init_engine_once()
 
     build_default_scene(g_scene);
 
-    // Editor camera initial pose (same as your old camera)
-    g_editor_cam.position = point3(3, 3, 2);
-    g_editor_cam.vfov     = 40.0;
+    // Editor camera pose
+    g_editor_cam.vfov = 40.0f;
+    g_editor_cam.set_from_lookat(point3(3, 3, 2),
+                                 point3(0, 0, -1));
 
-    point3 target  = point3(0, 0, -1);
-    vec3   forward = unit_vector(target - g_editor_cam.position);
-
-    g_editor_cam.yaw   = std::atan2(forward.z(), forward.x());
-    g_editor_cam.pitch = std::asin(forward.y());
-    g_editor_cam.update_basis();
-
-    // Ray-tracer camera base params
+    // RT camera
     g_camera.aspect_ratio      = 16.0 / 9.0;
     g_camera.image_width       = 800;
-    g_camera.image_height      = 450; // keep consistent with aspect ratio
-    g_camera.samples_per_pixel = 20;   // default sampling
-    g_camera.max_depth         = 20;   // default bounce depth
+    g_camera.image_height      = 450;
+    g_camera.samples_per_pixel = 20;
+    g_camera.max_depth         = 20;
     g_camera.background        = colour(0.70, 0.80, 1.00);
-
-    // Ensure camera uses the editor cam pose
     to_shirley_camera(g_editor_cam, g_camera);
+
+    BuildUnitSphereMesh();
+    BuildRasterShader();
 
     g_scene_initialized = true;
 }
 
-// Sync editor camera into the ray-tracer camera
+// Sync editor camera into RT camera
 static void sync_camera_from_editor(float viewport_width, float viewport_height)
 {
     if (viewport_width > 0.0f && viewport_height > 0.0f) {
         g_camera.aspect_ratio = viewport_width / viewport_height;
     }
-
     to_shirley_camera(g_editor_cam, g_camera);
 }
 
-// Convert render_result (uint8 RGB) into an RGBA8 OpenGL texture.
+// Convert render_result to RGBA8 texture
 static void UploadRenderToTexture(const render_result& img)
 {
     const int width  = img.width;
     const int height = img.height;
 
-    const std::vector<std::uint8_t>& src = img.pixels; // 3 bytes per pixel
+    const std::vector<std::uint8_t>& src = img.pixels;
 
     if (width <= 0 || height <= 0 || src.empty())
         return;
@@ -240,10 +878,10 @@ static void UploadRenderToTexture(const render_result& img)
         int src_idx = 3 * i;
         int dst_idx = 4 * i;
 
-        g_rtPixels[dst_idx + 0] = src[src_idx + 0]; // R
-        g_rtPixels[dst_idx + 1] = src[src_idx + 1]; // G
-        g_rtPixels[dst_idx + 2] = src[src_idx + 2]; // B
-        g_rtPixels[dst_idx + 3] = 255;              // A
+        g_rtPixels[dst_idx + 0] = src[src_idx + 0];
+        g_rtPixels[dst_idx + 1] = src[src_idx + 1];
+        g_rtPixels[dst_idx + 2] = src[src_idx + 2];
+        g_rtPixels[dst_idx + 3] = 255;
     }
 
     if (g_rtTexture == 0) {
@@ -253,36 +891,26 @@ static void UploadRenderToTexture(const render_result& img)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(
-            GL_TEXTURE_2D, 0, GL_RGBA,
-            width, height, 0,
-            GL_RGBA, GL_UNSIGNED_BYTE, g_rtPixels.data()
-        );
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, g_rtPixels.data());
     } else {
         glBindTexture(GL_TEXTURE_2D, g_rtTexture);
-        glTexImage2D(
-            GL_TEXTURE_2D, 0, GL_RGBA,
-            width, height, 0,
-            GL_RGBA, GL_UNSIGNED_BYTE, g_rtPixels.data()
-        );
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, g_rtPixels.data());
     }
 
     g_rtHasImage = true;
 }
 
-// Basic FPS-style camera controls using GLFW input
+// -----------------------------------------------------------------------------
+// Input
+// -----------------------------------------------------------------------------
+
 static void update_editor_camera_from_input(GLFWwindow* window, double dt)
 {
-    ImGuiIO& io = ImGui::GetIO();
-    (void)io;
-
-    // Only move camera when viewport is focused/hovered
     if (!g_viewport_focused && !g_viewport_hovered)
         return;
 
-    // -----------------------------
-    // Keyboard movement (WASD/QE)
-    // -----------------------------
     float move_forward = 0.0f;
     float move_right   = 0.0f;
     float move_up      = 0.0f;
@@ -295,17 +923,12 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
     if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) move_up      -= 1.0f;
 
     if (move_forward != 0.0f || move_right != 0.0f || move_up != 0.0f) {
+        g_editor_cam.move_speed = (double)g_camera_move_speed;
         g_editor_cam.move_from_input(
-            move_forward,
-            move_right,
-            move_up,
-            (float)(dt * g_camera_move_speed)
+            move_forward, move_right, move_up, dt
         );
     }
 
-    // -----------------------------
-    // Mouse look (hold RMB)
-    // -----------------------------
     static bool   rotating = false;
     static double last_x   = 0.0;
     static double last_y   = 0.0;
@@ -317,13 +940,10 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
 
         if (!rotating) {
             rotating = true;
-
-            // Lock/hide cursor while looking
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-
             last_x = x;
             last_y = y;
-            return; // avoid jump on first frame
+            return;
         }
 
         double dx = x - last_x;
@@ -331,22 +951,195 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
         last_x = x;
         last_y = y;
 
-        float sensitivity = g_camera_look_sens;
-        float yaw_delta   =  (float)( dx * sensitivity);  // right -> +yaw
-        float pitch_delta =  (float)(-dy * sensitivity);  // up   -> +pitch
+        double yaw_delta   =  dx * g_camera_look_sens;
+        double pitch_delta = -dy * g_camera_look_sens;
+
         g_editor_cam.look(yaw_delta, pitch_delta);
     }
     else
     {
         if (rotating) {
-            // Restore cursor
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
         }
         rotating = false;
     }
 }
 
-// GLFW file-drop callback: collects dropped file paths
+// -----------------------------------------------------------------------------
+// Material inspector helper
+// -----------------------------------------------------------------------------
+
+static void DrawMaterialInspector(scene_material& mat, scene& scn)
+{
+    ImGui::Separator();
+    ImGui::Text("Material Class");
+
+    const char* model_label = "Unknown";
+    switch (mat.model) {
+        case scene_material_model::lambert:       model_label = "Lambert";       break;
+        case scene_material_model::metal:         model_label = "Metal";         break;
+        case scene_material_model::dielectric:    model_label = "Dielectric";    break;
+        case scene_material_model::diffuse_light: model_label = "Diffuse Light"; break;
+        case scene_material_model::isotropic:     model_label = "Isotropic";     break;
+        case scene_material_model::pbr:           model_label = "PBR";           break;
+        default:                                  model_label = "Unknown";       break;
+    }
+
+    if (ImGui::BeginCombo("Class", model_label)) {
+        struct Option { const char* label; scene_material_model model; };
+        Option opts[] = {
+            { "Lambert",        scene_material_model::lambert },
+            { "Metal",          scene_material_model::metal },
+            { "Dielectric",     scene_material_model::dielectric },
+            { "Diffuse Light",  scene_material_model::diffuse_light },
+            { "Isotropic",      scene_material_model::isotropic },
+            { "PBR GGX",        scene_material_model::pbr },
+        };
+
+        for (const auto& opt : opts) {
+            bool selected = (mat.model == opt.model);
+            if (ImGui::Selectable(opt.label, selected)) {
+                mat.model = opt.model;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Material Parameters");
+
+    {
+        float base[3] = {
+            (float)mat.base_color.x(),
+            (float)mat.base_color.y(),
+            (float)mat.base_color.z()
+        };
+        if (ImGui::ColorEdit3("Base Color", base)) {
+            mat.base_color = colour(base[0], base[1], base[2]);
+        }
+    }
+
+    switch (mat.model) {
+    case scene_material_model::lambert:
+        ImGui::TextDisabled("Lambert: pure diffuse.");
+        break;
+
+    case scene_material_model::metal:
+        ImGui::TextDisabled("Metal: Shirley metal (fuzz not exposed yet).");
+        break;
+
+    case scene_material_model::dielectric:
+    {
+        ImGui::TextDisabled("Dielectric: glass-like.");
+        float ior_f = (float)mat.ior;
+        if (ImGui::SliderFloat("IOR", &ior_f, 1.0f, 2.5f)) {
+            mat.ior = ior_f;
+        }
+    } break;
+
+    case scene_material_model::diffuse_light:
+    {
+        float e[3] = {
+            (float)mat.emission.x(),
+            (float)mat.emission.y(),
+            (float)mat.emission.z()
+        };
+        if (ImGui::ColorEdit3("Emission", e)) {
+            mat.emission = vec3(e[0], e[1], e[2]);
+        }
+    } break;
+
+    case scene_material_model::isotropic:
+        ImGui::TextDisabled("Isotropic (volume).");
+        break;
+
+    case scene_material_model::pbr:
+    {
+        ImGui::TextDisabled("PBR GGX (your custom shader).");
+
+        float metallic_f  = (float)mat.metallic;
+        float roughness_f = (float)mat.roughness;
+        float norm_str_f  = (float)mat.normal_strength;
+
+        if (ImGui::SliderFloat("Metallic", &metallic_f, 0.0f, 1.0f)) {
+            mat.metallic = metallic_f;
+        }
+        if (ImGui::SliderFloat("Roughness", &roughness_f, 0.02f, 1.0f)) {
+            mat.roughness = roughness_f;
+        }
+        if (ImGui::SliderFloat("Normal Strength", &norm_str_f, 0.0f, 4.0f)) {
+            mat.normal_strength = norm_str_f;
+        }
+
+        float f0[3] = {
+            (float)mat.dielectric_F0.x(),
+            (float)mat.dielectric_F0.y(),
+            (float)mat.dielectric_F0.z()
+        };
+        if (ImGui::ColorEdit3("Dielectric F0", f0)) {
+            mat.dielectric_F0 = vec3(f0[0], f0[1], f0[2]);
+        }
+
+        ImGui::Separator();
+        ImGui::Text("PBR Texture Maps (drag from Textures window)");
+
+        auto draw_tex_slot = [&](const char* label, int& tex_index)
+        {
+            ImGui::Text("%s", label);
+            ImGui::SameLine();
+            const char* btn_label = "<none>";
+            if (tex_index >= 0 &&
+                tex_index < (int)scn.textures.size()) {
+                btn_label = scn.textures[tex_index].name.c_str();
+            }
+            ImGui::Button(btn_label, ImVec2(140.0f, 0.0f));
+
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* payload =
+                        ImGui::AcceptDragDropPayload("TEXTURE_ASSET_ID"))
+                {
+                    int asset_index = *(const int*)payload->Data;
+                    if (asset_index >= 0 &&
+                        asset_index < (int)scn.textures.size()) {
+                        tex_index = asset_index;
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+
+            if (tex_index >= 0) {
+                ImGui::SameLine();
+                std::string clear_id = std::string("X##clear_") + label;
+                if (ImGui::SmallButton(clear_id.c_str())) {
+                    tex_index = -1;
+                }
+            }
+        };
+
+        draw_tex_slot("Albedo",    mat.albedo_tex);
+        draw_tex_slot("Metallic",  mat.metallic_tex);
+        draw_tex_slot("Roughness", mat.roughness_tex);
+        draw_tex_slot("Normal",    mat.normal_tex);
+
+        ImGui::TextDisabled("build_world_from_scene must hook these into pbr_material.");
+    } break;
+
+    default:
+        ImGui::TextDisabled("Unknown material model.");
+        break;
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Edit transform/material/textures, then re-render.");
+}
+
+// -----------------------------------------------------------------------------
+// File-drop
+// -----------------------------------------------------------------------------
+
 static void glfw_drop_callback(GLFWwindow* /*window*/, int count, const char** paths)
 {
     for (int i = 0; i < count; ++i) {
@@ -356,37 +1149,115 @@ static void glfw_drop_callback(GLFWwindow* /*window*/, int count, const char** p
     }
 }
 
-// Turn any newly dropped files into scene textures
 static void process_dropped_files()
 {
     if (g_dropped_files.empty())
         return;
 
     for (const std::string& full_path : g_dropped_files) {
-        // Derive a nice texture name from the filename
-        std::string name = full_path;
 
-        // Strip directory
-        size_t slash = name.find_last_of("/\\");
-        if (slash != std::string::npos) {
-            name = name.substr(slash + 1);
+        // Textures
+        if (has_extension_ci(full_path, ".png")  ||
+            has_extension_ci(full_path, ".jpg")  ||
+            has_extension_ci(full_path, ".jpeg") ||
+            has_extension_ci(full_path, ".tga")  ||
+            has_extension_ci(full_path, ".bmp"))
+        {
+            std::string name = full_path;
+
+            size_t slash = name.find_last_of("/\\");
+            if (slash != std::string::npos) {
+                name = name.substr(slash + 1);
+            }
+
+            size_t dot = name.find_last_of('.');
+            if (dot != std::string::npos) {
+                name = name.substr(0, dot);
+            }
+
+            scene_texture tex;
+            tex.name = name;
+            tex.path = full_path;
+
+            g_scene.textures.push_back(std::move(tex));
+
+            std::printf("Imported texture: %s (%s)\n",
+                        g_scene.textures.back().name.c_str(),
+                        g_scene.textures.back().path.c_str());
         }
+        // FBX / OBJ meshes → mesh_instance
+        else if (has_extension_ci(full_path, ".fbx") ||
+                 has_extension_ci(full_path, ".obj"))
+        {
+            std::printf("Importing mesh (Assimp): %s\n", full_path.c_str());
 
-        // Strip extension
-        size_t dot = name.find_last_of('.');
-        if (dot != std::string::npos) {
-            name = name.substr(0, dot);
+            // Match RT loader: FBX is Z-up, OBJ usually Y-up.
+            bool z_up = has_extension_ci(full_path, ".fbx");
+            MeshLoadResult mlr = load_assimp_mesh_as_gpu_mesh(
+                full_path,
+                z_up,
+                /*normalise_unit=*/true,
+                /*user_scale=*/2.0
+            );
+
+            if (mlr.mesh.vao == 0 || mlr.mesh.index_count == 0) {
+                std::fprintf(stderr, "Mesh import failed or empty: %s\n",
+                             full_path.c_str());
+                continue;
+            }
+
+            std::string name = full_path;
+            size_t slash = name.find_last_of("/\\");
+            if (slash != std::string::npos) {
+                name = name.substr(slash + 1);
+            }
+            size_t dot = name.find_last_of('.');
+            if (dot != std::string::npos) {
+                name = name.substr(0, dot);
+            }
+
+            // Prepare mesh asset (with material slots)
+            scene_mesh_asset asset;
+            asset.name      = name;
+            asset.file_path = full_path;
+            asset.mesh_bvh  = nullptr; // RT support wired via mesh_loader.h
+            asset.slot_names = mlr.material_slot_names;
+            asset.slot_default_materials.assign(asset.slot_names.size(), -1);
+
+            int mesh_index = (int)g_scene.meshes.size();
+
+            // Create mesh_instance object
+            scene_object obj;
+            obj.name           = name;
+            obj.type           = scene_object_type::mesh_instance;
+            obj.material_index = -1; // per-slot binding will be used instead
+
+            obj.center       = point3(0,0,0);
+            obj.radius       = mlr.approx_radius;
+            obj.mesh_index   = mesh_index;
+            obj.translation  = vec3(0, 0, -1);
+            obj.rotation_deg = vec3(0, 0, 0);
+            obj.scale        = vec3(1, 1, 1);
+            obj.mesh_slot_materials = asset.slot_default_materials;
+
+            // Push asset + GPU mesh
+            g_scene.meshes.push_back(std::move(asset));
+
+            if ((int)g_gpu_meshes.size() < mesh_index + 1) {
+                g_gpu_meshes.resize(mesh_index + 1);
+            }
+            g_gpu_meshes[mesh_index] = mlr.mesh;
+
+            g_scene.objects.push_back(std::move(obj));
+
+            std::printf("Mesh imported as mesh_instance '%s' (mesh_index=%d, slots=%zu)\n",
+                        name.c_str(), mesh_index,
+                        g_scene.meshes[mesh_index].slot_names.size());
         }
-
-        scene_texture tex;
-        tex.name = name;
-        tex.path = full_path;  // use absolute path from OS
-
-        g_scene.textures.push_back(std::move(tex));
-
-        std::printf("Imported texture: %s (%s)\n",
-                    g_scene.textures.back().name.c_str(),
-                    g_scene.textures.back().path.c_str());
+        else {
+            std::printf("Dropped file not recognised as texture or supported mesh: %s\n",
+                        full_path.c_str());
+        }
     }
 
     g_dropped_files.clear();
@@ -398,9 +1269,6 @@ static void process_dropped_files()
 
 int main()
 {
-    // ---------------------------------------------------------
-    // GLFW init + window
-    // ---------------------------------------------------------
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) {
         std::fprintf(stderr, "Failed to init GLFW\n");
@@ -420,11 +1288,9 @@ int main()
     }
 
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1); // vsync
-
+    glfwSwapInterval(1);
     glfwSetDropCallback(window, glfw_drop_callback);
 
-    // GLEW init (after context)
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) {
         std::fprintf(stderr, "Failed to init GLEW\n");
@@ -433,9 +1299,6 @@ int main()
         return 1;
     }
 
-    // ---------------------------------------------------------
-    // ImGui context + backends
-    // ---------------------------------------------------------
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -457,37 +1320,27 @@ int main()
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 
-    // Init engine (scene + camera) once
     init_engine_once();
 
-    bool show_demo_window = false;
+    bool   show_demo_window = false;
+    double last_time        = glfwGetTime();
 
-    double last_time = glfwGetTime();
-
-    // ---------------------------------------------------------
-    // Main loop
-    // ---------------------------------------------------------
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
-
         process_dropped_files();
 
         double current_time = glfwGetTime();
         double dt = current_time - last_time;
         last_time = current_time;
 
-        // Update editor camera from input (WASD, Q/E, RMB look)
         update_editor_camera_from_input(window, dt);
 
-        // Start ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // -------------------------------------------------
         // Dockspace
-        // -------------------------------------------------
         {
             ImGuiWindowFlags window_flags =
                 ImGuiWindowFlags_MenuBar |
@@ -530,12 +1383,10 @@ int main()
                 ImGui::EndMenuBar();
             }
 
-            ImGui::End(); // DockSpaceRoot
+            ImGui::End();
         }
 
-        // -------------------------------------------------
-        // Scene Hierarchy (with selection)
-        // -------------------------------------------------
+        // Scene Hierarchy
         ImGui::Begin("Scene Hierarchy");
         ImGui::Text("Objects:");
         ImGui::Separator();
@@ -550,9 +1401,7 @@ int main()
         }
         ImGui::End();
 
-        // -------------------------------------------------
-        // Textures window (drag sources)
-        // -------------------------------------------------
+        // Textures
         ImGui::Begin("Textures");
         ImGui::Text("Drag textures onto PBR slots.");
         ImGui::Separator();
@@ -571,9 +1420,7 @@ int main()
         }
         ImGui::End();
 
-        // -------------------------------------------------
         // Inspector
-        // -------------------------------------------------
         ImGui::Begin("Inspector");
         ImGui::Text("Camera");
         ImGui::Separator();
@@ -591,23 +1438,15 @@ int main()
         ImGui::Separator();
         ImGui::Text("Editor Camera Settings");
         ImGui::SliderFloat("Move speed",  &g_camera_move_speed, 0.1f, 20.0f);
-        ImGui::SliderFloat("Look sens",   &g_camera_look_sens,  0.01f, 1.0f);
+        ImGui::SliderFloat("Look sens",   &g_camera_look_sens,  0.0005f, 0.02f);
         ImGui::SliderFloat("FOV",         &g_editor_cam.vfov,   20.0f, 90.0f);
 
         if (ImGui::Button("Reset Camera")) {
-            g_editor_cam.position = point3(3, 3, 2);
-            g_editor_cam.vfov     = 40.0;
-
-            point3 target  = point3(0, 0, -1);
-            vec3   forward = unit_vector(target - g_editor_cam.position);
-            g_editor_cam.yaw   = std::atan2(forward.z(), forward.x());
-            g_editor_cam.pitch = std::asin(forward.y());
-            g_editor_cam.update_basis();
+            g_editor_cam.vfov = 40.0f;
+            g_editor_cam.set_from_lookat(point3(3, 3, 2),
+                                         point3(0, 0, -1));
         }
 
-        // -------------------------------------------------
-        // Render Settings (sampling + resolution)
-        // -------------------------------------------------
         ImGui::Separator();
         ImGui::Text("Render Settings");
 
@@ -641,10 +1480,21 @@ int main()
         if (ImGui::Button("Apply Resolution")) {
             g_camera.image_width  = res_w;
             g_camera.image_height = res_h;
-            // you can also update aspect here if you want:
-            // g_camera.aspect_ratio = (float)res_w / (float)res_h;
         }
         ImGui::TextDisabled("Changes take effect next render.");
+
+        ImGui::Separator();
+        ImGui::Text("Background Color");
+
+        float bg[3] = {
+            (float)g_camera.background.x(),
+            (float)g_camera.background.y(),
+            (float)g_camera.background.z()
+        };
+
+        if (ImGui::ColorEdit3("Sky / Background", bg)) {
+            g_camera.background = colour(bg[0], bg[1], bg[2]);
+        }
 
         ImGui::Separator();
         ImGui::Text("Selection");
@@ -656,204 +1506,182 @@ int main()
             ImGui::Text("Selected object:");
             ImGui::BulletText("Name: %s", obj.name.c_str());
 
-            // -----------------------------
-            // Simple transform controls
-            // -----------------------------
-            point3 pos = obj.center;
-            float pos_f[3] = { (float)pos.x(), (float)pos.y(), (float)pos.z() };
-            if (ImGui::DragFloat3("Position", pos_f, 0.05f)) {
-                obj.center = point3(pos_f[0], pos_f[1], pos_f[2]);
+            // Basic transform
+            if (obj.type == scene_object_type::sphere) {
+                point3 pos = obj.center;
+                float pos_f[3] = { (float)pos.x(), (float)pos.y(), (float)pos.z() };
+                if (ImGui::DragFloat3("Center", pos_f, 0.05f)) {
+                    obj.center = point3(pos_f[0], pos_f[1], pos_f[2]);
+                }
+
+                float radius_f = (float)obj.radius;
+                if (ImGui::DragFloat("Radius", &radius_f, 0.01f, 0.01f, 1000.0f)) {
+                    obj.radius = radius_f;
+                }
+            }
+            else if (obj.type == scene_object_type::mesh_instance) {
+                float t[3] = {
+                    (float)obj.translation.x(),
+                    (float)obj.translation.y(),
+                    (float)obj.translation.z()
+                };
+                if (ImGui::DragFloat3("Translation", t, 0.05f)) {
+                    obj.translation = vec3(t[0], t[1], t[2]);
+                }
+
+                ImGui::TextDisabled("Scale/rotation not wired into raster yet.");
             }
 
-            float radius_f = (float)obj.radius;
-            if (ImGui::DragFloat("Radius", &radius_f, 0.01f, 0.01f, 1000.0f)) {
-                obj.radius = radius_f;
+            // Mesh asset handle (for slots)
+            bool is_mesh_instance = (obj.type == scene_object_type::mesh_instance);
+            scene_mesh_asset* mesh_asset = nullptr;
+            if (is_mesh_instance &&
+                obj.mesh_index >= 0 &&
+                obj.mesh_index < (int)g_scene.meshes.size())
+            {
+                mesh_asset = &g_scene.meshes[obj.mesh_index];
+
+                // keep overrides in sync with slot count
+                if (obj.mesh_slot_materials.size() != mesh_asset->slot_names.size()) {
+                    obj.mesh_slot_materials.assign(mesh_asset->slot_names.size(), -1);
+                }
             }
 
             ImGui::Separator();
             ImGui::Text("Material Binding");
 
-            int current_mat = obj.material_index;
-            if (current_mat < 0 || current_mat >= (int)g_scene.materials.size()) {
-                current_mat = -1;
+            // Button to create new materials
+            if (ImGui::Button("Create New Material")) {
+                scene_material m;
+                m.name = "Material " + std::to_string(g_scene.materials.size());
+                g_scene.materials.push_back(m);
             }
 
-            const char* current_label = "<none>";
-            if (current_mat >= 0) {
-                current_label = g_scene.materials[current_mat].name.c_str();
-            }
-
-            if (ImGui::BeginCombo("Material", current_label)) {
-                for (int i = 0; i < (int)g_scene.materials.size(); ++i) {
-                    bool is_sel = (i == current_mat);
-                    std::string label = g_scene.materials[i].name + "##mat_" + std::to_string(i);
-                    if (ImGui::Selectable(label.c_str(), is_sel)) {
-                        obj.material_index = i;
-                        current_mat        = i;
-                    }
-                    if (is_sel) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
-            }
-
-            if (obj.material_index >= 0 &&
-                obj.material_index < (int)g_scene.materials.size())
+            // --- Mesh instance: per-slot binding ---
+            if (is_mesh_instance && mesh_asset && !mesh_asset->slot_names.empty())
             {
-                auto& mat = g_scene.materials[obj.material_index];
+                ImGui::Text("Mesh material slots:");
 
-                ImGui::Separator();
-                ImGui::Text("Material Class");
+                for (size_t s = 0; s < mesh_asset->slot_names.size(); ++s) {
+                    std::string slot_label = "Slot " + std::to_string(s) +
+                                             " (" + mesh_asset->slot_names[s] + ")";
+                    int mat_idx = (int)((s < obj.mesh_slot_materials.size()) ?
+                                        obj.mesh_slot_materials[s] : -1);
 
-                const char* model_label = "Unknown";
-                switch (mat.model) {
-                    case scene_material_model::lambert:    model_label = "Lambert";    break;
-                    case scene_material_model::metal:      model_label = "Metal";      break;
-                    case scene_material_model::dielectric: model_label = "Dielectric"; break;
-                    case scene_material_model::pbr:        model_label = "PBR";        break;
-                    default:                               model_label = "Unknown";    break;
+                    const char* current_label = "<none>";
+                    if (mat_idx >= 0 && mat_idx < (int)g_scene.materials.size()) {
+                        current_label = g_scene.materials[mat_idx].name.c_str();
+                    }
+
+                    ImGui::TextUnformatted(slot_label.c_str());
+                    ImGui::SameLine();
+
+                    std::string combo_id = "##slot_mat_" + std::to_string(s);
+                    if (ImGui::BeginCombo(combo_id.c_str(), current_label)) {
+                        // None
+                        bool sel_none = (mat_idx == -1);
+                        if (ImGui::Selectable("<none>", sel_none)) {
+                            mat_idx = -1;
+                        }
+                        if (sel_none) ImGui::SetItemDefaultFocus();
+
+                        // existing materials
+                        for (int i = 0; i < (int)g_scene.materials.size(); ++i) {
+                            bool sel = (i == mat_idx);
+                            std::string item = g_scene.materials[i].name +
+                                               "##slotitem_" +
+                                               std::to_string(s) + "_" +
+                                               std::to_string(i);
+                            if (ImGui::Selectable(item.c_str(), sel)) {
+                                mat_idx = i;
+                            }
+                            if (sel) ImGui::SetItemDefaultFocus();
+                        }
+
+                        ImGui::EndCombo();
+                    }
+
+                    if (s < obj.mesh_slot_materials.size()) {
+                        obj.mesh_slot_materials[s] = mat_idx;
+                    }
                 }
 
-                if (ImGui::BeginCombo("Class", model_label)) {
-                    struct Option { const char* label; scene_material_model model; };
-                    Option opts[] = {
-                        { "Lambert (Shirley diffuse)",   scene_material_model::lambert    },
-                        { "Metal (Shirley metal)",       scene_material_model::metal      },
-                        { "Dielectric (glass)",          scene_material_model::dielectric },
-                        { "PBR GGX (your shader)",       scene_material_model::pbr        },
-                    };
+                // Choose which slot's material we are editing
+                static int s_active_slot = 0;
+                if (!mesh_asset->slot_names.empty()) {
+                    if (s_active_slot >= (int)mesh_asset->slot_names.size())
+                        s_active_slot = 0;
 
-                    for (const auto& opt : opts) {
-                        bool selected = (mat.model == opt.model);
-                        if (ImGui::Selectable(opt.label, selected)) {
-                            mat.model = opt.model;
+                    ImGui::Separator();
+                    ImGui::Text("Edit material for slot:");
+
+                    std::string active_label = "Slot " + std::to_string(s_active_slot) +
+                                               " (" + mesh_asset->slot_names[s_active_slot] + ")";
+                    if (ImGui::BeginCombo("Active Slot", active_label.c_str())) {
+                        for (int s = 0; s < (int)mesh_asset->slot_names.size(); ++s) {
+                            bool sel = (s == s_active_slot);
+                            std::string item = "Slot " + std::to_string(s) +
+                                               " (" + mesh_asset->slot_names[s] + ")";
+                            if (ImGui::Selectable(item.c_str(), sel)) {
+                                s_active_slot = s;
+                            }
+                            if (sel) ImGui::SetItemDefaultFocus();
                         }
-                        if (selected) {
+                        ImGui::EndCombo();
+                    }
+
+                    int active_mat_idx =
+                        (s_active_slot < (int)obj.mesh_slot_materials.size()) ?
+                        obj.mesh_slot_materials[s_active_slot] : -1;
+
+                    if (active_mat_idx >= 0 &&
+                        active_mat_idx < (int)g_scene.materials.size())
+                    {
+                        auto& mat = g_scene.materials[active_mat_idx];
+                        DrawMaterialInspector(mat, g_scene);
+                    } else {
+                        ImGui::TextDisabled("No material bound to this slot.");
+                    }
+                }
+            }
+            // --- Spheres / non-mesh: single material index as before ---
+            else
+            {
+                int current_mat = obj.material_index;
+                if (current_mat < 0 || current_mat >= (int)g_scene.materials.size()) {
+                    current_mat = -1;
+                }
+
+                const char* current_label = "<none>";
+                if (current_mat >= 0) {
+                    current_label = g_scene.materials[current_mat].name.c_str();
+                }
+
+                if (ImGui::BeginCombo("Material", current_label)) {
+                    for (int i = 0; i < (int)g_scene.materials.size(); ++i) {
+                        bool is_sel = (i == current_mat);
+                        std::string label = g_scene.materials[i].name +
+                                            "##mat_" + std::to_string(i);
+                        if (ImGui::Selectable(label.c_str(), is_sel)) {
+                            obj.material_index = i;
+                            current_mat        = i;
+                        }
+                        if (is_sel) {
                             ImGui::SetItemDefaultFocus();
                         }
                     }
-
                     ImGui::EndCombo();
                 }
 
-                ImGui::Separator();
-                ImGui::Text("Material Parameters");
-
+                if (obj.material_index >= 0 &&
+                    obj.material_index < (int)g_scene.materials.size())
                 {
-                    float base[3] = {
-                        (float)mat.base_color.x(),
-                        (float)mat.base_color.y(),
-                        (float)mat.base_color.z()
-                    };
-                    if (ImGui::ColorEdit3("Base Color", base)) {
-                        mat.base_color = colour(base[0], base[1], base[2]);
-                    }
+                    auto& mat = g_scene.materials[obj.material_index];
+                    DrawMaterialInspector(mat, g_scene);
                 }
-
-                switch (mat.model) {
-                case scene_material_model::lambert:
-                    ImGui::TextDisabled("Lambert: pure diffuse (Shirley lambertian).");
-                    break;
-
-                case scene_material_model::metal:
-                    ImGui::TextDisabled("Metal: colored metal BRDF (Shirley metal).");
-                    // You can expose fuzz here if you wire it through.
-                    break;
-
-                case scene_material_model::dielectric:
-                {
-                    ImGui::TextDisabled("Dielectric: refractive material (glass).");
-
-                    float ior_f = (float)mat.ior;
-                    if (ImGui::SliderFloat("IOR", &ior_f, 1.0f, 2.5f)) {
-                        mat.ior = ior_f;
-                    }
-                } break;
-
-                case scene_material_model::pbr:
-                {
-                    ImGui::TextDisabled("PBR GGX: uses your pbr_material in material.h");
-
-                    float metallic_f  = (float)mat.metallic;
-                    float roughness_f = (float)mat.roughness;
-                    float norm_str_f  = (float)mat.normal_strength;
-
-                    if (ImGui::SliderFloat("Metallic", &metallic_f, 0.0f, 1.0f)) {
-                        mat.metallic = metallic_f;
-                    }
-                    if (ImGui::SliderFloat("Roughness", &roughness_f, 0.02f, 1.0f)) {
-                        mat.roughness = roughness_f;
-                    }
-                    if (ImGui::SliderFloat("Normal Strength", &norm_str_f, 0.0f, 4.0f)) {
-                        mat.normal_strength = norm_str_f;
-                    }
-
-                    float f0[3] = {
-                        (float)mat.dielectric_F0.x(),
-                        (float)mat.dielectric_F0.y(),
-                        (float)mat.dielectric_F0.z()
-                    };
-                    if (ImGui::ColorEdit3("Dielectric F0", f0)) {
-                        mat.dielectric_F0 = colour(f0[0], f0[1], f0[2]);
-                    }
-
-                    ImGui::Separator();
-                    ImGui::Text("PBR Texture Maps (drag from Textures window)");
-
-                    auto draw_tex_slot = [&](const char* label, int& tex_index)
-                    {
-                        ImGui::Text("%s", label);
-                        ImGui::SameLine();
-                        const char* btn_label = "<none>";
-                        if (tex_index >= 0 &&
-                            tex_index < (int)g_scene.textures.size()) {
-                            btn_label = g_scene.textures[tex_index].name.c_str();
-                        }
-                        ImGui::Button(btn_label, ImVec2(140.0f, 0.0f));
-
-                        if (ImGui::BeginDragDropTarget()) {
-                            if (const ImGuiPayload* payload =
-                                    ImGui::AcceptDragDropPayload("TEXTURE_ASSET_ID"))
-                            {
-                                int asset_index = *(const int*)payload->Data;
-                                if (asset_index >= 0 &&
-                                    asset_index < (int)g_scene.textures.size()) {
-                                    tex_index = asset_index;
-                                }
-                            }
-                            ImGui::EndDragDropTarget();
-                        }
-
-                        if (tex_index >= 0) {
-                            ImGui::SameLine();
-                            std::string clear_id = std::string("X##clear_") + label;
-                            if (ImGui::SmallButton(clear_id.c_str())) {
-                                tex_index = -1;
-                            }
-                        }
-                    };
-
-                    draw_tex_slot("Albedo",    mat.albedo_tex);
-                    draw_tex_slot("Metallic",  mat.metallic_tex);
-                    draw_tex_slot("Roughness", mat.roughness_tex);
-                    draw_tex_slot("Normal",    mat.normal_tex);
-
-                    ImGui::TextDisabled("These indices map to scene.textures; "
-                                        "build_world_from_scene must bind them "
-                                        "into pbr_material.");
-                } break;
-
-                default:
-                    ImGui::TextDisabled("Unknown material model – extend UI if you add more.");
-                    break;
+                else {
+                    ImGui::TextDisabled("Object has no valid material bound.");
                 }
-
-                ImGui::Separator();
-                ImGui::TextDisabled("Edit transform/material/textures, then re-render.");
-            }
-            else {
-                ImGui::TextDisabled("Object has no valid material bound.");
             }
         }
         else {
@@ -862,9 +1690,7 @@ int main()
 
         ImGui::End();
 
-        // -------------------------------------------------
-        // Debug Camera window
-        // -------------------------------------------------
+        // Debug Camera
         ImGui::Begin("Debug Camera");
         ImGui::Text("Editor cam position:");
         ImGui::Text("  x = %.3f", g_editor_cam.position.x());
@@ -881,9 +1707,7 @@ int main()
         ImGui::Text("Max depth:         %d", g_camera.max_depth);
         ImGui::End();
 
-        // -------------------------------------------------
-        // Viewport: Render button + display ray-traced texture
-        // -------------------------------------------------
+        // Viewport
         ImGui::Begin("Viewport");
 
         g_viewport_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
@@ -894,11 +1718,18 @@ int main()
         if (ImGui::Button("Render Current View")) {
             sync_camera_from_editor(vp_size.x, vp_size.y);
 
+            // NOTE:
+            // build_world_from_scene(g_scene) is responsible for:
+            //   - Rebuilding runtime materials from g_scene.materials every call.
+            //   - Using mesh_instance.mesh_slot_materials + mesh_asset.slot_names
+            //     to get correct per-slot materials for meshes.
+            //
+            // We no longer collapse slot bindings into obj.material_index here;
+            // that was causing "slot 0 only" and stale material behaviour.
             hittable_list world = build_world_from_scene(g_scene);
 
             g_cancel_flag.store(false);
             render_result img = g_renderer.render(world, g_camera, &g_cancel_flag);
-
             UploadRenderToTexture(img);
         }
 
@@ -907,49 +1738,74 @@ int main()
 
         ImGui::Separator();
 
-        if (g_rtHasImage && g_rtTexture != 0) {
-            float img_aspect = (float)g_rtWidth / (float)g_rtHeight;
-            float vp_aspect  = vp_size.x / vp_size.y;
+        ImGui::Text("Viewport Mode:");
+        ImGui::SameLine();
+        ImGui::RadioButton("Ray Traced", &g_viewport_mode, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Rasterised", &g_viewport_mode, 1);
 
-            ImVec2 image_size = vp_size;
-            if (vp_aspect > img_aspect) {
-                image_size.x = vp_size.y * img_aspect;
+        ImGui::Separator();
+
+        if (g_viewport_mode == 0) {
+            if (g_rtHasImage && g_rtTexture != 0) {
+                float img_aspect = (float)g_rtWidth / (float)g_rtHeight;
+                float vp_aspect  = vp_size.x / vp_size.y;
+
+                ImVec2 image_size = vp_size;
+                if (vp_aspect > img_aspect) {
+                    image_size.x = vp_size.y * img_aspect;
+                } else {
+                    image_size.y = vp_size.x / img_aspect;
+                }
+
+                ImVec2 cursor = ImGui::GetCursorPos();
+                ImVec2 centered_pos = ImVec2(
+                    cursor.x + 0.5f * (vp_size.x - image_size.x),
+                    cursor.y + 0.5f * (vp_size.y - image_size.y)
+                );
+                ImGui::SetCursorPos(centered_pos);
+
+                ImGui::Image(
+                    (ImTextureID)(intptr_t)g_rtTexture,
+                    image_size,
+                    ImVec2(0, 0),
+                    ImVec2(1, 1)
+                );
             } else {
-                image_size.y = vp_size.x / img_aspect;
+                ImGui::Text("No render yet. Click 'Render Current View'.");
             }
-
-            ImVec2 cursor = ImGui::GetCursorPos();
-            ImVec2 avail  = vp_size;
-            ImVec2 centered_pos = ImVec2(
-                cursor.x + 0.5f * (avail.x - image_size.x),
-                cursor.y + 0.5f * (avail.y - image_size.y)
-            );
-            ImGui::SetCursorPos(centered_pos);
-
-            ImGui::Image(
-                (ImTextureID)(intptr_t)g_rtTexture,
-                image_size,
-                ImVec2(0, 0),   // UVs, no vertical flip
-                ImVec2(1, 1)
-            );
         } else {
-            ImGui::Text("No render yet. Click 'Render Current View'.");
+            int tex_w = (int)vp_size.x;
+            int tex_h = (int)vp_size.y;
+            if (tex_w > 0 && tex_h > 0) {
+                RenderRasterToTexture(tex_w, tex_h);
+
+                if (g_rasterColorTex != 0) {
+                    ImGui::Image(
+                        (ImTextureID)(intptr_t)g_rasterColorTex,
+                        vp_size,
+                        ImVec2(0, 1),
+                        ImVec2(1, 0)  // flip Y
+                    );
+                } else {
+                    ImGui::Text("Raster texture not ready.");
+                }
+            } else {
+                ImGui::Text("Viewport too small.");
+            }
         }
 
-        ImGui::End(); // Viewport
+        ImGui::End();
 
         if (show_demo_window)
             ImGui::ShowDemoWindow(&show_demo_window);
 
-        // -------------------------------------------------
-        // Render ImGui
-        // -------------------------------------------------
         ImGui::Render();
 
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
-
         glViewport(0, 0, display_w, display_h);
+        glDisable(GL_DEPTH_TEST);
         glClearColor(0.10f, 0.10f, 0.12f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
@@ -969,8 +1825,22 @@ int main()
     // Cleanup
     if (g_rtTexture != 0) {
         glDeleteTextures(1, &g_rtTexture);
-        g_rtTexture = 0;
     }
+
+    if (g_rasterSphereVAO) glDeleteVertexArrays(1, &g_rasterSphereVAO);
+    if (g_rasterSphereVBO) glDeleteBuffers(1, &g_rasterSphereVBO);
+    if (g_rasterSphereEBO) glDeleteBuffers(1, &g_rasterSphereEBO);
+
+    for (auto& gm : g_gpu_meshes) {
+        if (gm.vao) glDeleteVertexArrays(1, &gm.vao);
+        if (gm.vbo) glDeleteBuffers(1, &gm.vbo);
+        if (gm.ebo) glDeleteBuffers(1, &gm.ebo);
+    }
+
+    if (g_rasterShader)   glDeleteProgram(g_rasterShader);
+    if (g_rasterColorTex) glDeleteTextures(1, &g_rasterColorTex);
+    if (g_rasterDepthRBO) glDeleteRenderbuffers(1, &g_rasterDepthRBO);
+    if (g_rasterFBO)      glDeleteFramebuffers(1, &g_rasterFBO);
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
@@ -978,6 +1848,5 @@ int main()
 
     glfwDestroyWindow(window);
     glfwTerminate();
-
     return 0;
 }
