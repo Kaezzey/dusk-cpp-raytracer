@@ -15,6 +15,8 @@
 #include <thread>   // for render worker
 #include <mutex>    // for result handoff
 #include <chrono>   // for timing if you want
+#include <unordered_map>
+#include <algorithm>
 
 #include "../../external/glew/include/GL/glew.h"
 #include "../../include/external/GLFW/glfw3.h"
@@ -24,11 +26,31 @@
 #include "imgui_impl_opengl3.h"
 #include "imgui_internal.h"
 
+// stb_image for loading PNG icon
+#include "../../include/external/stb_image.h"
+
+// Helper: set a GLFW window icon from a PNG file path (relative to working dir)
+static bool SetWindowIconFromPNG(GLFWwindow* w, const char* relpath)
+{
+    if (!w || !relpath) return false;
+    int ix = 0, iy = 0, ic = 0;
+    unsigned char* pixels = stbi_load(relpath, &ix, &iy, &ic, 4);
+    if (!pixels) return false;
+    GLFWimage img;
+    img.width = ix;
+    img.height = iy;
+    img.pixels = pixels;
+    glfwSetWindowIcon(w, 1, &img);
+    stbi_image_free(pixels);
+    return true;
+}
+
 #include "../../include/core/camera.h"
 #include "../../include/core/renderer.h"
 #include "../../include/core/scene.h"
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/editor_camera.h"
+#include "../../include/core/undo.h"
 
 // Assimp for FBX/OBJ mesh import
 #include <assimp/Importer.hpp>
@@ -80,6 +102,12 @@ static std::mutex  g_render_mutex;
 static bool        g_render_in_progress = false;
 static bool        g_render_has_result  = false;
 static render_result g_render_result;
+static std::atomic<bool> g_render_final_image_ready{false};
+
+// Progress window (separate OS window) to show progressive render
+static GLFWwindow*            g_progress_window = nullptr;
+static std::thread            g_progress_window_thread;
+static std::atomic<bool>      g_progress_window_running{false};
 
 // -----------------------------------------------------------------------------
 // Ray-traced image texture
@@ -135,6 +163,17 @@ static GLuint g_gizmoConeVAO   = 0;
 static GLuint g_gizmoConeVBO   = 0;
 static int    g_gizmoConeVertexCount = 0;
 
+// Snapshot for object transform to support undo/redo
+struct ObjSnapshot {
+    point3 center;
+    vec3   translation;
+    vec3   rotation_deg;
+    vec3   scale;
+    double radius;
+};
+
+static std::unordered_map<int, ObjSnapshot> g_obj_snapshot_before;
+
 static bool   g_show_gizmo     = false;
 static int    g_active_gizmo_axis = -1; // -1 = none, 0=X,1=Y,2=Z
 static vec3   g_gizmo_hit_point;       // world-space closest point on axis at mouse down
@@ -150,6 +189,23 @@ static int g_viewport_mode = 0;
 static void glfw_error_callback(int error, const char* description)
 {
     std::fprintf(stderr, "GLFW Error %d: %s\n", error, description);
+}
+
+// Key callback: handle Ctrl+Z / Ctrl+Y for undo/redo (GLFW-level for reliability)
+static void glfw_key_callback(GLFWwindow* /*window*/, int key, int scancode, int action, int mods)
+{
+    if (action != GLFW_PRESS) return;
+
+    if ((mods & GLFW_MOD_CONTROL) != 0) {
+        if (key == GLFW_KEY_Z) {
+            UndoManager::Instance().undo();
+            return;
+        }
+        if (key == GLFW_KEY_Y) {
+            UndoManager::Instance().redo();
+            return;
+        }
+    }
 }
 
 static inline double dot3(const vec3& a, const vec3& b)
@@ -1562,12 +1618,221 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
     }
 }
 
+// Start a separate GLFW window thread that displays progressive render updates.
+static void start_progress_window_thread()
+{
+    if (g_progress_window_running.load()) return;
+    g_progress_window_running.store(true);
+    g_progress_window_thread = std::thread([]() {
+        // Create a simple GLFW window for progress display
+        int win_w = std::max(640, g_rtWidth);
+        int win_h = std::max(480, g_rtHeight);
+        GLFWwindow* pw = glfwCreateWindow(win_w, win_h, "Render Progress", NULL, NULL);
+        if (!pw) {
+            g_progress_window_running.store(false);
+            return;
+        }
+
+        // Try to set the same app icon for the progress window
+        SetWindowIconFromPNG(pw, "resources/dusktracer.png");
+
+        // Make its context current on this thread
+        glfwMakeContextCurrent(pw);
+        // Initialize GLEW for this context
+        glewExperimental = GL_TRUE;
+        if (glewInit() != GLEW_OK) {
+            glfwDestroyWindow(pw);
+            g_progress_window_running.store(false);
+            return;
+        }
+
+        // Create GL objects: texture + quad
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        // Simple textured quad shader (GLSL 130)
+        const char* vs_src = R"GLSL(#version 130
+        in vec2 aPos;
+        in vec2 aUV;
+        out vec2 vUV;
+        void main() {
+            vUV = aUV;
+            gl_Position = vec4(aPos, 0.0, 1.0);
+        }
+        )GLSL";
+
+        const char* fs_src = R"GLSL(#version 130
+        uniform sampler2D uTex;
+        in vec2 vUV;
+        out vec4 FragColor;
+        void main() {
+            FragColor = texture(uTex, vUV);
+        }
+        )GLSL";
+
+        auto compile_shader = [](GLenum type, const char* src) -> GLuint {
+            GLuint s = glCreateShader(type);
+            glShaderSource(s, 1, &src, nullptr);
+            glCompileShader(s);
+            GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+            if (!ok) {
+                char buf[1024]; glGetShaderInfoLog(s, 1024, nullptr, buf);
+                fprintf(stderr, "Shader compile error: %s\n", buf);
+                glDeleteShader(s);
+                return 0;
+            }
+            return s;
+        };
+
+        GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
+        GLuint prog = 0;
+        if (vs && fs) {
+            prog = glCreateProgram();
+            glAttachShader(prog, vs);
+            glAttachShader(prog, fs);
+            glBindAttribLocation(prog, 0, "aPos");
+            glBindAttribLocation(prog, 1, "aUV");
+            glLinkProgram(prog);
+            GLint ok = 0; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+            if (!ok) { char buf[1024]; glGetProgramInfoLog(prog, 1024, nullptr, buf); fprintf(stderr, "Prog link err: %s\n", buf); glDeleteProgram(prog); prog = 0; }
+        }
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+
+        float quad_verts[] = {
+            // pos.xy   uv.xy (flipped V so texture appears upright)
+            -1.0f, -1.0f, 0.0f, 1.0f,
+             1.0f, -1.0f, 1.0f, 1.0f,
+             1.0f,  1.0f, 1.0f, 0.0f,
+            -1.0f,  1.0f, 0.0f, 0.0f
+        };
+        unsigned int quad_idx[] = {0,1,2, 0,2,3};
+        GLuint quadVBO=0, quadVAO=0, quadEBO=0;
+        glGenVertexArrays(1, &quadVAO);
+        glGenBuffers(1, &quadVBO);
+        glGenBuffers(1, &quadEBO);
+        glBindVertexArray(quadVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_STATIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, quadEBO);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(quad_idx), quad_idx, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glBindVertexArray(0);
+
+        // Main loop for progress window
+        while (g_progress_window_running.load() && !glfwWindowShouldClose(pw)) {
+            glfwPollEvents();
+
+            // copy latest render pixels under mutex
+            int copy_w = 0, copy_h = 0;
+            std::vector<std::uint8_t> copy_pixels;
+            {
+                std::lock_guard<std::mutex> lock(g_render_mutex);
+                if (!g_render_result.pixels.empty()) {
+                    copy_w = g_render_result.width;
+                    copy_h = g_render_result.height;
+                    // convert rgb->rgba for upload
+                    copy_pixels.resize(copy_w * copy_h * 4);
+                    for (int i = 0; i < copy_w * copy_h; ++i) {
+                        int si = 3*i;
+                        int di = 4*i;
+                        copy_pixels[di+0] = g_render_result.pixels[si+0];
+                        copy_pixels[di+1] = g_render_result.pixels[si+1];
+                        copy_pixels[di+2] = g_render_result.pixels[si+2];
+                        copy_pixels[di+3] = 255;
+                    }
+                }
+            }
+
+            if (!copy_pixels.empty()) {
+                int fb_w, fb_h; glfwGetFramebufferSize(pw, &fb_w, &fb_h);
+                glViewport(0,0,fb_w,fb_h);
+                glClearColor(0.05f,0.05f,0.06f,1.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, copy_w, copy_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, copy_pixels.data());
+
+                if (prog) glUseProgram(prog);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                if (prog) glUniform1i(glGetUniformLocation(prog, "uTex"), 0);
+                glBindVertexArray(quadVAO);
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+                glBindVertexArray(0);
+
+                glfwSwapBuffers(pw);
+            } else {
+                // no image yet – still poll and sleep a bit
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+
+        // cleanup
+        glDeleteTextures(1, &tex);
+        if (prog) glDeleteProgram(prog);
+        if (quadVBO) glDeleteBuffers(1, &quadVBO);
+        if (quadEBO) glDeleteBuffers(1, &quadEBO);
+        if (quadVAO) glDeleteVertexArrays(1, &quadVAO);
+        glfwDestroyWindow(pw);
+        g_progress_window_running.store(false);
+    });
+}
+
+static void stop_progress_window_thread()
+{
+    if (!g_progress_window_running.load()) return;
+    g_progress_window_running.store(false);
+    if (g_progress_window_thread.joinable()) {
+        g_progress_window_thread.join();
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Material inspector helper
 // -----------------------------------------------------------------------------
 
-static void DrawMaterialInspector(scene_material& mat, scene& scn)
+static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index)
 {
+    // editable material name buffer (persist across frames keyed by material index)
+    static std::unordered_map<int, std::string> s_mat_name_bufs;
+    auto& name_buf = s_mat_name_bufs[mat_index];
+    if (name_buf.empty()) {
+        name_buf = mat.name;
+        name_buf.resize(256, '\0');
+    }
+
+    // Name input: commit on Enter
+    // use unique ImGui ID suffix so multiple "Name" widgets don't conflict
+    std::string mat_label = std::string("Name##mat_") + std::to_string(mat_index);
+    if (ImGui::InputText(mat_label.c_str(), &name_buf[0], name_buf.size(), ImGuiInputTextFlags_EnterReturnsTrue)) {
+        size_t len = std::strlen(name_buf.c_str());
+        name_buf.resize(len);
+        if (mat.name != name_buf) {
+            std::string before = mat.name;
+            std::string after  = name_buf;
+            UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                [mat_index, before]() {
+                    if (mat_index >= 0 && mat_index < (int)g_scene.materials.size())
+                        g_scene.materials[mat_index].name = before;
+                },
+                [mat_index, after]() {
+                    if (mat_index >= 0 && mat_index < (int)g_scene.materials.size())
+                        g_scene.materials[mat_index].name = after;
+                },
+                "Rename Material"
+            ));
+            mat.name = name_buf;
+        }
+    }
+
     ImGui::Separator();
     ImGui::Text("Material Class");
 
@@ -1905,9 +2170,13 @@ int main()
         return 1;
     }
 
+    // Try to set application icon from resources/dusktracer.png
+    SetWindowIconFromPNG(window, "dusktracer.png");
+
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
     glfwSetDropCallback(window, glfw_drop_callback);
+    glfwSetKeyCallback(window, glfw_key_callback);
 
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) {
@@ -1958,23 +2227,46 @@ int main()
 
         update_editor_camera_from_input(window, dt);
 
-        // If render thread completed, grab result & upload texture
+        // If render thread produced a partial or final result, upload texture.
         if (g_render_has_result) {
             {
                 std::lock_guard<std::mutex> lock(g_render_mutex);
                 UploadRenderToTexture(g_render_result);
                 g_render_has_result = false;
             }
-            if (g_render_thread.joinable()) {
-                g_render_thread.join();
+            // Only join/cleanup when final image is ready
+            if (g_render_final_image_ready.load()) {
+                if (g_render_thread.joinable()) {
+                    g_render_thread.join();
+                }
+                // Stop the separate progress window now that render finished
+                stop_progress_window_thread();
+                g_render_in_progress = false;
+                g_cancel_flag.store(false);
+                g_render_final_image_ready.store(false);
             }
-            g_render_in_progress = false;
-            g_cancel_flag.store(false);
         }
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+
+        // Ctrl+Z / Ctrl+Y handling (undo/redo) using GLFW key state; debounce on key transition
+        static bool s_prev_ctrlz = false;
+        static bool s_prev_ctrly = false;
+        bool ctrl_down = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) || (glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
+        bool z_down    = (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS);
+        bool y_down    = (glfwGetKey(window, GLFW_KEY_Y) == GLFW_PRESS);
+        bool cur_ctrlz = ctrl_down && z_down;
+        bool cur_ctrly = ctrl_down && y_down;
+        if (cur_ctrlz && !s_prev_ctrlz) {
+            UndoManager::Instance().undo();
+        }
+        if (cur_ctrly && !s_prev_ctrly) {
+            UndoManager::Instance().redo();
+        }
+        s_prev_ctrlz = cur_ctrlz;
+        s_prev_ctrly = cur_ctrly;
 
         // Dockspace
         {
@@ -2050,6 +2342,18 @@ int main()
                     ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window);
                     ImGui::EndMenu();
                 }
+                if (ImGui::BeginMenu("Edit"))
+                {
+                    bool canU = UndoManager::Instance().can_undo();
+                    bool canR = UndoManager::Instance().can_redo();
+                    if (ImGui::MenuItem("Undo", "Ctrl+Z", false, canU)) {
+                        UndoManager::Instance().undo();
+                    }
+                    if (ImGui::MenuItem("Redo", "Ctrl+Y", false, canR)) {
+                        UndoManager::Instance().redo();
+                    }
+                    ImGui::EndMenu();
+                }
                 ImGui::EndMenuBar();
             }
 
@@ -2094,8 +2398,33 @@ int main()
             obj.mesh_slot_materials.clear();
 
             g_scene.objects.push_back(obj);
-            g_selected_object = (int)g_scene.objects.size() - 1;
+            int new_idx = (int)g_scene.objects.size() - 1;
+            // capture a copy for undo/redo
+            scene_object snapshot = g_scene.objects[new_idx];
+            // push undo action: undo = remove, redo = re-insert
+            UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                [new_idx]() {
+                    if (new_idx >= 0 && new_idx < (int)g_scene.objects.size()) {
+                        g_scene.objects.erase(g_scene.objects.begin() + new_idx);
+                        if (g_scene.objects.empty()) g_selected_object = -1;
+                        else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
+                        g_world_dirty = true;
+                        g_cached_world.reset();
+                    }
+                },
+                [new_idx, snapshot]() {
+                    if (new_idx < 0) return;
+                    int insert_at = new_idx;
+                    if (insert_at > (int)g_scene.objects.size()) insert_at = (int)g_scene.objects.size();
+                    g_scene.objects.insert(g_scene.objects.begin() + insert_at, snapshot);
+                    g_selected_object = insert_at;
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                },
+                "Add Object"
+            ));
 
+            g_selected_object = new_idx;
             g_world_dirty = true;
             g_cached_world.reset();
         }
@@ -2123,8 +2452,31 @@ int main()
             obj.mesh_slot_materials.clear();
 
             g_scene.objects.push_back(obj);
-            g_selected_object = (int)g_scene.objects.size() - 1;
+            int new_idx = (int)g_scene.objects.size() - 1;
+            scene_object snapshot = g_scene.objects[new_idx];
+            UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                [new_idx]() {
+                    if (new_idx >= 0 && new_idx < (int)g_scene.objects.size()) {
+                        g_scene.objects.erase(g_scene.objects.begin() + new_idx);
+                        if (g_scene.objects.empty()) g_selected_object = -1;
+                        else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
+                        g_world_dirty = true;
+                        g_cached_world.reset();
+                    }
+                },
+                [new_idx, snapshot]() {
+                    if (new_idx < 0) return;
+                    int insert_at = new_idx;
+                    if (insert_at > (int)g_scene.objects.size()) insert_at = (int)g_scene.objects.size();
+                    g_scene.objects.insert(g_scene.objects.begin() + insert_at, snapshot);
+                    g_selected_object = insert_at;
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                },
+                "Add Object"
+            ));
 
+            g_selected_object = new_idx;
             g_world_dirty = true;
             g_cached_world.reset();
         }
@@ -2135,11 +2487,15 @@ int main()
 
         // Handle Delete key to remove selected object
         if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
-            if (ImGui::IsKeyPressed(ImGuiKey_Delete) &&
+                if (ImGui::IsKeyPressed(ImGuiKey_Delete) &&
                 g_selected_object >= 0 &&
                 g_selected_object < (int)g_scene.objects.size())
             {
-                g_scene.objects.erase(g_scene.objects.begin() + g_selected_object);
+                int del_idx = g_selected_object;
+                scene_object removed = g_scene.objects[del_idx];
+
+                // perform erase
+                g_scene.objects.erase(g_scene.objects.begin() + del_idx);
 
                 // Fix selection index
                 if (g_scene.objects.empty()) {
@@ -2151,6 +2507,31 @@ int main()
                 // Mark RT world dirty
                 g_world_dirty = true;
                 g_cached_world.reset();
+
+                // push undo action to restore object
+                UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                    [del_idx]() {
+                        // redo = perform delete again (after undo)
+                        if (del_idx >= 0 && del_idx < (int)g_scene.objects.size()) {
+                            g_scene.objects.erase(g_scene.objects.begin() + del_idx);
+                            if (g_scene.objects.empty()) g_selected_object = -1;
+                            else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
+                            g_world_dirty = true;
+                            g_cached_world.reset();
+                        }
+                    },
+                    [del_idx, removed]() {
+                        // undo = re-insert
+                        int insert_at = del_idx;
+                        if (insert_at < 0) insert_at = 0;
+                        if (insert_at > (int)g_scene.objects.size()) insert_at = (int)g_scene.objects.size();
+                        g_scene.objects.insert(g_scene.objects.begin() + insert_at, removed);
+                        g_selected_object = insert_at;
+                        g_world_dirty = true;
+                        g_cached_world.reset();
+                    },
+                    "Delete Object"
+                ));
             }
         }
 
@@ -2269,7 +2650,36 @@ int main()
         {
             auto& obj = g_scene.objects[g_selected_object];
             ImGui::Text("Selected object:");
-            ImGui::BulletText("Name: %s", obj.name.c_str());
+            // editable object name (persist across frames)
+            static std::unordered_map<int, std::string> s_obj_name_bufs;
+            int sel_idx = g_selected_object;
+            auto& obj_name_buf = s_obj_name_bufs[sel_idx];
+            if (obj_name_buf.empty()) {
+                obj_name_buf = obj.name;
+                obj_name_buf.resize(256, '\0');
+            }
+            std::string obj_label = std::string("Name##obj_") + std::to_string(sel_idx);
+            if (ImGui::InputText(obj_label.c_str(), &obj_name_buf[0], obj_name_buf.size(), ImGuiInputTextFlags_EnterReturnsTrue)) {
+                size_t len = std::strlen(obj_name_buf.c_str());
+                obj_name_buf.resize(len);
+                if (obj.name != obj_name_buf) {
+                    std::string before = obj.name;
+                    std::string after  = obj_name_buf;
+                    int idx = sel_idx;
+                    UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                        [idx, before]() {
+                            if (idx >= 0 && idx < (int)g_scene.objects.size())
+                                g_scene.objects[idx].name = before;
+                        },
+                        [idx, after]() {
+                            if (idx >= 0 && idx < (int)g_scene.objects.size())
+                                g_scene.objects[idx].name = after;
+                        },
+                        "Rename Object"
+                    ));
+                    obj.name = obj_name_buf;
+                }
+            }
 
             // Basic transform
             if (obj.type == scene_object_type::sphere) {
@@ -2279,6 +2689,84 @@ int main()
                     obj.center = point3(pos_f[0], pos_f[1], pos_f[2]);
                     g_world_dirty = true;
                     g_cached_world.reset();
+                }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
+                }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                    }
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
                 }
 
                 float radius_f = (float)obj.radius;
@@ -2295,6 +2783,44 @@ int main()
                     g_world_dirty = true;
                     g_cached_world.reset();
                 }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
+                }
 
                 // Per-axis scale for preview
                 float scale_fv[3] = { (float)obj.scale.x(), (float)obj.scale.y(), (float)obj.scale.z() };
@@ -2302,6 +2828,44 @@ int main()
                     obj.scale = vec3(scale_fv[0], scale_fv[1], scale_fv[2]);
                     g_world_dirty = true;
                     g_cached_world.reset();
+                }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
                 }
             }
             else if (obj.type == scene_object_type::cube) {
@@ -2324,6 +2888,82 @@ int main()
                     g_world_dirty = true;
                     g_cached_world.reset();
                 }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
+                }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
+                }
 
                 // Rotation
                 float rot_c[3] = { (float)obj.rotation_deg.x(), (float)obj.rotation_deg.y(), (float)obj.rotation_deg.z() };
@@ -2332,6 +2972,44 @@ int main()
                     g_world_dirty = true;
                     g_cached_world.reset();
                 }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
+                }
 
                 // Scale
                 float scl_c[3] = { (float)obj.scale.x(), (float)obj.scale.y(), (float)obj.scale.z() };
@@ -2339,6 +3017,44 @@ int main()
                     obj.scale = vec3(scl_c[0], scl_c[1], scl_c[2]);
                     g_world_dirty = true;
                     g_cached_world.reset();
+                }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
                 }
             }
             else if (obj.type == scene_object_type::mesh_instance) {
@@ -2360,6 +3076,44 @@ int main()
                     g_world_dirty = true;
                     g_cached_world.reset();
                 }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
+                }
 
                 // Scale (non-uniform)
                 float scl_m[3] = { (float)obj.scale.x(), (float)obj.scale.y(), (float)obj.scale.z() };
@@ -2367,6 +3121,44 @@ int main()
                     obj.scale = vec3(scl_m[0], scl_m[1], scl_m[2]);
                     g_world_dirty = true;
                     g_cached_world.reset();
+                }
+                if (ImGui::IsItemActivated()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) g_obj_snapshot_before[idx] = ObjSnapshot{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    int idx = g_selected_object;
+                    if (idx >= 0) {
+                        ObjSnapshot after{obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius};
+                        ObjSnapshot before = g_obj_snapshot_before[idx];
+                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                            [idx, before]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = before.center;
+                                    o.translation = before.translation;
+                                    o.rotation_deg = before.rotation_deg;
+                                    o.scale = before.scale;
+                                    o.radius = before.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            [idx, after]() {
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& o = g_scene.objects[idx];
+                                    o.center = after.center;
+                                    o.translation = after.translation;
+                                    o.rotation_deg = after.rotation_deg;
+                                    o.scale = after.scale;
+                                    o.radius = after.radius;
+                                    g_world_dirty = true;
+                                    g_cached_world.reset();
+                                }
+                            },
+                            "Transform Object"
+                        ));
+                    }
                 }
             }
 
@@ -2395,6 +3187,28 @@ int main()
                 scene_material m;
                 m.name = "Material " + std::to_string(g_scene.materials.size());
                 g_scene.materials.push_back(m);
+                int new_mat_idx = (int)g_scene.materials.size() - 1;
+                scene_material snapshot = g_scene.materials[new_mat_idx];
+                // push undo: remove on undo, re-insert on redo
+                UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                    [new_mat_idx]() {
+                        if (new_mat_idx >= 0 && new_mat_idx < (int)g_scene.materials.size()) {
+                            g_scene.materials.erase(g_scene.materials.begin() + new_mat_idx);
+                            g_world_dirty = true;
+                            g_cached_world.reset();
+                        }
+                    },
+                    [new_mat_idx, snapshot]() {
+                        int insert_at = new_mat_idx;
+                        if (insert_at < 0) insert_at = 0;
+                        if (insert_at > (int)g_scene.materials.size()) insert_at = (int)g_scene.materials.size();
+                        g_scene.materials.insert(g_scene.materials.begin() + insert_at, snapshot);
+                        g_world_dirty = true;
+                        g_cached_world.reset();
+                    },
+                    "Create Material"
+                ));
+
                 g_world_dirty = true;
                 g_cached_world.reset();
             }
@@ -2484,7 +3298,7 @@ int main()
                         active_mat_idx < (int)g_scene.materials.size())
                     {
                         auto& mat = g_scene.materials[active_mat_idx];
-                        DrawMaterialInspector(mat, g_scene);
+                        DrawMaterialInspector(mat, g_scene, active_mat_idx);
                         // DrawMaterialInspector already marks g_world_dirty
                     } else {
                         ImGui::TextDisabled("No material bound to this slot.");
@@ -2526,7 +3340,7 @@ int main()
                     obj.material_index < (int)g_scene.materials.size())
                 {
                     auto& mat = g_scene.materials[obj.material_index];
-                    DrawMaterialInspector(mat, g_scene);
+                    DrawMaterialInspector(mat, g_scene, obj.material_index);
                 }
                 else {
                     ImGui::TextDisabled("Object has no valid material bound.");
@@ -2596,18 +3410,30 @@ int main()
                 g_cancel_flag.store(false);
                 g_render_in_progress = true;
 
+                // open OS progress window to show progressive updates
+                start_progress_window_thread();
+
                 // Kick off worker thread
                 auto world_copy = g_cached_world;
                 camera cam_copy = g_camera;
+                g_render_final_image_ready.store(false);
                 g_render_thread = std::thread([world_copy, cam_copy]() mutable {
                     render_result img =
                         g_renderer.render(*world_copy, cam_copy,
-                                          &g_cancel_flag, &g_render_progress);
+                                          &g_cancel_flag, &g_render_progress,
+                                          // progress callback: write partial image into shared result
+                                          [](const render_result& partial) {
+                                              std::lock_guard<std::mutex> lock(g_render_mutex);
+                                              g_render_result = partial;
+                                              g_render_has_result = true;
+                                          });
 
+                    // final result: store and mark final-ready
                     {
                         std::lock_guard<std::mutex> lock(g_render_mutex);
                         g_render_result = std::move(img);
                         g_render_has_result = true;
+                        g_render_final_image_ready.store(true);
                     }
                 });
             }
@@ -2621,6 +3447,8 @@ int main()
         if (g_render_in_progress) {
             if (ImGui::Button("Cancel Render")) {
                 g_cancel_flag.store(true);
+                // close the progress window immediately on cancel
+                stop_progress_window_thread();
             }
         } else {
             ImGui::TextDisabled("Move camera / edit objects / materials, then click Render.");
@@ -2751,6 +3579,12 @@ int main()
                                     g_active_gizmo_axis = best_axis;
                                     g_gizmo_hit_point = best_cp1;
                                     g_gizmo_initial_obj_translation = g_scene.objects[g_selected_object].translation;
+                                    // capture snapshot for undo at drag start
+                                    int sidx = g_selected_object;
+                                    if (sidx >= 0) {
+                                        auto& o = g_scene.objects[sidx];
+                                        g_obj_snapshot_before[sidx] = ObjSnapshot{ o.center, o.translation, o.rotation_deg, o.scale, o.radius };
+                                    }
                                     did_hit_gizmo = true;
                                 }
                             }
@@ -2796,8 +3630,61 @@ int main()
                             }
                         }
 
-                        // Mouse release: clear active axis
+                        // Mouse release: if we were dragging a gizmo axis, push an undo action
                         if (!ImGui::IsMouseDown(0)) {
+                            if (g_active_gizmo_axis >= 0 && g_selected_object >= 0) {
+                                int idx = g_selected_object;
+                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                    auto& obj = g_scene.objects[idx];
+                                    ObjSnapshot after{ obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius };
+                                    ObjSnapshot before = g_obj_snapshot_before[idx];
+                                    // only push if something changed
+                                    bool changed = (
+                                        std::abs(after.translation.x() - before.translation.x()) > 1e-6 ||
+                                        std::abs(after.translation.y() - before.translation.y()) > 1e-6 ||
+                                        std::abs(after.translation.z() - before.translation.z()) > 1e-6 ||
+                                        std::abs(after.center.x() - before.center.x()) > 1e-6 ||
+                                        std::abs(after.center.y() - before.center.y()) > 1e-6 ||
+                                        std::abs(after.center.z() - before.center.z()) > 1e-6 ||
+                                        std::abs(after.rotation_deg.x() - before.rotation_deg.x()) > 1e-6 ||
+                                        std::abs(after.rotation_deg.y() - before.rotation_deg.y()) > 1e-6 ||
+                                        std::abs(after.rotation_deg.z() - before.rotation_deg.z()) > 1e-6 ||
+                                        std::abs(after.scale.x() - before.scale.x()) > 1e-6 ||
+                                        std::abs(after.scale.y() - before.scale.y()) > 1e-6 ||
+                                        std::abs(after.scale.z() - before.scale.z()) > 1e-6 ||
+                                        std::abs(after.radius - before.radius) > 1e-9
+                                    );
+                                    if (changed) {
+                                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                                            [idx, before]() {
+                                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                                    auto& o = g_scene.objects[idx];
+                                                    o.center = before.center;
+                                                    o.translation = before.translation;
+                                                    o.rotation_deg = before.rotation_deg;
+                                                    o.scale = before.scale;
+                                                    o.radius = before.radius;
+                                                    g_world_dirty = true;
+                                                    g_cached_world.reset();
+                                                }
+                                            },
+                                            [idx, after]() {
+                                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
+                                                    auto& o = g_scene.objects[idx];
+                                                    o.center = after.center;
+                                                    o.translation = after.translation;
+                                                    o.rotation_deg = after.rotation_deg;
+                                                    o.scale = after.scale;
+                                                    o.radius = after.radius;
+                                                    g_world_dirty = true;
+                                                    g_cached_world.reset();
+                                                }
+                                            },
+                                            "Transform Object"
+                                        ));
+                                    }
+                                }
+                            }
                             g_active_gizmo_axis = -1;
                         }
                     }
@@ -2850,6 +3737,9 @@ int main()
         g_cancel_flag.store(true);
         g_render_thread.join();
     }
+
+    // Ensure progress window is stopped on shutdown
+    stop_progress_window_thread();
 
     if (g_rtTexture != 0) {
         glDeleteTextures(1, &g_rtTexture);

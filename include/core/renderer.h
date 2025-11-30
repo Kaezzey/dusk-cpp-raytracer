@@ -8,6 +8,7 @@
 #include <vector>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 
 // Returned by renderer::render()
 struct render_result {
@@ -42,7 +43,8 @@ public:
         const hittable&        world,
         camera&                cam,
         std::atomic<bool>*     cancel_flag,
-        render_progress_state* progress
+        render_progress_state* progress,
+        std::function<void(const render_result&)> progress_callback = nullptr
     ) const;
 };
 

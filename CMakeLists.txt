@@ -91,6 +91,17 @@ add_executable(dusktracer_editor
 )
 
 # ---------------------------------------------------------------------------
+# Windows icon resource (for EXE/taskbar/titlebar)
+# ---------------------------------------------------------------------------
+if (WIN32)
+    # Single RC used by both targets. Path is relative to CMakeLists.txt.
+    set(APP_ICON_RC "${CMAKE_SOURCE_DIR}/appicon.rc")
+
+    target_sources(dusktracer        PRIVATE ${APP_ICON_RC})
+    target_sources(dusktracer_editor PRIVATE ${APP_ICON_RC})
+endif()
+
+# ---------------------------------------------------------------------------
 # OpenMP
 # ---------------------------------------------------------------------------
 find_package(OpenMP)
@@ -146,6 +157,13 @@ add_custom_command(TARGET dusktracer POST_BUILD
         "$<TARGET_FILE_DIR:dusktracer>/textures"
 )
 
+# Copy application icon PNG next to main exe so runtime can find it by relative path
+add_custom_command(TARGET dusktracer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/resources/dusktracer.png"
+        "$<TARGET_FILE_DIR:dusktracer>"
+)
+
 # Copy glfw3.dll next to the editor exe (if using dynamic GLFW)
 add_custom_command(TARGET dusktracer_editor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -157,5 +175,12 @@ add_custom_command(TARGET dusktracer_editor POST_BUILD
 add_custom_command(TARGET dusktracer_editor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${GLEW_ROOT}/bin/glew32.dll"
+        "$<TARGET_FILE_DIR:dusktracer_editor>"
+)
+
+# Copy application icon PNG next to editor exe so runtime can find it by relative path
+add_custom_command(TARGET dusktracer_editor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/resources/dusktracer.png"
         "$<TARGET_FILE_DIR:dusktracer_editor>"
 )

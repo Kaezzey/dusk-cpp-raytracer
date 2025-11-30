@@ -14,7 +14,7 @@ render_result renderer::render(
     std::atomic<bool>* cancel_flag
 ) const
 {
-    return render(world, cam, cancel_flag, nullptr);
+    return render(world, cam, cancel_flag, nullptr, nullptr);
 }
 
 // 2) Full version with progress + ETA
@@ -22,7 +22,8 @@ render_result renderer::render(
     const hittable&        world,
     camera&                cam,
     std::atomic<bool>*     cancel_flag,
-    render_progress_state* progress
+    render_progress_state* progress,
+    std::function<void(const render_result&)> progress_callback
 ) const
 {
     using clock = std::chrono::steady_clock;
@@ -119,6 +120,13 @@ render_result renderer::render(
 
                     progress->eta_seconds.store(eta);
                     progress->elapsed_seconds.store(elapsed);
+
+                    // If UI provided a progress callback, give it a partial image
+                    if (progress_callback) {
+                        // pass a copy of current output to the callback
+                        render_result partial = out;
+                        progress_callback(partial);
+                    }
                 }
             }
         }
