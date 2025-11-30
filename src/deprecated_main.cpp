@@ -280,7 +280,7 @@ void cornell_box() {
         tall_box,
         vec3(265, 0, 295),   // translation
         vec3(0, 15, 0),      // rotation (deg): +15° about Y
-        1.0                  // scale
+        vec3(1.0, 1.0, 1.0)  // scale
     ));
 
     // ---------------- Short box ----------------
@@ -294,7 +294,7 @@ void cornell_box() {
         short_box,
         vec3(130, 0, 65),    // translation
         vec3(0, -18, 0),     // rotation (deg): -18° about Y
-        1.0                  // scale
+        vec3(1.0, 1.0, 1.0)  // scale
     ));
 
     world = hittable_list(make_shared<bvh_node>(world));
@@ -391,7 +391,7 @@ void final_scene(int image_width, int samples_per_pixel, int max_depth) {
         object,
         vec3(-100, 270, 395),   // translation
         vec3(0, 15, 0),          // rotation degrees (rx, ry, rz)
-        1.0                      // scale
+        vec3(1.0, 1.0, 1.0)      // scale
     ));
 
     world = hittable_list(make_shared<bvh_node>(world));
@@ -557,7 +557,7 @@ void model_Scene(){
         mesh_bvh,
         vec3(0, 0, 0),   // translation
         vec3(0, 90, 0),      // rotation (deg): +15° about Y
-        1.0                  // scale
+        vec3(1.0, 1.0, 1.0)  // scale
     ));
 
     camera cam;

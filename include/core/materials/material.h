@@ -179,7 +179,16 @@ class dielectric : public material {
         else
             direction = refract(unit_direction, rec.normal, ri);
 
-        scattered = ray(rec.p, direction, r_in.time());
+        // Small offset to avoid self-intersections when spawning refracted/reflect
+        // rays from surfaces (especially important for thin glass and grazing exits).
+        // Use the surface normal to push the origin away from the surface in the
+        // correct hemisphere — this avoids accidentally nudging the ray back
+        // into the surface when the sampled direction points slightly inward.
+        const double eps = 1e-4;
+        vec3 n = rec.normal;
+        vec3 origin_offset = (dot(direction, n) > 0.0) ? (eps * n) : (-eps * n);
+
+        scattered = ray(rec.p + origin_offset, direction, r_in.time());
         return true;
     }
 

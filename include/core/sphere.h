@@ -52,20 +52,26 @@ class sphere : public hittable {
             // 1. GET UVs
             get_sphere_uv(outward_normal, rec.u, rec.v);
 
-            // 2. FIX: Calculate Analytical Tangents for a Sphere
-            // This ensures the Tangent (T) aligns perfectly with the U texture direction
-            // Tangent is derivative of position with respect to phi (horizontal)
-            // T = (-z, 0, x) derived from spherical coords
-            rec.tangent = vec3(-outward_normal.z(), 0.0, outward_normal.x());
-            
-            if (rec.tangent.length_squared() < 1e-8) {
-                rec.tangent = vec3(1,0,0); // Handle poles
+            // 2. Calculate a robust tangent basis for the sphere
+            // Compute tangent from the final shading normal (rec.normal) so
+            // that face-flips (set_face_normal) are handled consistently.
+            vec3 n = rec.normal;
+
+            // Prefer analytical longitude direction when valid
+            vec3 t = vec3(-n.z(), 0.0, n.x());
+
+            // If tangent is degenerate (poles), pick a stable perpendicular
+            if (t.length_squared() < 1e-8) {
+                vec3 up = (std::fabs(n.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+                t = unit_vector(cross(up, n));
             } else {
-                rec.tangent = unit_vector(rec.tangent);
+                t = unit_vector(t);
             }
 
-            // 3. Bitangent
-            rec.bitangent = cross(rec.normal, rec.tangent);
+            rec.tangent = t;
+
+            // 3. Bitangent (ensure orthogonality)
+            rec.bitangent = unit_vector(cross(rec.normal, rec.tangent));
 
             rec.mat = mat;
             return true;

@@ -1,6 +1,8 @@
 #ifndef TRIANGLE_H
 #define TRIANGLE_H
 
+#include <cmath>
+
 #include "hittable.h"
 #include "BVH.h"
 #include "AABB.h"
@@ -23,7 +25,7 @@ inline void compute_triangle_tangent_bitangent(
     double dv2 = v2 - v0;
 
     double det = du1 * dv2 - dv1 * du2;
-    if (fabs(det) < 1e-8) {
+    if (std::fabs(det) < 1e-8) {
         // Degenerate UV mapping – fall back to something arbitrary.
         tangent   = vec3(1, 0, 0);
         bitangent = vec3(0, 1, 0);
@@ -40,6 +42,9 @@ class triangle : public hittable {
 public:
     // Positions
     point3 v0, v1, v2;
+
+    // Precomputed edges for Möller–Trumbore
+    vec3   edge1, edge2;
 
     // Vertex normals (can be flat or smooth; required)
     vec3   n0, n1, n2;
@@ -75,13 +80,14 @@ public:
           u2(u2), v2_uv(v2_uv),
           t0(t0), t1(t1), t2(t2),
           b0(b0), b1(b1), b2(b2),
-          mat(mat)
+          mat(std::move(mat))
     {
+        build_edges();
+        orthonormalise_vertex_frames();
         compute_bbox();
     }
 
     // Convenience ctor: per-vertex position + normal + UV, but single face T/B
-    // (useful if you only compute tangents/bitangents per triangle)
     triangle(
         const point3& v0, const point3& v1, const point3& v2,
         const vec3&   n0, const vec3&   n1, const vec3&   n2,
@@ -99,13 +105,14 @@ public:
           u2(u2), v2_uv(v2_uv),
           t0(face_tangent), t1(face_tangent), t2(face_tangent),
           b0(face_bitangent), b1(face_bitangent), b2(face_bitangent),
-          mat(mat)
+          mat(std::move(mat))
     {
+        build_edges();
+        orthonormalise_vertex_frames();
         compute_bbox();
     }
 
     // Minimal ctor: only positions + UV; compute flat normal & face T/B
-    // (good for quick tests / simple models)
     triangle(
         const point3& v0, const point3& v1, const point3& v2,
         double u0, double v0_uv,
@@ -117,13 +124,15 @@ public:
           u0(u0), v0_uv(v0_uv),
           u1(u1), v1_uv(v1_uv),
           u2(u2), v2_uv(v2_uv),
-          mat(mat)
+          mat(std::move(mat))
     {
+        build_edges();
+
         // Flat geometric normal for all vertices
-        vec3 faceN = unit_vector(cross(v1 - v0, v2 - v0));
+        vec3 faceN = unit_vector(cross(edge1, edge2));
         n0 = n1 = n2 = faceN;
 
-        // Face tangent/bitangent
+        // Face tangent / bitangent from UVs
         vec3 faceT, faceB;
         compute_triangle_tangent_bitangent(
             v0, v1, v2,
@@ -132,24 +141,21 @@ public:
             u2, v2_uv,
             faceT, faceB
         );
-        t0 = t1 = t2 = unit_vector(faceT);
-        b0 = b1 = b2 = unit_vector(faceB);
+        t0 = t1 = t2 = faceT;
+        b0 = b1 = b2 = faceB;
 
+        orthonormalise_vertex_frames();
         compute_bbox();
     }
 
     // Core intersection
     bool hit(const ray& r, interval ray_t, hit_record& rec) const override {
-        // Möller–Trumbore
-
-        const vec3 edge1 = v1 - v0;
-        const vec3 edge2 = v2 - v0;
-
+        // Möller–Trumbore using precomputed edges
         const vec3 pvec = cross(r.direction(), edge2);
         const double det = dot(edge1, pvec);
 
         // Treat nearly-zero det as no hit (double-sided triangle)
-        if (fabs(det) < 1e-8)
+        if (det > -1e-8 && det < 1e-8)
             return false;
 
         const double invDet = 1.0 / det;
@@ -179,32 +185,47 @@ public:
         rec.v = w * v0_uv   + u * v1_uv   + v * v2_uv;
 
         // Interpolate normal (smooth)
-        vec3 interpN = unit_vector(
-            w * n0 +
-            u * n1 +
-            v * n2
-        );
+        vec3 interpN = w * n0 + u * n1 + v * n2;
+        interpN = unit_vector(interpN);
         rec.set_face_normal(r, interpN);
 
         // Interpolate tangent and bitangent
         vec3 interpT = w * t0 + u * t1 + v * t2;
         vec3 interpB = w * b0 + u * b1 + v * b2;
 
-        // Orthonormalise once here for safety
-        vec3 T = unit_vector(interpT - dot(interpT, rec.normal) * rec.normal);
-        vec3 B = cross(rec.normal, T);
-
-        // Fallback if degenerate
-        if (T.near_zero() || B.near_zero()) {
-            vec3 up = (fabs(rec.normal.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+        // Gram–Schmidt once per hit to keep T orthogonal to N
+        vec3 T = interpT;
+        if (!T.near_zero()) {
+            T = T - dot(T, rec.normal) * rec.normal;
+            T = unit_vector(T);
+        } else {
+            // Fallback if degenerate
+            vec3 up = (std::fabs(rec.normal.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
             T = unit_vector(cross(up, rec.normal));
+        }
+
+        vec3 B = interpB;
+        if (!B.near_zero()) {
+            B = B - dot(B, rec.normal) * rec.normal;
+            B = unit_vector(B);
+        } else {
             B = cross(rec.normal, T);
+        }
+
+        // Final safety: if B ended up degenerate, rebuild it from N and T
+        if (B.near_zero()) {
+            B = cross(rec.normal, T);
+            if (B.near_zero()) {
+                // absolute worst case fallback
+                vec3 up = (std::fabs(rec.normal.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+                T = unit_vector(cross(up, rec.normal));
+                B = cross(rec.normal, T);
+            }
         }
 
         rec.tangent   = T;
         rec.bitangent = B;
-
-        rec.mat = mat;
+        rec.mat       = mat;
 
         return true;
     }
@@ -214,17 +235,59 @@ public:
     }
 
 private:
+    void build_edges() {
+        edge1 = v1 - v0;
+        edge2 = v2 - v0;
+    }
+
+    // Make each vertex T/B frame roughly orthonormal with its normal.
+    // This is done once in the constructor so the hit() path is cheaper.
+    void orthonormalise_vertex_frames() {
+        auto fix_one = [](const vec3& N_in, vec3& T_in, vec3& B_in) {
+            vec3 N = unit_vector(N_in);
+
+            // Orthonormalise T to N
+            vec3 T = T_in;
+            if (T.near_zero()) {
+                // Construct some tangent if broken
+                vec3 up = (std::fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+                T = cross(up, N);
+            } else {
+                T = T - dot(T, N) * N;
+            }
+            T = unit_vector(T);
+
+            // B from N x T
+            vec3 B = cross(N, T);
+            if (B.near_zero()) {
+                // last resort
+                vec3 up = (std::fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+                T = unit_vector(cross(up, N));
+                B = cross(N, T);
+            } else {
+                B = unit_vector(B);
+            }
+
+            T_in = T;
+            B_in = B;
+        };
+
+        fix_one(n0, t0, b0);
+        fix_one(n1, t1, b1);
+        fix_one(n2, t2, b2);
+    }
+
     void compute_bbox() {
         point3 min_p(
-            fmin(v0.x(), fmin(v1.x(), v2.x())),
-            fmin(v0.y(), fmin(v1.y(), v2.y())),
-            fmin(v0.z(), fmin(v1.z(), v2.z()))
+            std::fmin(v0.x(), std::fmin(v1.x(), v2.x())),
+            std::fmin(v0.y(), std::fmin(v1.y(), v2.y())),
+            std::fmin(v0.z(), std::fmin(v1.z(), v2.z()))
         );
 
         point3 max_p(
-            fmax(v0.x(), fmax(v1.x(), v2.x())),
-            fmax(v0.y(), fmax(v1.y(), v2.y())),
-            fmax(v0.z(), fmax(v1.z(), v2.z()))
+            std::fmax(v0.x(), std::fmax(v1.x(), v2.x())),
+            std::fmax(v0.y(), std::fmax(v1.y(), v2.y())),
+            std::fmax(v0.z(), std::fmax(v1.z(), v2.z()))
         );
 
         // Small epsilon to avoid zero-thickness boxes

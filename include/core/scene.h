@@ -5,7 +5,7 @@
 #include <vector>
 #include <memory>
 
-#include "vec3.h"    // for vec3 / point3
+#include "vec3.h"  // for vec3 / point3
 
 // Forward declarations
 class material;
@@ -72,22 +72,46 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 // ----------------------------------------
 enum class scene_object_type {
     sphere,
-    mesh_instance,   // mesh placed in the world with a transform
+    cube,          // NEW: box made from your quad/box
+    mesh_instance  // mesh placed in the world with a transform
 };
 
 // ----------------------------------------
 // Editor-facing object description
 // ----------------------------------------
+//
+// Conventions:
+// - sphere:
+//     center, radius, material_index
+//
+// - cube:
+//     center       = cube centre in world space
+//     scale.x      = uniform scale multiplier (side length; 1 = unit cube)
+//     rotation_deg = Euler rotation (degrees)
+//     material_index used
+//
+// - mesh_instance:
+//     mesh_index, translation, rotation_deg, scale.x (uniform),
+//     mesh_slot_materials for per-slot overrides,
+//     material_index used as a fallback.
+//
 struct scene_object {
     std::string       name;
-    scene_object_type type;
-    int   material_index;
-    point3 center;
-    double radius;
-    int   mesh_index;
-    vec3  translation;
-    vec3  rotation_deg;
-    vec3  scale;
+    scene_object_type type = scene_object_type::sphere;
+
+    int   material_index = -1;
+
+    // Sphere / cube common “anchor”
+    point3 center       = point3(0, 0, 0);
+    double radius       = 0.5;           // used only for spheres
+
+    // Mesh instance specific
+    int   mesh_index    = -1;
+    vec3  translation   = vec3(0, 0, 0);
+    vec3  rotation_deg  = vec3(0, 0, 0);
+    vec3  scale         = vec3(1, 1, 1);
+
+    // Per-slot mesh materials (same order as scene_mesh_asset::slot_names)
     std::vector<int> mesh_slot_materials;
 };
 
@@ -98,7 +122,9 @@ struct scene_object {
 struct scene_mesh_asset {
     std::string name;
     std::string file_path;
-    std::shared_ptr<hittable> mesh_bvh;
+
+    std::shared_ptr<hittable> mesh_bvh;  // optional: per-mesh BVH cache
+
     std::vector<std::string> slot_names;
     std::vector<int>         slot_default_materials;
 };
@@ -130,13 +156,12 @@ struct scene_light {
 // Whole scene: what the editor owns
 // ----------------------------------------
 struct scene {
-    // NEW: texture assets
-    std::vector<scene_texture>   textures;  // texture library for this scene
+    std::vector<scene_texture>    textures;   // texture library
 
-    std::vector<scene_material>  materials;
-    std::vector<scene_object>    objects;
-    std::vector<scene_mesh_asset> meshes;   // mesh assets (FBX/OBJ etc.)
-    std::vector<scene_light>     lights;    // lights in the scene
+    std::vector<scene_material>   materials;
+    std::vector<scene_object>     objects;
+    std::vector<scene_mesh_asset> meshes;     // mesh assets (FBX/OBJ etc.)
+    std::vector<scene_light>      lights;     // lights in the scene
 };
 
 // Convert editor scene into runtime hittables for the renderer.

@@ -69,6 +69,7 @@
         "mutex": "cpp",
         "set": "cpp",
         "unordered_set": "cpp",
-        "xtree": "cpp"
+        "xtree": "cpp",
+        "*.in": "cpp"
     }
 }

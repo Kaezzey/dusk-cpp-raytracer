@@ -16,13 +16,14 @@ public:
     transform(std::shared_ptr<hittable> p,
               const vec3& translate,
               const vec3& rotate_deg,  // *** editor uses DEGREES ***
-              double      scale = 1.0)
+              const vec3& scale = vec3(1.0, 1.0, 1.0))
         : ptr(std::move(p)), t(translate)
     {
         //----------------------------------------------------------------------
         // 1. Build rotation matrices from DEGREES
         //----------------------------------------------------------------------
 
+        // Build rotation angles (degrees from editor are used directly).
         double rx = deg2rad(rotate_deg.x());
         double ry = deg2rad(rotate_deg.y());
         double rz = deg2rad(rotate_deg.z());
@@ -58,14 +59,35 @@ public:
         // 2. Build M and M_inv (forward + inverse transform)
         //----------------------------------------------------------------------
 
-        double s = scale;
-        double inv_s = (s == 0.0) ? 1.0 : 1.0 / s;
+        double scale_x = scale.x(); if (scale_x == 0.0) scale_x = 1.0;
+        double scale_y = scale.y(); if (scale_y == 0.0) scale_y = 1.0;
+        double scale_z = scale.z(); if (scale_z == 0.0) scale_z = 1.0;
 
-        for (int i = 0; i < 3; ++i)
+        double inv_scale_x = 1.0 / scale_x;
+        double inv_scale_y = 1.0 / scale_y;
+        double inv_scale_z = 1.0 / scale_z;
+
+        // The raster `make_model_trs` constructs a column-major matrix where
+        // the linear part is effectively (for element m_{row,col}):
+        //   m_{row,col} = R[col][row] * scale_row
+        // To match raster and RT conventions, build our row-major M so that
+        // apply(M, v) produces identical rotated+scaled results. Therefore:
+        //   M[row][col] = R[col][row] * scale_row
+        for (int i = 0; i < 3; ++i) {
+            double scale_i = (i == 0) ? scale_x : (i == 1) ? scale_y : scale_z;
             for (int j = 0; j < 3; ++j) {
-                M[i][j]     = R[i][j] * s;
-                M_inv[i][j] = R[j][i] * inv_s; // transpose(R) * (1/s)
+                M[i][j] = R[j][i] * scale_i;
             }
+        }
+
+        // For M = S * R^T, the inverse is M_inv = R * S^{-1} so:
+        //   M_inv[i][j] = R[i][j] * inv_scale_j
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                double inv_scale_j = (j == 0) ? inv_scale_x : (j == 1) ? inv_scale_y : inv_scale_z;
+                M_inv[i][j] = R[i][j] * inv_scale_j;
+            }
+        }
 
         //----------------------------------------------------------------------
         // 3. Build transformed bounding box
@@ -111,9 +133,11 @@ public:
         rec.p = apply(M, rec.p) + t;
 
         // Frame → world
-        vec3 n_world = unit_vector(apply(M, rec.normal));
-        vec3 t_world = unit_vector(apply(M, rec.tangent));
-        vec3 b_world = unit_vector(apply(M, rec.bitangent));
+            // Normals must be transformed by the inverse-transpose of the linear part
+            vec3 n_world = unit_vector(apply_transpose(M_inv, rec.normal));
+            // Tangent/bitangent (direction vectors) transform by the forward linear matrix
+            vec3 t_world = unit_vector(apply(M, rec.tangent));
+            vec3 b_world = unit_vector(apply(M, rec.bitangent));
 
         rec.normal    = n_world;
         rec.tangent   = t_world;
@@ -164,6 +188,15 @@ private:
             M[0][0]*v.x() + M[0][1]*v.y() + M[0][2]*v.z(),
             M[1][0]*v.x() + M[1][1]*v.y() + M[1][2]*v.z(),
             M[2][0]*v.x() + M[2][1]*v.y() + M[2][2]*v.z()
+        );
+    }
+
+    // Multiply by transpose: out = M^T * v
+    static vec3 apply_transpose(const double M[3][3], const vec3& v) {
+        return vec3(
+            M[0][0]*v.x() + M[1][0]*v.y() + M[2][0]*v.z(),
+            M[0][1]*v.x() + M[1][1]*v.y() + M[2][1]*v.z(),
+            M[0][2]*v.x() + M[1][2]*v.y() + M[2][2]*v.z()
         );
     }
 

@@ -11,6 +11,10 @@
 #include <sstream>
 #include <cctype>
 #include <cstring>
+#include <memory>   // for std::shared_ptr
+#include <thread>   // for render worker
+#include <mutex>    // for result handoff
+#include <chrono>   // for timing if you want
 
 #include "../../external/glew/include/GL/glew.h"
 #include "../../include/external/GLFW/glfw3.h"
@@ -18,6 +22,7 @@
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+#include "imgui_internal.h"
 
 #include "../../include/core/camera.h"
 #include "../../include/core/renderer.h"
@@ -33,6 +38,12 @@
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
+
+// -----------------------------------------------------------------------------
+// Progress state (defined in renderer.h)
+// -----------------------------------------------------------------------------
+
+static render_progress_state g_render_progress;
 
 // -----------------------------------------------------------------------------
 // Engine globals
@@ -58,6 +69,17 @@ static int g_selected_object = -1;
 
 // Files dropped this frame
 static std::vector<std::string> g_dropped_files;
+
+// Cached RT world + dirty flag
+static std::shared_ptr<hittable_list> g_cached_world;
+static bool g_world_dirty = true;
+
+// Async render thread + result handoff
+static std::thread g_render_thread;
+static std::mutex  g_render_mutex;
+static bool        g_render_in_progress = false;
+static bool        g_render_has_result  = false;
+static render_result g_render_result;
 
 // -----------------------------------------------------------------------------
 // Ray-traced image texture
@@ -85,6 +107,10 @@ static GLuint  g_rasterSphereVAO        = 0;
 static GLuint  g_rasterSphereVBO        = 0;
 static GLuint  g_rasterSphereEBO        = 0;
 static GLsizei g_rasterSphereIndexCount = 0;
+static GLuint  g_rasterCubeVAO          = 0;
+static GLuint  g_rasterCubeVBO          = 0;
+static GLuint  g_rasterCubeEBO          = 0;
+static GLsizei g_rasterCubeIndexCount   = 0;
 
 // One gpu_mesh per scene mesh asset, same index as g_scene.meshes
 static std::vector<gpu_mesh> g_gpu_meshes;
@@ -94,6 +120,25 @@ static GLuint g_rasterColorTex = 0;
 static GLuint g_rasterDepthRBO = 0;
 static int    g_rasterWidth    = 0;
 static int    g_rasterHeight   = 0;
+
+// Picking FBO + shader
+static GLuint g_pickFBO        = 0;
+static GLuint g_pickColorTex   = 0;
+static GLuint g_pickDepthRBO   = 0;
+static GLuint g_pickShader     = 0;
+
+// Gizmo (lines) shader + buffers
+static GLuint g_lineShader     = 0;
+static GLuint g_gizmoVAO       = 0;
+static GLuint g_gizmoVBO       = 0;
+static GLuint g_gizmoConeVAO   = 0;
+static GLuint g_gizmoConeVBO   = 0;
+static int    g_gizmoConeVertexCount = 0;
+
+static bool   g_show_gizmo     = false;
+static int    g_active_gizmo_axis = -1; // -1 = none, 0=X,1=Y,2=Z
+static vec3   g_gizmo_hit_point;       // world-space closest point on axis at mouse down
+static vec3   g_gizmo_initial_obj_translation;
 
 // 0 = Ray Traced, 1 = Rasterised
 static int g_viewport_mode = 0;
@@ -247,6 +292,10 @@ static void build_default_scene(scene& scn)
     sun.radiance  = vec3(3.0, 3.0, 3.0);
     sun.direction = unit_vector(vec3(-1.0, -1.0, -0.5));
     scn.lights.push_back(std::move(sun));
+
+    // Mark world dirty
+    g_world_dirty = true;
+    g_cached_world.reset();
 }
 
 // -----------------------------------------------------------------------------
@@ -336,6 +385,55 @@ static void BuildRasterShader()
     g_rasterShader = CompileShader(vs, fs);
 }
 
+// Simple flat shader used for picking (outputs a uniform color)
+static void BuildPickShader()
+{
+    const char* vs = R"(#version 130
+        in vec3 aPos;
+        uniform mat4 uModel;
+        uniform mat4 uView;
+        uniform mat4 uProj;
+        void main() {
+            gl_Position = uProj * uView * uModel * vec4(aPos, 1.0);
+        }
+    )";
+
+    const char* fs = R"(#version 130
+        uniform vec3 uPickColor;
+        out vec4 FragColor;
+        void main() {
+            FragColor = vec4(uPickColor, 1.0);
+        }
+    )";
+
+    g_pickShader = CompileShader(vs, fs);
+}
+
+// Line shader (vertex color) for gizmo axes
+static void BuildLineShader()
+{
+    const char* vs = R"(#version 130
+        in vec3 aPos;
+        in vec3 aColor;
+        out vec3 vColor;
+        uniform mat4 uModel;
+        uniform mat4 uView;
+        uniform mat4 uProj;
+        void main() {
+            vColor = aColor;
+            gl_Position = uProj * uView * uModel * vec4(aPos, 1.0);
+        }
+    )";
+
+    const char* fs = R"(#version 130
+        in vec3 vColor;
+        out vec4 FragColor;
+        void main() { FragColor = vec4(vColor, 1.0); }
+    )";
+
+    g_lineShader = CompileShader(vs, fs);
+}
+
 static void make_lookat(const vec3& eye, const vec3& center, const vec3& up, float out[16])
 {
     vec3 f = unit_vector(center - eye);
@@ -381,6 +479,59 @@ static void make_model_translate_only(const vec3& t, float out[16])
     out[4]  = 0.0f; out[5]  = 1.0f; out[6]  = 0.0f; out[7]  = 0.0f;
     out[8]  = 0.0f; out[9]  = 0.0f; out[10] = 1.0f; out[11] = 0.0f;
     out[12] = (float)t.x(); out[13] = (float)t.y(); out[14] = (float)t.z(); out[15] = 1.0f;
+}
+
+// make model matrix from Translation, Rotation (degrees XYZ), and non-uniform Scale
+static void make_model_trs(const vec3& translate, const vec3& rotation_deg, const vec3& scale, float out[16])
+{
+    // Build rotation matrices R = Rz * Ry * Rx (same convention as transform.h)
+    double rx = rotation_deg.x() * (3.14159265358979323846 / 180.0);
+    double ry = rotation_deg.y() * (3.14159265358979323846 / 180.0);
+    double rz = rotation_deg.z() * (3.14159265358979323846 / 180.0);
+
+    double cx = std::cos(rx), sx = std::sin(rx);
+    double cy = std::cos(ry), sy = std::sin(ry);
+    double cz = std::cos(rz), sz = std::sin(rz);
+
+    double Rx[3][3], Ry[3][3], Rz[3][3];
+    double Rtemp[3][3];
+    double R[3][3];
+
+    Rx[0][0] = 1;  Rx[0][1] = 0;   Rx[0][2] = 0;
+    Rx[1][0] = 0;  Rx[1][1] = cx;  Rx[1][2] = -sx;
+    Rx[2][0] = 0;  Rx[2][1] = sx;  Rx[2][2] = cx;
+
+    Ry[0][0] = cy; Ry[0][1] = 0;   Ry[0][2] = sy;
+    Ry[1][0] = 0;  Ry[1][1] = 1;   Ry[1][2] = 0;
+    Ry[2][0] = -sy;Ry[2][1] = 0;   Ry[2][2] = cy;
+
+    Rz[0][0] = cz; Rz[0][1] = -sz; Rz[0][2] = 0;
+    Rz[1][0] = sz; Rz[1][1] =  cz; Rz[1][2] = 0;
+    Rz[2][0] = 0;  Rz[2][1] =  0;  Rz[2][2] = 1;
+
+    // R = Rz * Ry * Rx
+    for (int i=0;i<3;++i) for (int j=0;j<3;++j) Rtemp[i][j]=0.0;
+    for (int i=0;i<3;++i)
+        for (int j=0;j<3;++j)
+            for (int k=0;k<3;++k)
+                Rtemp[i][j] += Ry[i][k] * Rx[k][j];
+
+    for (int i=0;i<3;++i)
+        for (int j=0;j<3;++j) {
+            R[i][j] = 0.0;
+            for (int k=0;k<3;++k) R[i][j] += Rz[i][k] * Rtemp[k][j];
+        }
+
+    // Combine rotation and non-uniform scale: M = R * S (S diagonal sx,sy,sz)
+    double sx_d = scale.x();
+    double sy_d = scale.y();
+    double sz_d = scale.z();
+
+    out[0]  = (float)(R[0][0] * sx_d); out[1]  = (float)(R[0][1] * sy_d); out[2]  = (float)(R[0][2] * sz_d); out[3]  = 0.0f;
+    out[4]  = (float)(R[1][0] * sx_d); out[5]  = (float)(R[1][1] * sy_d); out[6]  = (float)(R[1][2] * sz_d); out[7]  = 0.0f;
+    out[8]  = (float)(R[2][0] * sx_d); out[9]  = (float)(R[2][1] * sy_d); out[10] = (float)(R[2][2] * sz_d); out[11] = 0.0f;
+
+    out[12] = (float)translate.x(); out[13] = (float)translate.y(); out[14] = (float)translate.z(); out[15] = 1.0f;
 }
 
 // Unit sphere mesh with normals
@@ -453,6 +604,96 @@ static void BuildUnitSphereMesh(int segments = 32, int rings = 16)
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
                           sizeof(SphereVertex), (void*)(3 * sizeof(float)));
+
+    glBindVertexArray(0);
+}
+
+// Unit cube mesh with normals (centered at origin, size 1 -> extents [-0.5,0.5])
+static void BuildUnitCubeMesh()
+{
+    struct CubeVertex {
+        float px, py, pz;
+        float nx, ny, nz;
+    };
+
+    // 6 faces * 4 verts each (unique normals per face)
+    std::vector<CubeVertex> verts;
+    std::vector<unsigned int> inds;
+    verts.reserve(24);
+    inds.reserve(36);
+
+    const float hs = 0.5f;
+
+    // Front (+Z)
+    CubeVertex v0 = { -hs, -hs,  hs,  0, 0, 1 };
+    CubeVertex v1 = {  hs, -hs,  hs,  0, 0, 1 };
+    CubeVertex v2 = {  hs,  hs,  hs,  0, 0, 1 };
+    CubeVertex v3 = { -hs,  hs,  hs,  0, 0, 1 };
+
+    // Back (-Z)
+    CubeVertex v4 = {  hs, -hs, -hs,  0, 0, -1 };
+    CubeVertex v5 = { -hs, -hs, -hs,  0, 0, -1 };
+    CubeVertex v6 = { -hs,  hs, -hs,  0, 0, -1 };
+    CubeVertex v7 = {  hs,  hs, -hs,  0, 0, -1 };
+
+    // Left (-X)
+    CubeVertex v8  = { -hs, -hs, -hs, -1, 0, 0 };
+    CubeVertex v9  = { -hs, -hs,  hs, -1, 0, 0 };
+    CubeVertex v10 = { -hs,  hs,  hs, -1, 0, 0 };
+    CubeVertex v11 = { -hs,  hs, -hs, -1, 0, 0 };
+
+    // Right (+X)
+    CubeVertex v12 = {  hs, -hs,  hs, 1, 0, 0 };
+    CubeVertex v13 = {  hs, -hs, -hs, 1, 0, 0 };
+    CubeVertex v14 = {  hs,  hs, -hs, 1, 0, 0 };
+    CubeVertex v15 = {  hs,  hs,  hs, 1, 0, 0 };
+
+    // Top (+Y)
+    CubeVertex v16 = { -hs,  hs,  hs, 0, 1, 0 };
+    CubeVertex v17 = {  hs,  hs,  hs, 0, 1, 0 };
+    CubeVertex v18 = {  hs,  hs, -hs, 0, 1, 0 };
+    CubeVertex v19 = { -hs,  hs, -hs, 0, 1, 0 };
+
+    // Bottom (-Y)
+    CubeVertex v20 = { -hs, -hs, -hs, 0, -1, 0 };
+    CubeVertex v21 = {  hs, -hs, -hs, 0, -1, 0 };
+    CubeVertex v22 = {  hs, -hs,  hs, 0, -1, 0 };
+    CubeVertex v23 = { -hs, -hs,  hs, 0, -1, 0 };
+
+    CubeVertex cube_verts[] = {
+        v0,v1,v2,v3, v4,v5,v6,v7, v8,v9,v10,v11, v12,v13,v14,v15, v16,v17,v18,v19, v20,v21,v22,v23
+    };
+
+    for (int i = 0; i < 24; ++i) verts.push_back(cube_verts[i]);
+
+    unsigned int face_indices[] = {
+        0,1,2, 0,2,3,       // front
+        4,5,6, 4,6,7,       // back
+        8,9,10, 8,10,11,    // left
+        12,13,14, 12,14,15, // right
+        16,17,18, 16,18,19, // top
+        20,21,22, 20,22,23  // bottom
+    };
+
+    for (int i = 0; i < 36; ++i) inds.push_back(face_indices[i]);
+
+    g_rasterCubeIndexCount = (GLsizei)inds.size();
+
+    glGenVertexArrays(1, &g_rasterCubeVAO);
+    glBindVertexArray(g_rasterCubeVAO);
+
+    glGenBuffers(1, &g_rasterCubeVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_rasterCubeVBO);
+    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(CubeVertex), verts.data(), GL_STATIC_DRAW);
+
+    glGenBuffers(1, &g_rasterCubeEBO);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_rasterCubeEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, inds.size() * sizeof(unsigned int), inds.data(), GL_STATIC_DRAW);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)(3 * sizeof(float)));
 
     glBindVertexArray(0);
 }
@@ -718,7 +959,7 @@ static void EnsureRasterFBO(int width, int height)
 // Render rasterised scene into g_rasterColorTex
 static void RenderRasterToTexture(int width, int height)
 {
-    if (g_rasterShader == 0 || g_rasterSphereVAO == 0)
+    if (g_rasterShader == 0)
         return;
 
     EnsureRasterFBO(width, height);
@@ -766,7 +1007,7 @@ static void RenderRasterToTexture(int width, int height)
         if (obj.type == scene_object_type::mesh_instance &&
             !obj.mesh_slot_materials.empty())
         {
-            // Prefer first valid slot binding for *preview* colour
+            // Prefer first valid slot binding
             for (int idx : obj.mesh_slot_materials) {
                 if (idx >= 0 && idx < (int)g_scene.materials.size()) {
                     mat_index_for_raster = idx;
@@ -788,11 +1029,30 @@ static void RenderRasterToTexture(int width, int height)
 
         if (obj.type == scene_object_type::sphere)
         {
-            make_model_sphere(obj.center, obj.radius, model);
+            // Compose translation from center + translation, allow rotation/scale edits
+            vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+            vec3 rot   = obj.rotation_deg;
+            vec3 scl   = obj.scale * vec3(obj.radius, obj.radius, obj.radius);
+
+            make_model_trs(trans, rot, scl, model);
             glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
 
             glBindVertexArray(g_rasterSphereVAO);
             glDrawElements(GL_TRIANGLES, g_rasterSphereIndexCount,
+                           GL_UNSIGNED_INT, (void*)0);
+        }
+        else if (obj.type == scene_object_type::cube)
+        {
+            // Cube: use translation + center, rotation_deg and non-uniform scale
+            vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+            vec3 rot   = obj.rotation_deg;
+            vec3 scl   = obj.scale;
+
+            make_model_trs(trans, rot, scl, model);
+            glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
+
+            glBindVertexArray(g_rasterCubeVAO);
+            glDrawElements(GL_TRIANGLES, g_rasterCubeIndexCount,
                            GL_UNSIGNED_INT, (void*)0);
         }
         else if (obj.type == scene_object_type::mesh_instance)
@@ -805,7 +1065,12 @@ static void RenderRasterToTexture(int width, int height)
             if (gm.vao == 0 || gm.index_count == 0)
                 continue;
 
-            make_model_translate_only(obj.translation, model);
+            // apply translation, rotation and scale to mesh instances too
+            vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+            vec3 rot   = obj.rotation_deg;
+            vec3 scl   = obj.scale;
+
+            make_model_trs(trans, rot, scl, model);
             glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
 
             glBindVertexArray(gm.vao);
@@ -814,9 +1079,233 @@ static void RenderRasterToTexture(int width, int height)
         }
     }
 
+    // Draw gizmo (render into raster FBO so it appears in the preview)
+    if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size() && g_lineShader != 0) {
+        const auto& obj = g_scene.objects[g_selected_object];
+        float model[16];
+        vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+        vec3 rot   = obj.rotation_deg;
+        // gizmo scale based on object's radius (mesh/cube) for reasonable size
+        float gizmo_scale = 0.5f * (float)std::max(0.5, obj.radius);
+        vec3 scl = vec3(gizmo_scale, gizmo_scale, gizmo_scale);
+        make_model_trs(trans, rot, scl, model);
+
+        // Save depth state
+        GLboolean wasDepthTest = glIsEnabled(GL_DEPTH_TEST);
+        GLint prevDepthFunc = 0; glGetIntegerv(GL_DEPTH_FUNC, &prevDepthFunc);
+        // Draw on top of scene
+        glDisable(GL_DEPTH_TEST);
+
+        glUseProgram(g_lineShader);
+        GLint locModelL = glGetUniformLocation(g_lineShader, "uModel");
+        GLint locViewL  = glGetUniformLocation(g_lineShader, "uView");
+        GLint locProjL  = glGetUniformLocation(g_lineShader, "uProj");
+        glUniformMatrix4fv(locViewL, 1, GL_FALSE, view);
+        glUniformMatrix4fv(locProjL, 1, GL_FALSE, proj);
+        glUniformMatrix4fv(locModelL, 1, GL_FALSE, model);
+
+        // draw axis lines (slightly thicker)
+        glLineWidth(2.0f);
+        glBindVertexArray(g_gizmoVAO);
+        glDrawArrays(GL_LINES, 0, 6);
+        glBindVertexArray(0);
+        glLineWidth(1.0f);
+
+        // draw cone arrowheads (triangles) using same shader (vertex color baked)
+        glBindVertexArray(g_gizmoConeVAO);
+        if (g_gizmoConeVertexCount > 0) {
+            glDrawArrays(GL_TRIANGLES, 0, g_gizmoConeVertexCount);
+        }
+        glBindVertexArray(0);
+
+        glUseProgram(0);
+
+        // Restore depth state
+        if (wasDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+        glDepthFunc(prevDepthFunc);
+    }
+
     glBindVertexArray(0);
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// Ensure pick FBO (RGB8 id buffer + depth)
+static void EnsurePickFBO(int width, int height)
+{
+    if (width <= 0 || height <= 0) return;
+
+    if (g_pickFBO == 0) {
+        glGenFramebuffers(1, &g_pickFBO);
+        glGenTextures(1, &g_pickColorTex);
+        glGenRenderbuffers(1, &g_pickDepthRBO);
+    }
+
+    // resize
+    glBindTexture(GL_TEXTURE_2D, g_pickColorTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8,
+                 width, height, 0,
+                 GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+
+    glBindRenderbuffer(GL_RENDERBUFFER, g_pickDepthRBO);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_pickFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, g_pickColorTex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                              GL_RENDERBUFFER, g_pickDepthRBO);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        std::fprintf(stderr, "Pick FBO incomplete: 0x%X\n", status);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// Render pick-pass and read clicked pixel; returns object index or -1
+static int PerformPick(int width, int height, int click_x, int click_y)
+{
+    if (g_pickShader == 0) return -1;
+
+    EnsurePickFBO(width, height);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_pickFBO);
+    glViewport(0, 0, width, height);
+    glEnable(GL_DEPTH_TEST);
+    glClearColor(0,0,0,0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glUseProgram(g_pickShader);
+    GLint locModel    = glGetUniformLocation(g_pickShader, "uModel");
+    GLint locView     = glGetUniformLocation(g_pickShader, "uView");
+    GLint locProj     = glGetUniformLocation(g_pickShader, "uProj");
+    GLint locColor    = glGetUniformLocation(g_pickShader, "uPickColor");
+
+    float view[16];
+    float proj[16];
+    const vec3& pos = g_editor_cam.position;
+    const vec3& f   = g_editor_cam.forward;
+    const vec3& u   = g_editor_cam.up;
+    make_lookat(pos, pos + f, u, view);
+    make_perspective(g_editor_cam.vfov, (float)width/(float)height, 0.01f, 500.0f, proj);
+
+    glUniformMatrix4fv(locView, 1, GL_FALSE, view);
+    glUniformMatrix4fv(locProj, 1, GL_FALSE, proj);
+
+    int idx = 0;
+    for (const auto& obj : g_scene.objects) {
+        int id = idx + 1; // reserve 0 = no object
+        unsigned char r = (id >> 16) & 0xFF;
+        unsigned char g = (id >> 8) & 0xFF;
+        unsigned char b = id & 0xFF;
+        float fr = r / 255.0f, fg = g / 255.0f, fb = b / 255.0f;
+
+        float model[16];
+        if (obj.type == scene_object_type::sphere) {
+            vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+            vec3 rot   = obj.rotation_deg;
+            vec3 scl   = obj.scale * vec3(obj.radius, obj.radius, obj.radius);
+            make_model_trs(trans, rot, scl, model);
+
+            glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
+            glUniform3f(locColor, fr, fg, fb);
+
+            glBindVertexArray(g_rasterSphereVAO);
+            glDrawElements(GL_TRIANGLES, g_rasterSphereIndexCount, GL_UNSIGNED_INT, (void*)0);
+        }
+        else if (obj.type == scene_object_type::cube) {
+            vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+            vec3 rot   = obj.rotation_deg;
+            vec3 scl   = obj.scale;
+            make_model_trs(trans, rot, scl, model);
+
+            glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
+            glUniform3f(locColor, fr, fg, fb);
+
+            glBindVertexArray(g_rasterCubeVAO);
+            glDrawElements(GL_TRIANGLES, g_rasterCubeIndexCount, GL_UNSIGNED_INT, (void*)0);
+        }
+        else if (obj.type == scene_object_type::mesh_instance) {
+            if (obj.mesh_index >= 0 && obj.mesh_index < (int)g_gpu_meshes.size()) {
+                const gpu_mesh& gm = g_gpu_meshes[obj.mesh_index];
+                if (gm.vao && gm.index_count) {
+                    vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+                    vec3 rot   = obj.rotation_deg;
+                    vec3 scl   = obj.scale;
+                    make_model_trs(trans, rot, scl, model);
+
+                    glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
+                    glUniform3f(locColor, fr, fg, fb);
+
+                    glBindVertexArray(gm.vao);
+                    glDrawElements(GL_TRIANGLES, gm.index_count, GL_UNSIGNED_INT, (void*)0);
+                }
+            }
+        }
+
+        ++idx;
+    }
+
+    // Read pixel (OpenGL origin is bottom-left)
+    unsigned char px[3] = {0,0,0};
+    int read_x = click_x;
+    int read_y = height - 1 - click_y;
+    glFlush(); glFinish();
+    glReadPixels(read_x, read_y, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    int picked_id = (px[0] << 16) | (px[1] << 8) | (px[2]);
+    if (picked_id == 0) return -1;
+    return picked_id - 1;
+}
+
+// Convert screen (texture-local) coords to a world-space ray using editor camera
+static ray ScreenPointToRay(const editor_camera_state& cam, int tex_w, int tex_h, float sx, float sy)
+{
+    // sx,sy are in texture-local pixels (origin top-left)
+    const double PI = 3.14159265358979323846;
+    double u = (sx + 0.5) / (double)tex_w; // [0,1]
+    double v = (sy + 0.5) / (double)tex_h; // [0,1]
+
+    // NDC-like coords with y flipped so +y is up
+    double ndc_x = (u - 0.5) * 2.0; // -1..1
+    double ndc_y = (0.5 - v) * 2.0; // -1..1 (flip)
+
+    double fov_rad = cam.vfov * (PI / 180.0);
+    double tan_fov = std::tan(fov_rad * 0.5);
+    double aspect = (double)tex_w / (double)tex_h;
+
+    double px = ndc_x * aspect * tan_fov;
+    double py = ndc_y * tan_fov;
+
+    vec3 dir = unit_vector(cam.forward + cam.right * (float)px + cam.up * (float)py);
+    return ray(cam.position, dir, 0.0);
+}
+
+// Closest points between two infinite lines (p1 + s*d1, p2 + t*d2)
+// Returns true if solved; out_s and out_t are parameters along the lines.
+static bool ClosestPointsBetweenLines(const vec3& p1, const vec3& d1, const vec3& p2, const vec3& d2,
+                                      double& out_s, double& out_t)
+{
+    const double EPS = 1e-9;
+    double a = dot(d1, d1);
+    double b = dot(d1, d2);
+    double c = dot(d2, d2);
+    vec3 r = p1 - p2;
+    double d = dot(d1, r);
+    double e = dot(d2, r);
+
+    double denom = a * c - b * b;
+    if (std::fabs(denom) < EPS) return false; // parallel or nearly
+
+    out_s = (b * e - c * d) / denom;
+    out_t = (a * e - b * d) / denom;
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -845,9 +1334,116 @@ static void init_engine_once()
     to_shirley_camera(g_editor_cam, g_camera);
 
     BuildUnitSphereMesh();
+    BuildUnitCubeMesh();
     BuildRasterShader();
+    BuildPickShader();
+    BuildLineShader();
+
+    // Create gizmo VAO/VBO (6 verts: 3 axes, each a line of 2 verts)
+    // Vertex format: pos.xyz, color.xyz
+    float gizmo_verts[] = {
+        // X axis (red)
+         0.0f, 0.0f, 0.0f,   1.0f, 0.0f, 0.0f,
+         1.0f, 0.0f, 0.0f,   1.0f, 0.0f, 0.0f,
+        // Y axis (green)
+         0.0f, 0.0f, 0.0f,   0.0f, 1.0f, 0.0f,
+         0.0f, 1.0f, 0.0f,   0.0f, 1.0f, 0.0f,
+        // Z axis (blue)
+         0.0f, 0.0f, 0.0f,   0.0f, 0.0f, 1.0f,
+         0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 1.0f
+    };
+
+    // Build smoother cone arrowheads (procedural) for each axis
+    std::vector<float> gizmo_cones;
+    const int cone_segments = 16;
+    const float cone_len    = 0.18f; // along axis from base to apex
+    const float base_rad    = 0.06f; // radius of cone base
+
+    auto push_vertex = [&](float px, float py, float pz, float r, float g, float b) {
+        gizmo_cones.push_back(px); gizmo_cones.push_back(py); gizmo_cones.push_back(pz);
+        gizmo_cones.push_back(r);  gizmo_cones.push_back(g);  gizmo_cones.push_back(b);
+    };
+
+    // X axis (red) - base circle centered at x=1.0, apex at x=1.0 + cone_len
+    for (int s = 0; s < cone_segments; ++s) {
+        float t0 = (float)s / (float)cone_segments;
+        float t1 = (float)(s+1) / (float)cone_segments;
+        float a0 = t0 * 2.0f * 3.14159265f;
+        float a1 = t1 * 2.0f * 3.14159265f;
+        // apex
+        float ax = 1.0f + cone_len; float ay = 0.0f; float az = 0.0f;
+        // base points in YZ plane
+        float b0x = 1.0f, b0y = std::cos(a0) * base_rad, b0z = std::sin(a0) * base_rad;
+        float b1x = 1.0f, b1y = std::cos(a1) * base_rad, b1z = std::sin(a1) * base_rad;
+        push_vertex(ax, ay, az, 1.0f, 0.0f, 0.0f);
+        push_vertex(b0x, b0y, b0z, 1.0f, 0.0f, 0.0f);
+        push_vertex(b1x, b1y, b1z, 1.0f, 0.0f, 0.0f);
+    }
+
+    // Y axis (green) - base circle centered at y=1.0, apex at y=1.0 + cone_len
+    for (int s = 0; s < cone_segments; ++s) {
+        float t0 = (float)s / (float)cone_segments;
+        float t1 = (float)(s+1) / (float)cone_segments;
+        float a0 = t0 * 2.0f * 3.14159265f;
+        float a1 = t1 * 2.0f * 3.14159265f;
+        float ax = 0.0f, ay = 1.0f + cone_len, az = 0.0f;
+        // base points in XZ plane
+        float b0x = std::cos(a0) * base_rad, b0y = 1.0f, b0z = std::sin(a0) * base_rad;
+        float b1x = std::cos(a1) * base_rad, b1y = 1.0f, b1z = std::sin(a1) * base_rad;
+        push_vertex(ax, ay, az, 0.0f, 1.0f, 0.0f);
+        push_vertex(b0x, b0y, b0z, 0.0f, 1.0f, 0.0f);
+        push_vertex(b1x, b1y, b1z, 0.0f, 1.0f, 0.0f);
+    }
+
+    // Z axis (blue) - base circle centered at z=1.0, apex at z=1.0 + cone_len
+    for (int s = 0; s < cone_segments; ++s) {
+        float t0 = (float)s / (float)cone_segments;
+        float t1 = (float)(s+1) / (float)cone_segments;
+        float a0 = t0 * 2.0f * 3.14159265f;
+        float a1 = t1 * 2.0f * 3.14159265f;
+        float ax = 0.0f, ay = 0.0f, az = 1.0f + cone_len;
+        // base points in XY plane
+        float b0x = std::cos(a0) * base_rad, b0y = std::sin(a0) * base_rad, b0z = 1.0f;
+        float b1x = std::cos(a1) * base_rad, b1y = std::sin(a1) * base_rad, b1z = 1.0f;
+        push_vertex(ax, ay, az, 0.0f, 0.0f, 1.0f);
+        push_vertex(b0x, b0y, b0z, 0.0f, 0.0f, 1.0f);
+        push_vertex(b1x, b1y, b1z, 0.0f, 0.0f, 1.0f);
+    }
+
+    glGenVertexArrays(1, &g_gizmoVAO);
+    glGenBuffers(1, &g_gizmoVBO);
+    glBindVertexArray(g_gizmoVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_gizmoVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(gizmo_verts), gizmo_verts, GL_STATIC_DRAW);
+    // pos
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    // color
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glBindVertexArray(0);
+
+    // Cone geometry
+    glGenVertexArrays(1, &g_gizmoConeVAO);
+    glGenBuffers(1, &g_gizmoConeVBO);
+    glBindVertexArray(g_gizmoConeVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_gizmoConeVBO);
+    g_gizmoConeVertexCount = 0;
+    if (!gizmo_cones.empty()) {
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(gizmo_cones.size() * sizeof(float)), gizmo_cones.data(), GL_STATIC_DRAW);
+        g_gizmoConeVertexCount = (int)gizmo_cones.size() / 6; // each vertex = pos(3) + color(3)
+    } else {
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_STATIC_DRAW);
+    }
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glBindVertexArray(0);
 
     g_scene_initialized = true;
+    g_world_dirty       = true;
+    g_cached_world.reset();
 }
 
 // Sync editor camera into RT camera
@@ -927,6 +1523,7 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
         g_editor_cam.move_from_input(
             move_forward, move_right, move_up, dt
         );
+        // camera movement does NOT dirty the world
     }
 
     static bool   rotating = false;
@@ -1000,6 +1597,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn)
             bool selected = (mat.model == opt.model);
             if (ImGui::Selectable(opt.label, selected)) {
                 mat.model = opt.model;
+                g_world_dirty = true;
             }
             if (selected) {
                 ImGui::SetItemDefaultFocus();
@@ -1019,6 +1617,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn)
         };
         if (ImGui::ColorEdit3("Base Color", base)) {
             mat.base_color = colour(base[0], base[1], base[2]);
+            g_world_dirty  = true;
         }
     }
 
@@ -1037,6 +1636,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn)
         float ior_f = (float)mat.ior;
         if (ImGui::SliderFloat("IOR", &ior_f, 1.0f, 2.5f)) {
             mat.ior = ior_f;
+            g_world_dirty = true;
         }
     } break;
 
@@ -1049,6 +1649,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn)
         };
         if (ImGui::ColorEdit3("Emission", e)) {
             mat.emission = vec3(e[0], e[1], e[2]);
+            g_world_dirty = true;
         }
     } break;
 
@@ -1066,12 +1667,15 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn)
 
         if (ImGui::SliderFloat("Metallic", &metallic_f, 0.0f, 1.0f)) {
             mat.metallic = metallic_f;
+            g_world_dirty = true;
         }
         if (ImGui::SliderFloat("Roughness", &roughness_f, 0.02f, 1.0f)) {
             mat.roughness = roughness_f;
+            g_world_dirty = true;
         }
         if (ImGui::SliderFloat("Normal Strength", &norm_str_f, 0.0f, 4.0f)) {
             mat.normal_strength = norm_str_f;
+            g_world_dirty = true;
         }
 
         float f0[3] = {
@@ -1081,6 +1685,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn)
         };
         if (ImGui::ColorEdit3("Dielectric F0", f0)) {
             mat.dielectric_F0 = vec3(f0[0], f0[1], f0[2]);
+            g_world_dirty     = true;
         }
 
         ImGui::Separator();
@@ -1105,6 +1710,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn)
                     if (asset_index >= 0 &&
                         asset_index < (int)scn.textures.size()) {
                         tex_index = asset_index;
+                        g_world_dirty = true;
                     }
                 }
                 ImGui::EndDragDropTarget();
@@ -1115,6 +1721,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn)
                 std::string clear_id = std::string("X##clear_") + label;
                 if (ImGui::SmallButton(clear_id.c_str())) {
                     tex_index = -1;
+                    g_world_dirty = true;
                 }
             }
         };
@@ -1154,6 +1761,8 @@ static void process_dropped_files()
     if (g_dropped_files.empty())
         return;
 
+    bool imported_any = false;
+
     for (const std::string& full_path : g_dropped_files) {
 
         // Textures
@@ -1184,6 +1793,8 @@ static void process_dropped_files()
             std::printf("Imported texture: %s (%s)\n",
                         g_scene.textures.back().name.c_str(),
                         g_scene.textures.back().path.c_str());
+
+            imported_any = true;
         }
         // FBX / OBJ meshes → mesh_instance
         else if (has_extension_ci(full_path, ".fbx") ||
@@ -1220,7 +1831,7 @@ static void process_dropped_files()
             scene_mesh_asset asset;
             asset.name      = name;
             asset.file_path = full_path;
-            asset.mesh_bvh  = nullptr; // RT support wired via mesh_loader.h
+            asset.mesh_bvh  = nullptr; // RT support via mesh_loader.h now built in scene.cpp
             asset.slot_names = mlr.material_slot_names;
             asset.slot_default_materials.assign(asset.slot_names.size(), -1);
 
@@ -1253,6 +1864,8 @@ static void process_dropped_files()
             std::printf("Mesh imported as mesh_instance '%s' (mesh_index=%d, slots=%zu)\n",
                         name.c_str(), mesh_index,
                         g_scene.meshes[mesh_index].slot_names.size());
+
+            imported_any = true;
         }
         else {
             std::printf("Dropped file not recognised as texture or supported mesh: %s\n",
@@ -1261,6 +1874,11 @@ static void process_dropped_files()
     }
 
     g_dropped_files.clear();
+
+    if (imported_any) {
+        g_world_dirty = true;
+        g_cached_world.reset();
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1311,6 +1929,10 @@ int main()
     ImGui::StyleColorsDark();
 
     ImGuiStyle& style = ImGui::GetStyle();
+    // Progress bar (PlotHistogram) colour
+    style.Colors[ImGuiCol_PlotHistogram]        = ImVec4(0.26f, 0.75f, 0.33f, 1.0f); // fill
+    style.Colors[ImGuiCol_PlotHistogramHovered] = ImVec4(0.36f, 0.85f, 0.43f, 1.0f); // hover
+
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
     {
         style.WindowRounding = 0.0f;
@@ -1335,6 +1957,20 @@ int main()
         last_time = current_time;
 
         update_editor_camera_from_input(window, dt);
+
+        // If render thread completed, grab result & upload texture
+        if (g_render_has_result) {
+            {
+                std::lock_guard<std::mutex> lock(g_render_mutex);
+                UploadRenderToTexture(g_render_result);
+                g_render_has_result = false;
+            }
+            if (g_render_thread.joinable()) {
+                g_render_thread.join();
+            }
+            g_render_in_progress = false;
+            g_cancel_flag.store(false);
+        }
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -1366,6 +2002,40 @@ int main()
             ImGuiID dockspace_id = ImGui::GetID("DusktracerDockSpace");
             ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f));
 
+                // --- One-time dock layout setup ---
+            static bool s_dockspace_built = false;
+            if (!s_dockspace_built)
+            {
+                s_dockspace_built = true;
+
+                // Clear any previous layout for this dockspace ID
+                ImGui::DockBuilderRemoveNode(dockspace_id);
+                ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
+                ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
+
+                ImGuiID dock_main_id   = dockspace_id;
+                ImGuiID dock_left_id   = ImGui::DockBuilderSplitNode(
+                    dock_main_id, ImGuiDir_Left, 0.20f, nullptr, &dock_main_id);
+                ImGuiID dock_right_id  = ImGui::DockBuilderSplitNode(
+                    dock_main_id, ImGuiDir_Right, 0.25f, nullptr, &dock_main_id);
+                ImGuiID dock_left_bottom_id = ImGui::DockBuilderSplitNode(
+                    dock_left_id, ImGuiDir_Down, 0.40f, nullptr, &dock_left_id);
+
+                // Center: Viewport
+                ImGui::DockBuilderDockWindow("Viewport",       dock_main_id);
+
+                // Left: Scene Hierarchy (top), Textures + Debug Camera (bottom)
+                ImGui::DockBuilderDockWindow("Scene Hierarchy", dock_left_id);
+                ImGui::DockBuilderDockWindow("Textures",        dock_left_bottom_id);
+                ImGui::DockBuilderDockWindow("Debug Camera",    dock_left_bottom_id);
+
+                // Right: Inspector
+                ImGui::DockBuilderDockWindow("Inspector",      dock_right_id);
+
+                ImGui::DockBuilderFinish(dockspace_id);
+            }
+
+
             if (ImGui::BeginMenuBar())
             {
                 if (ImGui::BeginMenu("File"))
@@ -1386,41 +2056,134 @@ int main()
             ImGui::End();
         }
 
+        // ---------------------------------------------------------------------
         // Scene Hierarchy
+        // ---------------------------------------------------------------------
         ImGui::Begin("Scene Hierarchy");
         ImGui::Text("Objects:");
         ImGui::Separator();
+
+        // List + selection
         for (size_t i = 0; i < g_scene.objects.size(); ++i) {
             bool is_selected = (int)i == g_selected_object;
             if (ImGui::Selectable(g_scene.objects[i].name.c_str(), is_selected)) {
                 g_selected_object = (int)i;
             }
         }
+
         if (g_scene.objects.empty()) {
             ImGui::TextDisabled("No objects in scene.");
         }
+
+        // ----------------------------------
+        // Add Sphere / Add Cube buttons
+        // ----------------------------------
+        if (ImGui::Button("Add Sphere")) {
+            scene_object obj;
+
+            obj.name = "Sphere " + std::to_string(g_scene.objects.size());
+            obj.type           = scene_object_type::sphere;
+            obj.material_index = -1;
+
+            obj.center       = point3(0, 0, -1);
+            obj.radius       = 0.5;
+            obj.mesh_index   = -1;
+            obj.translation  = vec3(0, 0, 0);
+            obj.rotation_deg = vec3(0, 0, 0);
+            obj.scale        = vec3(1, 1, 1);
+            obj.mesh_slot_materials.clear();
+
+            g_scene.objects.push_back(obj);
+            g_selected_object = (int)g_scene.objects.size() - 1;
+
+            g_world_dirty = true;
+            g_cached_world.reset();
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Add Cube")) {
+            scene_object obj;
+
+            obj.name = "Cube " + std::to_string(g_scene.objects.size());
+
+            // If your enum is scene_object_type::box instead of ::cube, swap it here.
+            obj.type           = scene_object_type::cube;
+            obj.material_index = -1;
+
+            // Centre it roughly where spheres go
+            obj.center       = point3(0, 0, -1);
+
+            // Bounding sphere radius for a unit cube ([-0.5,0.5]^3) ≈ sqrt(3)*0.5
+            obj.radius       = std::sqrt(3.0) * 0.5;
+
+            obj.mesh_index   = -1;
+            obj.translation  = vec3(0, 0, 0);
+            obj.rotation_deg = vec3(0, 0, 0);
+            obj.scale        = vec3(1, 1, 1);
+            obj.mesh_slot_materials.clear();
+
+            g_scene.objects.push_back(obj);
+            g_selected_object = (int)g_scene.objects.size() - 1;
+
+            g_world_dirty = true;
+            g_cached_world.reset();
+        }
+
+        ImGui::SameLine();
+        ImGui::TextDisabled("Select object and press Del to remove.");
+
+
+        // Handle Delete key to remove selected object
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete) &&
+                g_selected_object >= 0 &&
+                g_selected_object < (int)g_scene.objects.size())
+            {
+                g_scene.objects.erase(g_scene.objects.begin() + g_selected_object);
+
+                // Fix selection index
+                if (g_scene.objects.empty()) {
+                    g_selected_object = -1;
+                } else if (g_selected_object >= (int)g_scene.objects.size()) {
+                    g_selected_object = (int)g_scene.objects.size() - 1;
+                }
+
+                // Mark RT world dirty
+                g_world_dirty = true;
+                g_cached_world.reset();
+            }
+        }
+
         ImGui::End();
 
-        // Textures
+        // ---------------------------------------------------------------------
+        // Textures window (drag textures into PBR slots)
+        // ---------------------------------------------------------------------
         ImGui::Begin("Textures");
         ImGui::Text("Drag textures onto PBR slots.");
         ImGui::Separator();
 
         for (int i = 0; i < (int)g_scene.textures.size(); ++i) {
             auto& tex = g_scene.textures[i];
+
             ImGui::Selectable(tex.name.c_str());
+
             if (ImGui::BeginDragDropSource()) {
                 ImGui::SetDragDropPayload("TEXTURE_ASSET_ID", &i, sizeof(int));
                 ImGui::Text("Texture: %s", tex.name.c_str());
                 ImGui::EndDragDropSource();
             }
         }
+
         if (g_scene.textures.empty()) {
-            ImGui::TextDisabled("No textures in scene.");
+            ImGui::TextDisabled("No textures in scene. Drag PNG/JPG/TGA/BMP into window.");
         }
+
         ImGui::End();
 
+        // ---------------------------------------------------------------------
         // Inspector
+        // ---------------------------------------------------------------------
         ImGui::Begin("Inspector");
         ImGui::Text("Camera");
         ImGui::Separator();
@@ -1445,6 +2208,7 @@ int main()
             g_editor_cam.vfov = 40.0f;
             g_editor_cam.set_from_lookat(point3(3, 3, 2),
                                          point3(0, 0, -1));
+            // camera reset doesn't dirty world
         }
 
         ImGui::Separator();
@@ -1494,6 +2258,7 @@ int main()
 
         if (ImGui::ColorEdit3("Sky / Background", bg)) {
             g_camera.background = colour(bg[0], bg[1], bg[2]);
+            // background doesn't require world rebuild
         }
 
         ImGui::Separator();
@@ -1512,11 +2277,68 @@ int main()
                 float pos_f[3] = { (float)pos.x(), (float)pos.y(), (float)pos.z() };
                 if (ImGui::DragFloat3("Center", pos_f, 0.05f)) {
                     obj.center = point3(pos_f[0], pos_f[1], pos_f[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
                 }
 
                 float radius_f = (float)obj.radius;
                 if (ImGui::DragFloat("Radius", &radius_f, 0.01f, 0.01f, 1000.0f)) {
                     obj.radius = radius_f;
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                }
+                
+                // Rotation (degrees) for editor/raster preview (no effect on RT sphere geometry beyond transform)
+                float rot_f[3] = { (float)obj.rotation_deg.x(), (float)obj.rotation_deg.y(), (float)obj.rotation_deg.z() };
+                if (ImGui::DragFloat3("Rotation (deg)", rot_f, 1.0f)) {
+                    obj.rotation_deg = vec3(rot_f[0], rot_f[1], rot_f[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                }
+
+                // Per-axis scale for preview
+                float scale_fv[3] = { (float)obj.scale.x(), (float)obj.scale.y(), (float)obj.scale.z() };
+                if (ImGui::DragFloat3("Scale", scale_fv, 0.01f)) {
+                    obj.scale = vec3(scale_fv[0], scale_fv[1], scale_fv[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                }
+            }
+            else if (obj.type == scene_object_type::cube) {
+                // Cube inspector: centre + optional translation, rotation, scale
+                point3 pos = obj.center;
+                float pos_f[3] = { (float)pos.x(), (float)pos.y(), (float)pos.z() };
+                if (ImGui::DragFloat3("Center", pos_f, 0.05f)) {
+                    obj.center = point3(pos_f[0], pos_f[1], pos_f[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                }
+
+                float t[3] = {
+                    (float)obj.translation.x(),
+                    (float)obj.translation.y(),
+                    (float)obj.translation.z()
+                };
+                if (ImGui::DragFloat3("Translation", t, 0.05f)) {
+                    obj.translation = vec3(t[0], t[1], t[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                }
+
+                // Rotation
+                float rot_c[3] = { (float)obj.rotation_deg.x(), (float)obj.rotation_deg.y(), (float)obj.rotation_deg.z() };
+                if (ImGui::DragFloat3("Rotation (deg)", rot_c, 1.0f)) {
+                    obj.rotation_deg = vec3(rot_c[0], rot_c[1], rot_c[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                }
+
+                // Scale
+                float scl_c[3] = { (float)obj.scale.x(), (float)obj.scale.y(), (float)obj.scale.z() };
+                if (ImGui::DragFloat3("Scale", scl_c, 0.01f)) {
+                    obj.scale = vec3(scl_c[0], scl_c[1], scl_c[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
                 }
             }
             else if (obj.type == scene_object_type::mesh_instance) {
@@ -1527,9 +2349,25 @@ int main()
                 };
                 if (ImGui::DragFloat3("Translation", t, 0.05f)) {
                     obj.translation = vec3(t[0], t[1], t[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
                 }
 
-                ImGui::TextDisabled("Scale/rotation not wired into raster yet.");
+                // Rotation
+                float rot_m[3] = { (float)obj.rotation_deg.x(), (float)obj.rotation_deg.y(), (float)obj.rotation_deg.z() };
+                if (ImGui::DragFloat3("Rotation (deg)", rot_m, 1.0f)) {
+                    obj.rotation_deg = vec3(rot_m[0], rot_m[1], rot_m[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                }
+
+                // Scale (non-uniform)
+                float scl_m[3] = { (float)obj.scale.x(), (float)obj.scale.y(), (float)obj.scale.z() };
+                if (ImGui::DragFloat3("Scale", scl_m, 0.01f)) {
+                    obj.scale = vec3(scl_m[0], scl_m[1], scl_m[2]);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                }
             }
 
             // Mesh asset handle (for slots)
@@ -1544,6 +2382,8 @@ int main()
                 // keep overrides in sync with slot count
                 if (obj.mesh_slot_materials.size() != mesh_asset->slot_names.size()) {
                     obj.mesh_slot_materials.assign(mesh_asset->slot_names.size(), -1);
+                    g_world_dirty = true;
+                    g_cached_world.reset();
                 }
             }
 
@@ -1555,6 +2395,8 @@ int main()
                 scene_material m;
                 m.name = "Material " + std::to_string(g_scene.materials.size());
                 g_scene.materials.push_back(m);
+                g_world_dirty = true;
+                g_cached_world.reset();
             }
 
             // --- Mesh instance: per-slot binding ---
@@ -1602,7 +2444,11 @@ int main()
                     }
 
                     if (s < obj.mesh_slot_materials.size()) {
-                        obj.mesh_slot_materials[s] = mat_idx;
+                        if (obj.mesh_slot_materials[s] != mat_idx) {
+                            obj.mesh_slot_materials[s] = mat_idx;
+                            g_world_dirty = true;
+                            g_cached_world.reset();
+                        }
                     }
                 }
 
@@ -1639,6 +2485,7 @@ int main()
                     {
                         auto& mat = g_scene.materials[active_mat_idx];
                         DrawMaterialInspector(mat, g_scene);
+                        // DrawMaterialInspector already marks g_world_dirty
                     } else {
                         ImGui::TextDisabled("No material bound to this slot.");
                     }
@@ -1665,6 +2512,8 @@ int main()
                         if (ImGui::Selectable(label.c_str(), is_sel)) {
                             obj.material_index = i;
                             current_mat        = i;
+                            g_world_dirty      = true;
+                            g_cached_world.reset();
                         }
                         if (is_sel) {
                             ImGui::SetItemDefaultFocus();
@@ -1690,7 +2539,9 @@ int main()
 
         ImGui::End();
 
+        // ---------------------------------------------------------------------
         // Debug Camera
+        // ---------------------------------------------------------------------
         ImGui::Begin("Debug Camera");
         ImGui::Text("Editor cam position:");
         ImGui::Text("  x = %.3f", g_editor_cam.position.x());
@@ -1705,9 +2556,15 @@ int main()
         ImGui::Separator();
         ImGui::Text("Samples per pixel: %d", g_camera.samples_per_pixel);
         ImGui::Text("Max depth:         %d", g_camera.max_depth);
+        ImGui::Separator();
+        ImGui::Text("World dirty: %s", g_world_dirty ? "true" : "false");
+        ImGui::Separator();
+        ImGui::Text("Render in progress: %s", g_render_in_progress ? "true" : "false");
         ImGui::End();
 
+        // ---------------------------------------------------------------------
         // Viewport
+        // ---------------------------------------------------------------------
         ImGui::Begin("Viewport");
 
         g_viewport_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
@@ -1715,26 +2572,78 @@ int main()
 
         ImVec2 vp_size = ImGui::GetContentRegionAvail();
 
-        if (ImGui::Button("Render Current View")) {
-            sync_camera_from_editor(vp_size.x, vp_size.y);
+        // Render button + progress bar
+        if (!g_render_in_progress) {
+            if (ImGui::Button("Render Current View")) {
+                // Sync RT camera from editor view
+                sync_camera_from_editor(vp_size.x, vp_size.y);
 
-            // NOTE:
-            // build_world_from_scene(g_scene) is responsible for:
-            //   - Rebuilding runtime materials from g_scene.materials every call.
-            //   - Using mesh_instance.mesh_slot_materials + mesh_asset.slot_names
-            //     to get correct per-slot materials for meshes.
-            //
-            // We no longer collapse slot bindings into obj.material_index here;
-            // that was causing "slot 0 only" and stale material behaviour.
-            hittable_list world = build_world_from_scene(g_scene);
+                // Build world only if needed
+                if (!g_cached_world || g_world_dirty) {
+                    auto new_world = std::make_shared<hittable_list>(
+                        build_world_from_scene(g_scene)
+                    );
+                    g_cached_world = new_world;
+                    g_world_dirty  = false;
+                }
 
-            g_cancel_flag.store(false);
-            render_result img = g_renderer.render(world, g_camera, &g_cancel_flag);
-            UploadRenderToTexture(img);
+                // Reset progress struct
+                g_render_progress.total_scanlines = g_camera.image_height;
+                g_render_progress.completed_scanlines.store(0);
+                g_render_progress.eta_seconds.store(0.0);
+                g_render_progress.elapsed_seconds.store(0.0);
+
+                g_cancel_flag.store(false);
+                g_render_in_progress = true;
+
+                // Kick off worker thread
+                auto world_copy = g_cached_world;
+                camera cam_copy = g_camera;
+                g_render_thread = std::thread([world_copy, cam_copy]() mutable {
+                    render_result img =
+                        g_renderer.render(*world_copy, cam_copy,
+                                          &g_cancel_flag, &g_render_progress);
+
+                    {
+                        std::lock_guard<std::mutex> lock(g_render_mutex);
+                        g_render_result = std::move(img);
+                        g_render_has_result = true;
+                    }
+                });
+            }
+        } else {
+            ImGui::BeginDisabled();
+            ImGui::Button("Render Current View");
+            ImGui::EndDisabled();
         }
 
         ImGui::SameLine();
-        ImGui::TextDisabled("Move camera / edit objects / materials, then click Render.");
+        if (g_render_in_progress) {
+            if (ImGui::Button("Cancel Render")) {
+                g_cancel_flag.store(true);
+            }
+        } else {
+            ImGui::TextDisabled("Move camera / edit objects / materials, then click Render.");
+        }
+
+        // Progress bar / ETA
+        if (g_render_in_progress) {
+            ImGui::Separator();
+            int   done   = g_render_progress.completed_scanlines.load();
+            int   total  = g_render_progress.total_scanlines;
+            float pct    = (total > 0) ? (float)done / (float)total : 0.0f;
+            double eta   = g_render_progress.eta_seconds.load();
+            double el    = g_render_progress.elapsed_seconds.load();
+
+            ImGui::Text("Rendering: %d / %d scanlines", done, total);
+            ImGui::ProgressBar(pct, ImVec2(-FLT_MIN, 0.0f));
+
+            int rem = (int)eta;
+            int rem_min = rem / 60;
+            int rem_sec = rem % 60;
+
+            ImGui::Text("Elapsed: %.0fs | Remaining: %d:%02d", el, rem_min, rem_sec);
+        }
 
         ImGui::Separator();
 
@@ -1778,7 +2687,121 @@ int main()
             int tex_w = (int)vp_size.x;
             int tex_h = (int)vp_size.y;
             if (tex_w > 0 && tex_h > 0) {
+                // Record where ImGui will draw the image on screen so we can
+                // convert mouse coordinates into texture-local coords for picking.
+                ImVec2 screen_pos = ImGui::GetCursorScreenPos();
+
                 RenderRasterToTexture(tex_w, tex_h);
+
+                // Handle mouse click / drag -> gizmo interaction or pick
+                ImGuiIO& io = ImGui::GetIO();
+                if (g_viewport_hovered) {
+                    ImVec2 m = io.MousePos;
+                    float local_x = m.x - screen_pos.x;
+                    float local_y = m.y - screen_pos.y;
+
+                    if (local_x >= 0 && local_x < tex_w && local_y >= 0 && local_y < tex_h) {
+                        // Mouse down: attempt gizmo axis hit first, otherwise pick scene
+                        if (ImGui::IsMouseClicked(0)) {
+                            bool did_hit_gizmo = false;
+                            if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size()) {
+                                // build ray
+                                ray r = ScreenPointToRay(g_editor_cam, tex_w, tex_h, local_x, local_y);
+                                // gizmo origin and axes in world space
+                                const auto& obj = g_scene.objects[g_selected_object];
+                                vec3 origin = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+                                // transform axes by object's rotation
+                                float tmpModel[16];
+                                make_model_trs(vec3(0,0,0), obj.rotation_deg, vec3(1,1,1), tmpModel);
+                                // unit axes in local space
+                                vec3 axes[3] = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
+                                // rotate axes by R (use R part from model matrix)
+                                auto transform_vec3_by_model = [&](const float M[16], const vec3& v) {
+                                    return vec3(
+                                        M[0]*v.x() + M[1]*v.y() + M[2]*v.z(),
+                                        M[4]*v.x() + M[5]*v.y() + M[6]*v.z(),
+                                        M[8]*v.x() + M[9]*v.y() + M[10]*v.z()
+                                    );
+                                };
+
+                                vec3 axis_world[3];
+                                for (int a=0;a<3;++a) axis_world[a] = unit_vector(transform_vec3_by_model(tmpModel, axes[a]));
+
+                                // test closest distance to each axis
+                                double best_dist = 1e9; int best_axis = -1; vec3 best_cp1, best_cp2;
+                                for (int a=0;a<3;++a) {
+                                    double s,t;
+                                    if (!ClosestPointsBetweenLines(origin, axis_world[a], r.origin(), r.direction(), s, t)) continue;
+                                    vec3 cp_axis = origin + axis_world[a] * (float)s;
+                                    vec3 cp_ray  = r.origin() + r.direction() * (float)t;
+                                    double dist = (cp_axis - cp_ray).length();
+                                    // threshold based on object size
+                                    double gizmo_scale = 0.5 * std::max(0.5, obj.radius);
+                                    double thresh = gizmo_scale * 0.12; // heuristic
+                                    if (dist < best_dist && dist < thresh) {
+                                        best_dist = dist;
+                                        best_axis = a;
+                                        best_cp1 = cp_axis;
+                                        best_cp2 = cp_ray;
+                                    }
+                                }
+
+                                if (best_axis >= 0) {
+                                    // begin gizmo drag
+                                    g_active_gizmo_axis = best_axis;
+                                    g_gizmo_hit_point = best_cp1;
+                                    g_gizmo_initial_obj_translation = g_scene.objects[g_selected_object].translation;
+                                    did_hit_gizmo = true;
+                                }
+                            }
+
+                            if (!did_hit_gizmo) {
+                                int picked = PerformPick(tex_w, tex_h, (int)local_x, (int)local_y);
+                                if (picked >= 0 && picked < (int)g_scene.objects.size()) {
+                                    g_selected_object = picked;
+                                    g_show_gizmo = true;
+                                } else {
+                                    g_selected_object = -1;
+                                    g_show_gizmo = false;
+                                }
+                                g_active_gizmo_axis = -1;
+                            }
+                        }
+
+                        // Mouse dragging: if active axis, compute new closest point and move object
+                        if (g_active_gizmo_axis >= 0 && ImGui::IsMouseDown(0) && g_selected_object >= 0) {
+                            ray rnow = ScreenPointToRay(g_editor_cam, tex_w, tex_h, local_x, local_y);
+                            const auto& obj = g_scene.objects[g_selected_object];
+                            vec3 origin = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+                            float tmpModel[16];
+                            make_model_trs(vec3(0,0,0), obj.rotation_deg, vec3(1,1,1), tmpModel);
+                            vec3 axes[3] = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
+                            auto transform_vec3_by_model = [&](const float M[16], const vec3& v) {
+                                return vec3(
+                                    M[0]*v.x() + M[1]*v.y() + M[2]*v.z(),
+                                    M[4]*v.x() + M[5]*v.y() + M[6]*v.z(),
+                                    M[8]*v.x() + M[9]*v.y() + M[10]*v.z()
+                                );
+                            };
+                            vec3 axis_world = unit_vector(transform_vec3_by_model(tmpModel, axes[g_active_gizmo_axis]));
+
+                            double s_now, t_now;
+                            if (ClosestPointsBetweenLines(origin, axis_world, rnow.origin(), rnow.direction(), s_now, t_now)) {
+                                vec3 cp_axis_now = origin + axis_world * (float)s_now;
+                                float move_along = (float)dot(cp_axis_now - g_gizmo_hit_point, axis_world);
+                                vec3 new_trans = g_gizmo_initial_obj_translation + axis_world * move_along;
+                                g_scene.objects[g_selected_object].translation = new_trans;
+                                g_world_dirty = true;
+                                g_cached_world.reset();
+                            }
+                        }
+
+                        // Mouse release: clear active axis
+                        if (!ImGui::IsMouseDown(0)) {
+                            g_active_gizmo_axis = -1;
+                        }
+                    }
+                }
 
                 if (g_rasterColorTex != 0) {
                     ImGui::Image(
@@ -1823,6 +2846,11 @@ int main()
     }
 
     // Cleanup
+    if (g_render_in_progress && g_render_thread.joinable()) {
+        g_cancel_flag.store(true);
+        g_render_thread.join();
+    }
+
     if (g_rtTexture != 0) {
         glDeleteTextures(1, &g_rtTexture);
     }
@@ -1830,6 +2858,10 @@ int main()
     if (g_rasterSphereVAO) glDeleteVertexArrays(1, &g_rasterSphereVAO);
     if (g_rasterSphereVBO) glDeleteBuffers(1, &g_rasterSphereVBO);
     if (g_rasterSphereEBO) glDeleteBuffers(1, &g_rasterSphereEBO);
+
+    if (g_rasterCubeVAO) glDeleteVertexArrays(1, &g_rasterCubeVAO);
+    if (g_rasterCubeVBO) glDeleteBuffers(1, &g_rasterCubeVBO);
+    if (g_rasterCubeEBO) glDeleteBuffers(1, &g_rasterCubeEBO);
 
     for (auto& gm : g_gpu_meshes) {
         if (gm.vao) glDeleteVertexArrays(1, &gm.vao);
@@ -1841,6 +2873,17 @@ int main()
     if (g_rasterColorTex) glDeleteTextures(1, &g_rasterColorTex);
     if (g_rasterDepthRBO) glDeleteRenderbuffers(1, &g_rasterDepthRBO);
     if (g_rasterFBO)      glDeleteFramebuffers(1, &g_rasterFBO);
+
+    if (g_pickShader)     glDeleteProgram(g_pickShader);
+    if (g_pickColorTex)   glDeleteTextures(1, &g_pickColorTex);
+    if (g_pickDepthRBO)   glDeleteRenderbuffers(1, &g_pickDepthRBO);
+    if (g_pickFBO)        glDeleteFramebuffers(1, &g_pickFBO);
+
+    if (g_lineShader)     glDeleteProgram(g_lineShader);
+    if (g_gizmoVBO)       glDeleteBuffers(1, &g_gizmoVBO);
+    if (g_gizmoVAO)       glDeleteVertexArrays(1, &g_gizmoVAO);
+
+    g_cached_world.reset();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
