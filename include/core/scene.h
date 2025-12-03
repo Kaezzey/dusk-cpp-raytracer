@@ -51,6 +51,7 @@ struct scene_material {
     double fuzz             = 0.0;                    // metal fuzz
     double ior              = 1.5;                    // dielectric IOR
     vec3   emission         = vec3(0, 0, 0);          // diffuse_light color
+    double emission_intensity = 1.0;                  // intensity multiplier for diffuse_light
     vec3   dielectric_F0    = vec3(0.04, 0.04, 0.04); // PBR dielectric F0
     double normal_strength  = 1.0;                    // PBR normal strength
 

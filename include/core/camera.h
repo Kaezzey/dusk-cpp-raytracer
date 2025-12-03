@@ -24,7 +24,7 @@ class camera {
     int samples_per_pixel = 10;
     int max_depth = 10; //max recursion depth for ray tracing
 
-    colour background = colour(0.70, 0.80, 1.00); //default sky color
+    colour background = colour(0.0, 0.0, 0.0); //default sky color
 
     //vertical field of view in degrees
     double vfov = 90.0; 

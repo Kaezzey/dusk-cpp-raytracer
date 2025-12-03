@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cstring>
 #include <memory>   // for std::shared_ptr
+#include <filesystem>
 #include <thread>   // for render worker
 #include <mutex>    // for result handoff
 #include <chrono>   // for timing if you want
@@ -51,6 +52,7 @@ static bool SetWindowIconFromPNG(GLFWwindow* w, const char* relpath)
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/editor_camera.h"
 #include "../../include/core/undo.h"
+#include "../../include/core/image_io.h"
 
 // Assimp for FBX/OBJ mesh import
 #include <assimp/Importer.hpp>
@@ -238,120 +240,523 @@ static inline void zup_to_yup(float& x, float& y, float& z)
     z = nz;
 }
 
+// Forward-declare mesh loader/result so we can optionally import a mesh
+// into build_default_scene (actual implementation is below).
+struct MeshLoadResult;
+static MeshLoadResult load_assimp_mesh_as_gpu_mesh(
+    const std::string& full_path,
+    bool               z_up,
+    bool               normalise_unit,
+    double             user_scale);
+
+// Lightweight wrapper usable before the loader definition: returns true on success
+// and fills out a gpu_mesh, approx_radius and slot names.
+static bool try_load_assimp_mesh(const std::string& full_path,
+                                 gpu_mesh& out_mesh,
+                                 float& out_approx_radius,
+                                 std::vector<std::string>& out_slot_names);
+
 // -----------------------------------------------------------------------------
 // Default scene
 // -----------------------------------------------------------------------------
 
-static void build_default_scene(scene& scn)
+// Export the current editor `scene` as a C++ snippet you can paste into
+// `build_default_scene(scene& scn)`. Writes to `path` (e.g. "Renders/scene_export.cpp").
+static void export_scene_as_cpp(const scene& scn, const std::string& path)
 {
-    scn.textures.clear();
-    scn.materials.clear();
-    scn.objects.clear();
-    scn.meshes.clear();
-    scn.lights.clear();
+    namespace fs = std::filesystem;
 
-    // Materials
-    int ground_mat = (int)scn.materials.size();
-    scn.materials.push_back({});
-    scn.materials.back().name       = "Ground";
-    scn.materials.back().model      = scene_material_model::lambert;
-    scn.materials.back().base_color = colour(0.8, 0.8, 0.0);
-
-    int center_mat = (int)scn.materials.size();
-    scn.materials.push_back({});
-    scn.materials.back().name       = "Center";
-    scn.materials.back().model      = scene_material_model::lambert;
-    scn.materials.back().base_color = colour(0.1, 0.2, 0.5);
-
-    int glass_mat = (int)scn.materials.size();
-    scn.materials.push_back({});
-    scn.materials.back().name       = "Glass";
-    scn.materials.back().model      = scene_material_model::dielectric;
-    scn.materials.back().ior        = 1.5;
-    scn.materials.back().base_color = colour(1.0, 1.0, 1.0);
-
-    int pbr_metal_mat = (int)scn.materials.size();
-    scn.materials.push_back({});
-    {
-        auto& m = scn.materials.back();
-        m.name            = "PBR Metal";
-        m.model           = scene_material_model::pbr;
-        m.base_color      = colour(0.8, 0.6, 0.2);
-        m.metallic        = 1.0;
-        m.roughness       = 0.2;
-        m.normal_strength = 1.0;
-        m.dielectric_F0   = colour(0.04, 0.04, 0.04);
-
-        m.albedo_tex    = -1;
-        m.metallic_tex  = -1;
-        m.roughness_tex = -1;
-        m.normal_tex    = -1;
+    try {
+        fs::path p(path);
+        if (!p.parent_path().empty()) fs::create_directories(p.parent_path());
+    } catch (...) {
+        std::fprintf(stderr, "Warning: failed to create parent directory for %s\n", path.c_str());
     }
 
-    // Spheres
-    scn.objects.push_back({
-        "GroundSphere",
-        scene_object_type::sphere,
-        ground_mat,
-        point3(0, -100.5, -1),
-        100.0,
-        -1,                   // mesh_index
-        vec3(0,0,0),          // translation
-        vec3(0,0,0),          // rotation_deg
-        vec3(1,1,1),          // scale
-        {}                    // mesh_slot_materials (unused for spheres)
-    });
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        std::fprintf(stderr, "Failed to open %s for writing\n", path.c_str());
+        return;
+    }
 
-    scn.objects.push_back({
-        "CenterSphere",
-        scene_object_type::sphere,
-        center_mat,
-        point3(0, 0, -1),
-        0.5,
-        -1,
-        vec3(0,0,0),
-        vec3(0,0,0),
-        vec3(1,1,1),
-        {}
-    });
+    auto esc = [&](const std::string& s) {
+        std::string r; r.reserve(s.size());
+        for (char c : s) {
+            if (c == '\\') r += "\\\\";
+            else if (c == '"') r += "\\\"";
+            else r += c;
+        }
+        return r;
+    };
 
-    scn.objects.push_back({
-        "GlassSphere",
-        scene_object_type::sphere,
-        glass_mat,
-        point3(-1, 0, -1),
-        0.5,
-        -1,
-        vec3(0,0,0),
-        vec3(0,0,0),
-        vec3(1,1,1),
-        {}
-    });
+    out << "// Generated scene code - paste into build_default_scene(scene& scn)\n";
+    out << "scn.textures.clear(); scn.materials.clear(); scn.objects.clear(); scn.meshes.clear(); scn.lights.clear();\n\n";
 
-    scn.objects.push_back({
-        "PBRMetalSphere",
-        scene_object_type::sphere,
-        pbr_metal_mat,
-        point3(1, 0, -1),
-        0.5,
-        -1,
-        vec3(0,0,0),
-        vec3(0,0,0),
-        vec3(1,1,1),
-        {}
-    });
+    // Textures
+    for (const auto& t : scn.textures) {
+        out << "scn.textures.push_back({\"" << esc(t.name) << "\", \"" << esc(t.path) << "\"});\n";
+    }
+    out << "\n";
 
-    // Light (for RT; raster uses hard-coded sun dir)
-    scene_light sun;
-    sun.name      = "Sun";
-    sun.type      = scene_light_type::directional;
-    sun.radiance  = vec3(3.0, 3.0, 3.0);
-    sun.direction = unit_vector(vec3(-1.0, -1.0, -0.5));
-    scn.lights.push_back(std::move(sun));
+    // Materials
+    for (const auto& m : scn.materials) {
+        out << "scn.materials.push_back({});\n";
+        out << "scn.materials.back().name = \"" << esc(m.name) << "\";\n";
+        // model
+        const char* model_str = "scene_material_model::lambert";
+        switch (m.model) {
+            case scene_material_model::lambert: model_str = "scene_material_model::lambert"; break;
+            case scene_material_model::metal: model_str = "scene_material_model::metal"; break;
+            case scene_material_model::dielectric: model_str = "scene_material_model::dielectric"; break;
+            case scene_material_model::diffuse_light: model_str = "scene_material_model::diffuse_light"; break;
+            case scene_material_model::isotropic: model_str = "scene_material_model::isotropic"; break;
+            case scene_material_model::pbr: model_str = "scene_material_model::pbr"; break;
+        }
+        out << "scn.materials.back().model = " << model_str << ";\n";
+        out << "scn.materials.back().base_color = colour(" << m.base_color.x() << ", " << m.base_color.y() << ", " << m.base_color.z() << ");\n";
+        out << "scn.materials.back().metallic = " << m.metallic << ";\n";
+        out << "scn.materials.back().roughness = " << m.roughness << ";\n";
+        out << "scn.materials.back().ior = " << m.ior << ";\n";
+        out << "scn.materials.back().emission = vec3(" << m.emission.x() << ", " << m.emission.y() << ", " << m.emission.z() << ");\n";
+        out << "\n";
+    }
 
-    // Mark world dirty
-    g_world_dirty = true;
-    g_cached_world.reset();
+    // Objects
+    for (const auto& o : scn.objects) {
+        out << "{\n";
+        out << "    scene_object obj;\n";
+        out << "    obj.name = \"" << esc(o.name) << "\";\n";
+        // type
+        const char* type_str = "scene_object_type::sphere";
+        switch (o.type) {
+            case scene_object_type::sphere: type_str = "scene_object_type::sphere"; break;
+            case scene_object_type::cube: type_str = "scene_object_type::cube"; break;
+            case scene_object_type::mesh_instance: type_str = "scene_object_type::mesh_instance"; break;
+        }
+        out << "    obj.type = " << type_str << ";\n";
+        out << "    obj.material_index = " << o.material_index << ";\n";
+        out << "    obj.center = point3(" << o.center.x() << ", " << o.center.y() << ", " << o.center.z() << ");\n";
+        out << "    obj.radius = " << o.radius << ";\n";
+        out << "    obj.translation = vec3(" << o.translation.x() << ", " << o.translation.y() << ", " << o.translation.z() << ");\n";
+        out << "    obj.rotation_deg = vec3(" << o.rotation_deg.x() << ", " << o.rotation_deg.y() << ", " << o.rotation_deg.z() << ");\n";
+        out << "    obj.scale = vec3(" << o.scale.x() << ", " << o.scale.y() << ", " << o.scale.z() << ");\n";
+        if (!o.mesh_slot_materials.empty()) {
+            out << "    obj.mesh_slot_materials = {";
+            for (size_t i = 0; i < o.mesh_slot_materials.size(); ++i) {
+                if (i) out << ", ";
+                out << o.mesh_slot_materials[i];
+            }
+            out << "};\n";
+        }
+        out << "    scn.objects.push_back(obj);\n";
+        out << "}\n";
+    }
+
+    // Lights
+    for (const auto& L : scn.lights) {
+        out << "scn.lights.push_back({\"" << esc(L.name) << "\", ";
+        out << (L.type == scene_light_type::directional ? "scene_light_type::directional" : "scene_light_type::point");
+        out << "});\n";
+        out << "scn.lights.back().radiance = vec3(" << L.radiance.x() << ", " << L.radiance.y() << ", " << L.radiance.z() << ");\n";
+        if (L.type == scene_light_type::directional) {
+            out << "scn.lights.back().direction = vec3(" << L.direction.x() << ", " << L.direction.y() << ", " << L.direction.z() << ");\n";
+        } else {
+            out << "scn.lights.back().position = point3(" << L.position.x() << ", " << L.position.y() << ", " << L.position.z() << ");\n";
+            out << "scn.lights.back().range = " << L.range << ";\n";
+        }
+    }
+
+    out.close();
+    std::printf("Scene exported to '%s'\n", path.c_str());
+}
+static void build_default_scene(scene& scn)
+{
+    scn.textures.clear(); scn.materials.clear(); scn.objects.clear(); scn.meshes.clear(); scn.lights.clear();
+
+    scn.textures.push_back({"Chest_Roughness", "models\\Chest_Roughness.png"});
+    scn.textures.push_back({"Helmet_Base_color", "models\\Helmet_Base_color.png"});
+    scn.textures.push_back({"Helmet_Metallic", "models\\Helmet_Metallic.png"});
+    scn.textures.push_back({"Helmet_Normal_OpenGL", "models\\Helmet_Normal_OpenGL.png"});
+    scn.textures.push_back({"Helmet_Roughness", "models\\Helmet_Roughness.png"});
+    scn.textures.push_back({"Legs_Base_color", "models\\Legs_Base_color.png"});
+    scn.textures.push_back({"Legs_Metallic", "models\\Legs_Metallic.png"});
+    scn.textures.push_back({"Legs_Normal_OpenGL", "models\\Legs_Normal_OpenGL.png"});
+    scn.textures.push_back({"Legs_Roughness", "models\\Legs_Roughness.png"});
+    scn.textures.push_back({"Arms_Base_color", "models\\Arms_Base_color.png"});
+    scn.textures.push_back({"Arms_Metallic", "models\\Arms_Metallic.png"});
+    scn.textures.push_back({"Arms_Normal_OpenGL", "models\\Arms_Normal_OpenGL.png"});
+    scn.textures.push_back({"Arms_Roughness", "models\\Arms_Roughness.png"});
+    scn.textures.push_back({"Chest_Base_color", "models\\Chest_Base_color.png"});
+    scn.textures.push_back({"Chest_Metallic", "models\\Chest_Metallic.png"});
+    scn.textures.push_back({"Chest_Normal_OpenGL", "models\\Chest_Normal_OpenGL.png"});
+    scn.materials.push_back({});
+    scn.materials.back().name = "Ground";
+    scn.materials.back().model = scene_material_model::lambert;
+    scn.materials.back().base_color = colour(0.8, 0.8, 0);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Center";
+    scn.materials.back().model = scene_material_model::lambert;
+    scn.materials.back().base_color = colour(0.1, 0.2, 0.5);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Glass";
+    scn.materials.back().model = scene_material_model::dielectric;
+    scn.materials.back().base_color = colour(1, 1, 1);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.609;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "PBR Metal";
+    scn.materials.back().model = scene_material_model::pbr;
+    scn.materials.back().base_color = colour(0.8, 0.6, 0.2);
+    scn.materials.back().metallic = 1;
+    scn.materials.back().roughness = 0.2;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Red";
+    scn.materials.back().model = scene_material_model::lambert;
+    scn.materials.back().base_color = colour(0.838235, 0.0698529, 0.0698529);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Green";
+    scn.materials.back().model = scene_material_model::lambert;
+    scn.materials.back().base_color = colour(0.0853758, 0.452122, 0.916667);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Material 6";
+    scn.materials.back().model = scene_material_model::diffuse_light;
+    scn.materials.back().base_color = colour(3.92157, 3.92157, 3.92157);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(13.7255, 13.7255, 13.7255);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Material 7";
+    scn.materials.back().model = scene_material_model::pbr;
+    scn.materials.back().base_color = colour(0.8, 0.8, 0.8);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Material 8";
+    scn.materials.back().model = scene_material_model::pbr;
+    scn.materials.back().base_color = colour(0.8, 0.8, 0.8);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Material 9";
+    scn.materials.back().model = scene_material_model::pbr;
+    scn.materials.back().base_color = colour(0.8, 0.8, 0.8);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Material 10";
+    scn.materials.back().model = scene_material_model::pbr;
+    scn.materials.back().base_color = colour(0.8, 0.8, 0.8);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(0, 0, 0);
+
+    scn.materials.push_back({});
+    scn.materials.back().name = "Material 11";
+    scn.materials.back().model = scene_material_model::diffuse_light;
+    scn.materials.back().base_color = colour(0.8, 0.8, 0.8);
+    scn.materials.back().metallic = 0;
+    scn.materials.back().roughness = 0.5;
+    scn.materials.back().ior = 1.5;
+    scn.materials.back().emission = vec3(4.70588, 4.70588, 4.70588);
+
+    // --- Apply model textures to PBR materials (materials 7..10) ---
+    auto find_texture_index = [&](const std::string& texname) -> int {
+        for (size_t i = 0; i < scn.textures.size(); ++i) {
+            if (scn.textures[i].name == texname) return (int)i;
+        }
+        return -1;
+    };
+
+    // Material 7 -> Legs
+    if (scn.materials.size() > 7) {
+        int a = find_texture_index("Legs_Base_color");
+        int m = find_texture_index("Legs_Metallic");
+        int r = find_texture_index("Legs_Roughness");
+        int n = find_texture_index("Legs_Normal_OpenGL");
+        if (a >= 0) scn.materials[7].albedo_tex = a;
+        if (m >= 0) scn.materials[7].metallic_tex = m;
+        if (r >= 0) scn.materials[7].roughness_tex = r;
+        if (n >= 0) scn.materials[7].normal_tex = n;
+    }
+
+    // Material 8 -> Chest
+    if (scn.materials.size() > 8) {
+        int a = find_texture_index("Chest_Base_color");
+        int m = find_texture_index("Chest_Metallic");
+        int r = find_texture_index("Chest_Roughness");
+        int n = find_texture_index("Chest_Normal_OpenGL");
+        if (a >= 0) scn.materials[8].albedo_tex = a;
+        if (m >= 0) scn.materials[8].metallic_tex = m;
+        if (r >= 0) scn.materials[8].roughness_tex = r;
+        if (n >= 0) scn.materials[8].normal_tex = n;
+    }
+
+    // Material 9 -> Arms
+    if (scn.materials.size() > 9) {
+        int a = find_texture_index("Arms_Base_color");
+        int m = find_texture_index("Arms_Metallic");
+        int r = find_texture_index("Arms_Roughness");
+        int n = find_texture_index("Arms_Normal_OpenGL");
+        if (a >= 0) scn.materials[9].albedo_tex = a;
+        if (m >= 0) scn.materials[9].metallic_tex = m;
+        if (r >= 0) scn.materials[9].roughness_tex = r;
+        if (n >= 0) scn.materials[9].normal_tex = n;
+    }
+
+    // Material 10 -> Helmet
+    if (scn.materials.size() > 10) {
+        int a = find_texture_index("Helmet_Base_color");
+        int m = find_texture_index("Helmet_Metallic");
+        int r = find_texture_index("Helmet_Roughness");
+        int n = find_texture_index("Helmet_Normal_OpenGL");
+        if (a >= 0) scn.materials[10].albedo_tex = a;
+        if (m >= 0) scn.materials[10].metallic_tex = m;
+        if (r >= 0) scn.materials[10].roughness_tex = r;
+        if (n >= 0) scn.materials[10].normal_tex = n;
+    }
+
+    {
+        scene_object obj;
+        obj.name = "Cube 0";
+        obj.type = scene_object_type::cube;
+        obj.material_index = 5;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.866025;
+        obj.translation = vec3(1.24724, -0.0392758, 0);
+        obj.rotation_deg = vec3(0, 0, 0);
+        obj.scale = vec3(0.1, 2.2, 4);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Cube 1";
+        obj.type = scene_object_type::cube;
+        obj.material_index = -1;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.866025;
+        obj.translation = vec3(0.0535498, -0.0663178, -0.949799);
+        obj.rotation_deg = vec3(0, 0, 0);
+        obj.scale = vec3(2.3, 2.2, 0.1);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Cube 2";
+        obj.type = scene_object_type::cube;
+        obj.material_index = -1;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.866025;
+        obj.translation = vec3(0.14756, 1.06957, -0.00132418);
+        obj.rotation_deg = vec3(0, 0, 0);
+        obj.scale = vec3(2.3, 0.1, 4);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Cube 3";
+        obj.type = scene_object_type::cube;
+        obj.material_index = 6;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.866025;
+        obj.translation = vec3(0.148591, 1.01711, 0.457007);
+        obj.rotation_deg = vec3(0, 0, 0);
+        obj.scale = vec3(0.5, 0.01, 0.5);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Cube 4";
+        obj.type = scene_object_type::cube;
+        obj.material_index = -1;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.866025;
+        obj.translation = vec3(0.145035, -1.17922, 0);
+        obj.rotation_deg = vec3(0, 0, 0);
+        obj.scale = vec3(2.3, 0.1, 4);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Cube 5";
+        obj.type = scene_object_type::cube;
+        obj.material_index = 4;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.866025;
+        obj.translation = vec3(-0.952429, -0.033585, 0);
+        obj.rotation_deg = vec3(0, 0, 0);
+        obj.scale = vec3(0.1, 2.2, 4);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Cube 6";
+        obj.type = scene_object_type::cube;
+        obj.material_index = -1;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.866025;
+        obj.translation = vec3(-0.266196, -0.674796, -0.366528);
+        obj.rotation_deg = vec3(0, -24, 0);
+        obj.scale = vec3(0.69, 2.25, 0.75);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Cube 7";
+        obj.type = scene_object_type::cube;
+        obj.material_index = -1;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.866025;
+        obj.translation = vec3(0.699079, -0.875483, 0.599731);
+        obj.rotation_deg = vec3(0, 24, 0);
+        obj.scale = vec3(0.5, 0.5, 0.5);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Sphere 8";
+        obj.type = scene_object_type::sphere;
+        obj.material_index = 2;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.5;
+        obj.translation = vec3(-0.344305, -0.28823, 1.12807);
+        obj.rotation_deg = vec3(0, 0, 0);
+        obj.scale = vec3(0.6, 0.6, 0.6);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Sphere 9";
+        obj.type = scene_object_type::sphere;
+        obj.material_index = 2;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.5;
+        obj.translation = vec3(0.611195, -0.34475, 0.747368);
+        obj.rotation_deg = vec3(0, 0, 0);
+        obj.scale = vec3(0.4, 0.4, 0.4);
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Atlasted MK IV";
+        obj.type = scene_object_type::mesh_instance;
+        obj.material_index = -1;
+        obj.center = point3(0, 0, 0);
+        obj.radius = 2.00049;
+        obj.translation = vec3(0.0773224, -1.13468, -0.680275);
+        obj.rotation_deg = vec3(0, 103, 0);
+        obj.scale = vec3(0.7, 0.7, 0.7);
+        obj.mesh_slot_materials = {7, 8, 9, 10};
+        scn.objects.push_back(obj);
+    }
+    {
+        scene_object obj;
+        obj.name = "Sphere 11";
+        obj.type = scene_object_type::sphere;
+        obj.material_index = 11;
+        obj.center = point3(0, 0, -1);
+        obj.radius = 0.5;
+        obj.translation = vec3(-0.598247, -0.317685, 0.355021);
+        obj.rotation_deg = vec3(0, 0, 0);
+        obj.scale = vec3(0.3, 0.3, 0.3);
+        scn.objects.push_back(obj);
+    }
+    scn.lights.push_back({"Sun", scene_light_type::directional});
+    scn.lights.back().radiance = vec3(3, 3, 3);
+    scn.lights.back().direction = vec3(-0.666667, -0.666667, -0.333333);
+
+    // If AtlasedMKIV model exists, import as a mesh asset and attach to the
+    // pre-created mesh_instance object named "Atlasted MK IV" (if present).
+    try {
+        const std::string model_rel = "models/AtlastedMKIV.fbx";
+        std::string full_path = model_rel;
+        if (!std::filesystem::exists(full_path)) {
+            std::string alt = std::string("../") + model_rel;
+            if (std::filesystem::exists(alt)) full_path = alt;
+        }
+
+        if (std::filesystem::exists(full_path)) {
+            std::printf("Attempting to load AtlasedMKIV from %s\n", full_path.c_str());
+            gpu_mesh loaded_gm{};
+            float approx_r = 1.0f;
+            std::vector<std::string> slot_names;
+            if (try_load_assimp_mesh(full_path, loaded_gm, approx_r, slot_names)) {
+                scene_mesh_asset asset;
+                asset.name = "AtlasedMKIV";
+                asset.file_path = full_path;
+                asset.mesh_bvh = nullptr;
+                asset.slot_names = slot_names;
+                asset.slot_default_materials.assign(asset.slot_names.size(), -1);
+
+                int mesh_index = (int)scn.meshes.size();
+                scn.meshes.push_back(std::move(asset));
+
+                if ((int)g_gpu_meshes.size() < mesh_index + 1) g_gpu_meshes.resize(mesh_index + 1);
+                g_gpu_meshes[mesh_index] = loaded_gm;
+
+                // Find the existing object by name and attach the mesh_index
+                for (auto &o : scn.objects) {
+                    if (o.name == "Atlasted MK IV") {
+                        o.mesh_index = mesh_index;
+                        // Preserve any provided per-slot bindings but ensure correct size
+                        if ((int)o.mesh_slot_materials.size() != (int)scn.meshes[mesh_index].slot_names.size()) {
+                            o.mesh_slot_materials.resize(scn.meshes[mesh_index].slot_names.size(), -1);
+                        }
+                        break;
+                    }
+                }
+
+                std::printf("AtlasedMKIV loaded as mesh_index=%d (slots=%zu)\n", mesh_index, scn.meshes[mesh_index].slot_names.size());
+            } else {
+                std::fprintf(stderr, "AtlasedMKIV found but failed to load via Assimp: %s\n", full_path.c_str());
+            }
+        } else {
+            std::printf("AtlasedMKIV not found at %s (skipping)\n", model_rel.c_str());
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Exception while trying to attach AtlasedMKIV: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "Unknown exception while trying to attach AtlasedMKIV\n");
+    }
+
+
 }
 
 // -----------------------------------------------------------------------------
@@ -964,6 +1369,25 @@ static MeshLoadResult load_assimp_mesh_as_gpu_mesh(
                 verts.size(), inds.size() / 3, result.approx_radius);
 
     return result;
+}
+
+// try_load_assimp_mesh implementation - uses the loader defined above
+static bool try_load_assimp_mesh(const std::string& full_path,
+                                 gpu_mesh& out_mesh,
+                                 float& out_approx_radius,
+                                 std::vector<std::string>& out_slot_names)
+{
+    MeshLoadResult mlr = load_assimp_mesh_as_gpu_mesh(full_path,
+                                                     /*z_up=*/true,
+                                                     /*normalise_unit=*/true,
+                                                     /*user_scale=*/2.0);
+    if (mlr.mesh.vao == 0 || mlr.mesh.index_count == 0)
+        return false;
+
+    out_mesh = mlr.mesh;
+    out_approx_radius = mlr.approx_radius;
+    out_slot_names = std::move(mlr.material_slot_names);
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -1907,15 +2331,27 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
 
     case scene_material_model::diffuse_light:
     {
-        float e[3] = {
+        // Separate colour and intensity: colour selects hue, slider controls scalar intensity
+        float ecol[3] = {
             (float)mat.emission.x(),
             (float)mat.emission.y(),
             (float)mat.emission.z()
         };
-        if (ImGui::ColorEdit3("Emission", e)) {
-            mat.emission = vec3(e[0], e[1], e[2]);
+        float eint = (float)mat.emission_intensity;
+
+        if (ImGui::ColorEdit3("Emission Color", ecol)) {
+            mat.emission = vec3(ecol[0], ecol[1], ecol[2]);
             g_world_dirty = true;
         }
+
+        // Allow typing the intensity value directly
+        if (ImGui::InputFloat("Emission Intensity", &eint, 0.1f, 1.0f, "%.3f")) {
+            if (eint < 0.0f) eint = 0.0f;
+            mat.emission_intensity = (double)eint;
+            g_world_dirty = true;
+        }
+
+        ImGui::TextDisabled("Colour selects hue; intensity scales brightness.");
     } break;
 
     case scene_material_model::isotropic:
@@ -2241,6 +2677,17 @@ int main()
                 }
                 // Stop the separate progress window now that render finished
                 stop_progress_window_thread();
+                // Save final image to disk using existing helper
+                {
+                    const std::string out_path = "Renders/LastRender.ppm";
+                    bool saved = write_ppm(out_path, g_render_result);
+                    if (saved) {
+                        std::printf("Saved render to '%s'\n", out_path.c_str());
+                    } else {
+                        std::fprintf(stderr, "Failed to save render to '%s'\n", out_path.c_str());
+                    }
+                }
+
                 g_render_in_progress = false;
                 g_cancel_flag.store(false);
                 g_render_final_image_ready.store(false);
@@ -2332,6 +2779,12 @@ int main()
             {
                 if (ImGui::BeginMenu("File"))
                 {
+                    bool canExport = !g_render_in_progress;
+                    if (ImGui::MenuItem("Export Scene as C++...", nullptr, false, canExport)) {
+                        const std::string out = "Renders/scene_export.cpp";
+                        export_scene_as_cpp(g_scene, out);
+                    }
+
                     if (ImGui::MenuItem("Exit")) {
                         glfwSetWindowShouldClose(window, GLFW_TRUE);
                     }
@@ -2605,6 +3058,16 @@ int main()
         if (ImGui::DragInt("Max bounce depth", &max_depth, 1, 1, 128)) {
             if (max_depth < 1) max_depth = 1;
             g_camera.max_depth = max_depth;
+        }
+
+        // Exposure control (linear multiplier applied in renderer)
+        {
+            float exp_f = (float)g_renderer.exposure;
+            if (ImGui::DragFloat("Exposure", &exp_f, 0.01f, 0.0f, 100.0f, "%.3f")) {
+                if (exp_f < 0.0f) exp_f = 0.0f;
+                g_renderer.exposure = exp_f;
+            }
+            ImGui::TextDisabled("Linear exposure multiplier applied before tone mapping.");
         }
 
         ImGui::TextDisabled("Higher = cleaner but slower.");

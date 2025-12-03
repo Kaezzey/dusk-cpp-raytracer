@@ -72,7 +72,30 @@ render_result renderer::render(
 
             for (int s = 0; s < spp; ++s) {
                 ray r = cam.get_ray(i, j, s);
-                pixel_col += cam.ray_colour(r, depth, world);
+                // Get one sample's contribution
+                colour samp = cam.ray_colour(r, depth, world);
+
+                // Per-sample sanitization: guard against NaN/Inf and negatives
+                auto samp_sanitize = [](double v) -> double {
+                    if (!std::isfinite(v) || v <= 0.0) return 0.0;
+                    const double MAX_SAMPLE = 1e6; // cap per-component sample value
+                    if (v > MAX_SAMPLE) v = MAX_SAMPLE;
+                    return v;
+                };
+
+                double sr = samp_sanitize(samp.x());
+                double sg = samp_sanitize(samp.y());
+                double sb = samp_sanitize(samp.z());
+
+                // Luminance-based clamp to reduce fireflies (preserve color ratios)
+                double lum = 0.2126*sr + 0.7152*sg + 0.0722*sb;
+                const double MAX_SAMPLE_LUM = 1e4; // tweakable; protects against outliers
+                if (lum > MAX_SAMPLE_LUM) {
+                    double scale = MAX_SAMPLE_LUM / lum;
+                    sr *= scale; sg *= scale; sb *= scale;
+                }
+
+                pixel_col += colour(sr, sg, sb);
             }
 
             double scale = 1.0 / spp;
@@ -80,9 +103,45 @@ render_result renderer::render(
             double g_lin = scale * pixel_col.y();
             double b_lin = scale * pixel_col.z();
 
-            double r_gam = linear_to_gamma(r_lin);
-            double g_gam = linear_to_gamma(g_lin);
-            double b_gam = linear_to_gamma(b_lin);
+            // Sanitize components to avoid NaN/Inf and extremely large values
+            auto sanitize = [](double v) -> double {
+                if (!std::isfinite(v) || v <= 0.0) return 0.0;
+                const double MAX_LINEAR = 1e6;
+                if (v > MAX_LINEAR) v = MAX_LINEAR;
+                return v;
+            };
+
+            r_lin = sanitize(r_lin);
+            g_lin = sanitize(g_lin);
+            b_lin = sanitize(b_lin);
+
+            // Exposure (linear multiplier) comes from renderer state
+            double exposure = this->exposure;
+            r_lin *= exposure; g_lin *= exposure; b_lin *= exposure;
+
+            // ACES RRT+ODT approximation (film-like tonemapping)
+            auto aces_film = [](double x) -> double {
+                // fit constants from common ACES approximation
+                const double a = 2.51;
+                const double b = 0.03;
+                const double c = 2.43;
+                const double d = 0.59;
+                const double e = 0.14;
+                double v = (x * (a * x + b)) / (x * (c * x + d) + e);
+                if (!std::isfinite(v)) return 0.0;
+                if (v < 0.0) return 0.0;
+                if (v > 1.0) return 1.0;
+                return v;
+            };
+
+            double r_ton = aces_film(r_lin);
+            double g_ton = aces_film(g_lin);
+            double b_ton = aces_film(b_lin);
+
+            // Gamma-correct the tone-mapped (display) values
+            double r_gam = linear_to_gamma(r_ton);
+            double g_gam = linear_to_gamma(g_ton);
+            double b_gam = linear_to_gamma(b_ton);
 
             int rbyte = int(256 * intensity.clamp(r_gam));
             int gbyte = int(256 * intensity.clamp(g_gam));

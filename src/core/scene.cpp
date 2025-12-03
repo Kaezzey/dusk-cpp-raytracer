@@ -128,12 +128,16 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 
     case scene_material_model::diffuse_light:
     {
-        // Use emission if set; otherwise base_color as emissive
-        vec3 emit_col = (m.emission.x() != 0.0 ||
-                         m.emission.y() != 0.0 ||
-                         m.emission.z() != 0.0)
-                        ? m.emission
-                        : m.base_color;
+        // Use emission colour if set; otherwise base_color as emissive.
+        // Apply emission_intensity as a scalar multiplier so colour + intensity
+        // are independently controllable from the editor.
+        vec3 base_emit = (m.emission.x() != 0.0 ||
+                          m.emission.y() != 0.0 ||
+                          m.emission.z() != 0.0)
+                         ? m.emission
+                         : m.base_color;
+
+        vec3 emit_col = base_emit * (float)m.emission_intensity;
 
         auto tex = load_scene_texture(scn, m.albedo_tex);
         std::shared_ptr<texture> emit_tex =

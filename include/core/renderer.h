@@ -30,6 +30,8 @@ struct render_progress_state {
 class renderer {
 public:
     renderer() = default;
+    // Exposure (stops-like linear multiplier); editable from the editor UI
+    double exposure = 1.0;
 
     // OLD signature kept for console main, etc.
     render_result render(

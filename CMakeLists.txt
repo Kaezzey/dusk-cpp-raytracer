@@ -78,14 +78,8 @@ list(REMOVE_ITEM DUSK_SOURCES
 # Executables
 # ---------------------------------------------------------------------------
 
-# CLI / main renderer
-add_executable(dusktracer
-    src/core/main.cpp
-    ${DUSK_SOURCES}
-)
-
-# Editor executable
-add_executable(dusktracer_editor
+# Single editor executable (renamed to `Dusktracer`)
+add_executable(Dusktracer
     src/core/editor_main.cpp
     ${DUSK_SOURCES}
 )
@@ -97,8 +91,7 @@ if (WIN32)
     # Single RC used by both targets. Path is relative to CMakeLists.txt.
     set(APP_ICON_RC "${CMAKE_SOURCE_DIR}/appicon.rc")
 
-    target_sources(dusktracer        PRIVATE ${APP_ICON_RC})
-    target_sources(dusktracer_editor PRIVATE ${APP_ICON_RC})
+    target_sources(Dusktracer        PRIVATE ${APP_ICON_RC})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -106,8 +99,7 @@ endif()
 # ---------------------------------------------------------------------------
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
-    target_link_libraries(dusktracer        PRIVATE OpenMP::OpenMP_CXX)
-    target_link_libraries(dusktracer_editor PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(Dusktracer PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -117,18 +109,15 @@ set(ASSIMP_ROOT        "${CMAKE_SOURCE_DIR}/external/assimp")
 set(ASSIMP_INCLUDE_DIR "${ASSIMP_ROOT}/include")
 set(ASSIMP_LIB_RELEASE "${ASSIMP_ROOT}/lib/assimp-vc143-mt.lib")
 
-target_include_directories(dusktracer        PRIVATE ${ASSIMP_INCLUDE_DIR})
-target_include_directories(dusktracer_editor PRIVATE ${ASSIMP_INCLUDE_DIR})
-
-target_link_libraries(dusktracer        PRIVATE ${ASSIMP_LIB_RELEASE})
-target_link_libraries(dusktracer_editor PRIVATE ${ASSIMP_LIB_RELEASE})
+target_include_directories(Dusktracer PRIVATE ${ASSIMP_INCLUDE_DIR})
+target_link_libraries(Dusktracer PRIVATE ${ASSIMP_LIB_RELEASE})
 
 # ---------------------------------------------------------------------------
 # OpenGL + link ImGui + GLFW + GLEW into the editor
 # ---------------------------------------------------------------------------
 find_package(OpenGL REQUIRED)
 
-target_link_libraries(dusktracer_editor
+target_link_libraries(Dusktracer
     PRIVATE
         imgui
         ${GLFW_LIB_PATH}
@@ -139,48 +128,54 @@ target_link_libraries(dusktracer_editor
 # ---------------------------------------------------------------------------
 # Post-build: copy DLL/models/textures for main renderer
 # ---------------------------------------------------------------------------
-add_custom_command(TARGET dusktracer POST_BUILD
+# Post-build: copy DLL/models/textures next to the executable
+add_custom_command(TARGET Dusktracer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${ASSIMP_ROOT}/bin/assimp-vc143-mt.dll"
-        "$<TARGET_FILE_DIR:dusktracer>"
+        "$<TARGET_FILE_DIR:Dusktracer>"
 )
 
-add_custom_command(TARGET dusktracer POST_BUILD
+add_custom_command(TARGET Dusktracer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/models"
-        "$<TARGET_FILE_DIR:dusktracer>/models"
+        "$<TARGET_FILE_DIR:Dusktracer>/models"
 )
 
-add_custom_command(TARGET dusktracer POST_BUILD
+add_custom_command(TARGET Dusktracer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/textures"
-        "$<TARGET_FILE_DIR:dusktracer>/textures"
+        "$<TARGET_FILE_DIR:Dusktracer>/textures"
 )
 
-# Copy application icon PNG next to main exe so runtime can find it by relative path
-add_custom_command(TARGET dusktracer POST_BUILD
+# Copy application icon PNG next to exe so runtime can find it by relative path
+add_custom_command(TARGET Dusktracer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/resources/dusktracer.png"
-        "$<TARGET_FILE_DIR:dusktracer>"
+        "$<TARGET_FILE_DIR:Dusktracer>"
 )
 
 # Copy glfw3.dll next to the editor exe (if using dynamic GLFW)
-add_custom_command(TARGET dusktracer_editor POST_BUILD
+# Copy glfw3.dll next to the exe (if using dynamic GLFW)
+add_custom_command(TARGET Dusktracer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${GLFW_ROOT}/glfw3.dll"
-        "$<TARGET_FILE_DIR:dusktracer_editor>"
+        "$<TARGET_FILE_DIR:Dusktracer>"
 )
 
-# Copy glew32.dll next to the editor exe
-add_custom_command(TARGET dusktracer_editor POST_BUILD
+# Copy glew32.dll next to the exe
+add_custom_command(TARGET Dusktracer POST_BUILD         
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${GLEW_ROOT}/bin/glew32.dll"
-        "$<TARGET_FILE_DIR:dusktracer_editor>"
+        "$<TARGET_FILE_DIR:Dusktracer>"
 )
 
-# Copy application icon PNG next to editor exe so runtime can find it by relative path
-add_custom_command(TARGET dusktracer_editor POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/resources/dusktracer.png"
-        "$<TARGET_FILE_DIR:dusktracer_editor>"
+# Ensure a `Renders` directory exists next to the built executables (useful for runtime saves)
+add_custom_command(TARGET Dusktracer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:Dusktracer>/Renders"
+)
+
+add_custom_command(TARGET Dusktracer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:Dusktracer>/Renders"
 )
