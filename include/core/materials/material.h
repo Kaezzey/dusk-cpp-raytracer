@@ -77,6 +77,21 @@ class material {
         return false;
     }
 
+    // By default materials are not purely specular. Override in materials
+    // that are fully specular (mirror/dielectric) so renderer can skip
+    // direct-diffuse lighting (e.g. lambert terms) for them.
+        virtual bool is_specular() const { return false; }
+
+    // Direct-shading hook for direct lights (used by sun). Default is
+    // Lambertian: albedo * Li * (NdotL / pi). V is the view direction
+    // (pointing out from the surface).
+    virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const {
+        double NdotL = std::max(0.0, dot(rec.normal, unit_vector(Ldir)));
+        if (NdotL <= 0.0) return colour(0,0,0);
+        colour base = albedo(rec);
+        return base * Li * (NdotL / pi);
+    }
+
     //diffuse "base color" hook (used later for direct lighting)
     virtual colour albedo(const hit_record& rec) const {
         return colour(1,1,1);
@@ -133,6 +148,11 @@ class metal : public material {
         return (dot(scattered.direction(), rec.normal) > 0);
     }
 
+    bool is_specular() const override { return true; }
+    colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const override {
+        return colour(0,0,0);
+    }
+
     colour albedo(const hit_record& rec) const override {
         return tex->value(rec.u, rec.v, rec.p);
     }
@@ -162,48 +182,125 @@ class dielectric : public material {
     bool scatter(const ray& r_in, const hit_record& rec,
                  colour& attenuation, ray& scattered) const override
     {
-        // Sample attenuation from texture
-        attenuation = tex->value(rec.u, rec.v, rec.p);
-
-        double ri = rec.front_face ? (1.0 / refraction_index) : refraction_index;
+        // Physically-based dielectric (clear glass by default)
+        // Determine incident/transmitted indices
+        const double ior = refraction_index;
+        double etai = 1.0;
+        double etat = ior;
+        if (!rec.front_face) std::swap(etai, etat);
+        double etai_over_etat = etai / etat;
 
         vec3 unit_direction = unit_vector(r_in.direction());
         double cos_theta = std::fmin(dot(-unit_direction, rec.normal), 1.0);
-        double sin_theta = std::sqrt(1.0 - cos_theta*cos_theta);
+        double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
 
-        bool cannot_refract = ri * sin_theta > 1.0;
+        // Fresnel reflectance (probability of reflection)
+        double reflect_prob = reflectance(cos_theta, etai, etat);
+
         vec3 direction;
 
-        if (cannot_refract || reflectance(cos_theta, ri) > random_double())
+        // Total internal reflection check
+        if (etai_over_etat * sin_theta > 1.0) {
             direction = reflect(unit_direction, rec.normal);
-        else
-            direction = refract(unit_direction, rec.normal, ri);
+        } else {
+            if (random_double() < reflect_prob) {
+                direction = reflect(unit_direction, rec.normal);
+            } else {
+                direction = refract(unit_direction, rec.normal, etai_over_etat);
+            }
+        }
 
-        // Small offset to avoid self-intersections when spawning refracted/reflect
-        // rays from surfaces (especially important for thin glass and grazing exits).
-        // Use the surface normal to push the origin away from the surface in the
-        // correct hemisphere — this avoids accidentally nudging the ray back
-        // into the surface when the sampled direction points slightly inward.
+        // Offset ray origin slightly to avoid self-intersections
         const double eps = 1e-4;
         vec3 n = rec.normal;
-        vec3 origin_offset = (dot(direction, n) > 0.0) ? (eps * n) : (-eps * n);
+        vec3 origin = rec.p + ((dot(direction, n) > 0.0) ? (eps * n) : (-eps * n));
 
-        scattered = ray(rec.p + origin_offset, direction, r_in.time());
+        // Clear glass: do not tint reflections or transmissions by default.
+        // This keeps glass looking crystal-clear irrespective of light intensity.
+        attenuation = colour(1.0, 1.0, 1.0);
+
+        scattered = ray(origin, direction, r_in.time());
         return true;
+    }
+    
+    bool is_specular() const override { return true; }
+
+    // Direct shading for dielectrics: only a specular Fresnel reflection
+    // (no diffuse). Transmission of light into the scene is handled by
+    // refracted scattering paths, so shadows behind the glass remain
+    // dark unless light is transmitted through the medium.
+    colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const override {
+        vec3 N = rec.normal;
+        vec3 L = unit_vector(Ldir);
+        vec3 Vn = unit_vector(V);
+
+        double NdotL = std::max(0.0001, dot(N, L));
+        double NdotV = std::max(0.0001, dot(N, Vn));
+
+        // Half vector
+        vec3 H = unit_vector(L + Vn);
+        double NdotH = std::max(0.0001, dot(N, H));
+        double VdotH = std::max(0.0001, dot(Vn, H));
+
+        // Use a small roughness for clear glass; increase slightly so
+        // highlights are broader for direct lights. We'll also apply an
+        // intensity-dependent boost to make strong lights produce larger
+        // specular highlights.
+        double rough = 0.04; // slightly larger -> broader highlight
+        double alpha = rough * rough;
+
+        // GGX / Trowbridge-Reitz D term
+        double a2 = alpha * alpha;
+        double denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+        double D = (a2) / (pi * denom * denom + 1e-12);
+
+        // Smith G
+        double k = (alpha * alpha) / 2.0;
+        double G = 1.0;
+        {
+            auto geometry_schlick_ggx = [](double NdotX, double k) {
+                return NdotX / (NdotX * (1.0 - k) + k);
+            };
+            G = geometry_schlick_ggx(NdotV, k) * geometry_schlick_ggx(NdotL, k);
+        }
+
+        // Fresnel using Schlick with F0 from IOR
+        double etai = 1.0;
+        double etat = refraction_index;
+        if (!rec.front_face) std::swap(etai, etat);
+        // compute F0
+        double r0 = (etai - etat) / (etai + etat);
+        r0 = r0 * r0;
+        colour F = schlick_fresnel(std::max(0.0, VdotH), colour((float)r0, (float)r0, (float)r0));
+
+        // Specular BRDF (microfacet). Convert to outgoing radiance contribution.
+        // brdf_spec = D * G * F / (4 * NdotV * NdotL)
+        // contribution = brdf_spec * Li * NdotL -> simplifies to (D*G*F)/(4*NdotV) * Li
+        colour spec_term = F * (float)((D * G) / (4.0 * NdotV + 1e-12));
+
+        // Boost factor based on incoming radiance intensity so bright
+        // directional lights create larger, more visible highlights.
+        double incoming_lum = luminance(Li);
+        double boost = 1.0 + std::clamp(incoming_lum * 2.0, 0.0, 8.0);
+
+        return spec_term * (float)boost * Li;
     }
 
     colour albedo(const hit_record& rec) const override {
-        return tex->value(0, 0, 0);
+        return colour(1.0, 1.0, 1.0);
     }
 
   private:
     double refraction_index;
     shared_ptr<texture> tex;
 
-    static double reflectance(double cosine, double refraction_index) {
-        auto r0 = (1 - refraction_index) / (1 + refraction_index);
-        r0 = r0*r0;
-        return r0 + (1-r0)*std::pow((1 - cosine),5);
+    // Fresnel (Schlick) using explicit incident/transmitted indices
+    static double reflectance(double cosine, double etai, double etat) {
+        // compute F0 from indices
+        double r0 = (etai - etat) / (etai + etat);
+        r0 = r0 * r0;
+        double x = 1.0 - std::clamp(cosine, 0.0, 1.0);
+        return r0 + (1.0 - r0) * std::pow(x, 5.0);
     }
 };
 
@@ -250,240 +347,260 @@ class isotropic : public material {
 
 class pbr_material : public material {
 public:
-    // PBR Textures
+    // Base color, metallic, roughness, specular F0, normal map
     shared_ptr<texture> base_tex;
-    shared_ptr<texture> metallic_tex;
-    shared_ptr<texture> roughness_tex;
-    shared_ptr<texture> normal_tex;
+    shared_ptr<texture> metallic_tex;   // greyscale in [0,1]
+    shared_ptr<texture> roughness_tex;  // greyscale in [0,1]
+    shared_ptr<texture> normal_tex;     // tangent-space normal map
     double normal_strength;
-    colour dielectric_F0;
+
+    // Dielectric F0 when metallic = 0 (0.04 is common)
+    colour  dielectric_F0;
 
 public:
-    // (A) Constant parameters
-    pbr_material(const colour& base_color, double metallic, double roughness,
-                 shared_ptr<texture> normal_map = nullptr, double normal_strength_in = 1.0,
-                 const colour& dielectric_specular = colour(0.04, 0.04, 0.04))
+    // (A) Constant base/metal/rough with optional normal map
+    pbr_material(
+        const colour& base_color,
+        double metallic,
+        double roughness,
+        shared_ptr<texture> normal_map = nullptr,
+        double normal_strength_in = 1.0,
+        const colour& dielectric_specular = colour(0.04, 0.04, 0.04)
+    )
         : dielectric_F0(dielectric_specular),
           base_tex(make_shared<solid_colour>(base_color)),
           metallic_tex(make_shared<solid_colour>(colour(clamp01(metallic), clamp01(metallic), clamp01(metallic)))),
           roughness_tex(make_shared<solid_colour>(colour(clamp01(roughness), clamp01(roughness), clamp01(roughness)))),
           normal_tex(normal_map),
-          normal_strength(normal_strength_in) {}
+          normal_strength(normal_strength_in)
+    {}
 
-    // (B) Textured base
-    pbr_material(shared_ptr<texture> base_color, double metallic, double roughness,
-                 shared_ptr<texture> normal_map, double normal_strength_in = 1.0,
-                 const colour& dielectric_specular = colour(0.04, 0.04, 0.04))
+
+    // (B) Textured base + scalar metallic/rough + normal map
+    pbr_material(
+        shared_ptr<texture> base_color,
+        double metallic,
+        double roughness,
+        shared_ptr<texture> normal_map,
+        double normal_strength_in = 1.0,
+        const colour& dielectric_specular = colour(0.04, 0.04, 0.04)
+    )
         : dielectric_F0(dielectric_specular),
           base_tex(base_color),
           metallic_tex(make_shared<solid_colour>(colour(clamp01(metallic), clamp01(metallic), clamp01(metallic)))),
           roughness_tex(make_shared<solid_colour>(colour(clamp01(roughness), clamp01(roughness), clamp01(roughness)))),
           normal_tex(normal_map),
-          normal_strength(normal_strength_in) {}
+          normal_strength(normal_strength_in)
+    {}
 
-    // (C) Fully textured
-    pbr_material(shared_ptr<texture> base_color, shared_ptr<texture> metallic,
-                 shared_ptr<texture> roughness, shared_ptr<texture> normal_map,
-                 double normal_strength_in = 1.0, const colour& dielectric_specular = colour(0.04, 0.04, 0.04))
+
+    // (C) Fully textured PBR: base, metallic, roughness, normal
+    pbr_material(
+        shared_ptr<texture> base_color,
+        shared_ptr<texture> metallic,
+        shared_ptr<texture> roughness,
+        shared_ptr<texture> normal_map,
+        double normal_strength_in = 1.0,
+        const colour& dielectric_specular = colour(0.04, 0.04, 0.04)
+    )
         : dielectric_F0(dielectric_specular),
           base_tex(base_color),
           metallic_tex(metallic),
           roughness_tex(roughness),
           normal_tex(normal_map),
-          normal_strength(normal_strength_in) {}
+          normal_strength(normal_strength_in)
+    {}
 
     virtual colour albedo(const hit_record& rec) const override {
-        return base_tex ? base_tex->value(rec.u, rec.v, rec.p) : colour(1, 1, 1);
+        return base_tex ? base_tex->value(rec.u, rec.v, rec.p)
+                        : colour(1,1,1);
     }
 
+    // Core scatter
     virtual bool scatter(
         const ray& r_in,
         const hit_record& rec,
         colour& attenuation,
         ray& scattered
     ) const override {
-        
-        // 1. Fetch Material Parameters
-        colour baseColor = base_tex ? base_tex->value(rec.u, rec.v, rec.p) : colour(1, 1, 1);
-        
-        double metallic = metallic_tex ? metallic_tex->value(rec.u, rec.v, rec.p).x() : 0.0;
-        double rough_val = roughness_tex ? roughness_tex->value(rec.u, rec.v, rec.p).x() : 0.5;
+
+        // ----------------
+        // Fetch parameters
+        // ----------------
+        colour baseColor = base_tex
+            ? base_tex->value(rec.u, rec.v, rec.p)
+            : colour(1,1,1);
+
+        double metallic = metallic_tex
+        ? luminance(metallic_tex->value(rec.u, rec.v, rec.p))
+        : 0.0;
+
+        double rough = roughness_tex
+        ? luminance(roughness_tex->value(rec.u, rec.v, rec.p))
+        : 0.5;
 
         metallic = clamp01(metallic);
-        rough_val = clamp01(rough_val);
+        rough    = clamp01(rough);
 
-        // Map perceptual roughness to linear alpha (Disney/Unreal convention: alpha = roughness^2)
-        double alpha = rough_val * rough_val;
+        double alpha = perceptual_to_alpha(rough);
 
-        // Calculate F0 (Reflectance at normal incidence)
-        colour F0 = (vec3(1.0, 1.0, 1.0) - vec3(metallic, metallic, metallic)) * dielectric_F0 
-                  + vec3(metallic, metallic, metallic) * baseColor;
+        // Fresnel base reflectivity: mix between dielectric F0 and baseColornormal_strength_in
+        colour F0 = (vec3(1.0,1.0,1.0) - vec3(metallic, metallic, metallic)) * dielectric_F0
+                    + vec3(metallic, metallic, metallic) * baseColor;
 
-        // 2. Normal Mapping with Grazing Angle Damping
+        // ----------------
+        // Build world-space normal from normal map (if present)
+        // ----------------
         vec3 Ngeom = rec.normal;
         vec3 N = Ngeom;
+
+        // Use tangent & bitangent from hit_record as the ONB everywhere
         vec3 T = rec.tangent;
         vec3 B = rec.bitangent;
 
-        // View direction (pointing out from surface)
-        vec3 V = -unit_vector(r_in.direction());
-
         if (normal_tex) {
             colour n_tex = normal_tex->value(rec.u, rec.v, rec.p);
-            vec3 n_tan_raw(2.0 * n_tex.x() - 1.0, 2.0 * n_tex.y() - 1.0, 2.0 * n_tex.z() - 1.0);
-            
-            vec3 n_tan(n_tan_raw.x() * normal_strength, n_tan_raw.y() * normal_strength, n_tan_raw.z());
+
+            // Decode tangent-space normal from [0,1] → [-1,1]
+            vec3 n_tan_raw(
+                2.0 * n_tex.x() - 1.0,
+                2.0 * n_tex.y() - 1.0,
+                2.0 * n_tex.z() - 1.0
+            );
+
+            // Apply intensity (only to X and Y)
+            vec3 n_tan(
+                n_tan_raw.x() * normal_strength,
+                n_tan_raw.y() * normal_strength,
+                n_tan_raw.z()
+            );
+
             n_tan = unit_vector(n_tan);
 
-            vec3 N_bumpy = unit_vector(n_tan.x() * T + n_tan.y() * B + n_tan.z() * Ngeom);
-
-            // Grazing angle damping to prevent black artifacts
-            double NdotV_geom = std::max(0.0, dot(Ngeom, V));
-            double strength_factor = std::clamp(NdotV_geom * 5.0, 0.0, 1.0); // Fade in last 20%
-            
-            // Blend safe geometry normal with bumpy normal
-            N = unit_vector(N_bumpy * strength_factor + Ngeom * (1.0 - strength_factor));
+            // Transform into world space using T,B,Ngeom
+            N = unit_vector(
+                n_tan.x() * T +
+                n_tan.y() * B +
+                n_tan.z() * Ngeom
+            );
         }
 
-        // Ensure N points towards viewer
-        if (dot(N, V) < 0) N = -N;
-
-        double NdotV = std::max(0.0001, dot(N, V));
-
-        // 3. Fresnel-based Lobe Selection Probability
-        colour F_view = schlick_fresnel(NdotV, F0);
-        double F_avg = (F_view.x() + F_view.y() + F_view.z()) / 3.0;
+        // --- NEW FIX: GRAZING ANGLE DAMPING ---
+        // As the view angle gets shallower, we fade the normal map out.
+        // This prevents the "Impossible Reflection" paradox before it happens.
         
-        // Probability to sample specular lobe
-        double spec_prob = std::clamp(F_avg, 0.05, 0.95);
-        if (metallic > 0.5) spec_prob = std::max(spec_prob, metallic); // Metals are mostly specular
+        vec3 view_dir = -unit_vector(r_in.direction());
+        
+        // Calculate how much we are facing the geometry (0.0 = edge, 1.0 = center)
+        double NdotV = std::max(0.0, dot(Ngeom, view_dir));
+        
+        // Fade factor: Start fading when within the last 20% of the edge.
+        // smoothstep helps make it look organic.
+        double strength = NdotV * 5.0; 
+        strength = std::clamp(strength, 0.0, 1.0);
 
-        // 4. Sampling
-        if (random_double() < spec_prob) {
-            // ------------------------------------------
-            // SPECULAR LOBE (GGX)
-            // ------------------------------------------
-            
-            // Sample Half Vector H
+        // Blend the Bumpy Normal (N) into the Safe Geometry Normal (Ngeom)
+        N = unit_vector(N * strength + Ngeom * (1.0 - strength));
+
+        vec3 wo = -unit_vector(r_in.direction()); // view dir in world space
+
+        // ---------------
+        // Lobe selection
+        // ---------------
+        // Simple heuristic: more metallic = more likely specular
+        double spec_prob;
+        if (metallic > 0.9) {
+            spec_prob = 1.0;
+        } else {
+            spec_prob = 0.25 + 0.7 * metallic;
+            spec_prob = clamp01(spec_prob);
+        }
+
+        double xi_lobe = random_double();
+
+        vec3 wi;        // scattered direction
+        colour weight;  // BRDF-ish weight used as attenuation
+
+        if (xi_lobe < spec_prob) {
+            // 1. Generate GGX Sample
             double xi1 = random_double();
             double xi2 = random_double();
             vec3 h_local = sample_ggx_half_vector(alpha, xi1, xi2);
-            
-            // Transform H to World Space
-            vec3 H = unit_vector(h_local.x() * T + h_local.y() * B + h_local.z() * N);
-            
-            // Reflected Vector L
-            vec3 L = reflect(-V, H);
+            vec3 h = unit_vector(h_local.x() * T + h_local.y() * B + h_local.z() * N);
 
-            // --- Horizon Lifting Fix (Your implementation) ---
-            double dot_geom = dot(L, Ngeom);
-            double geometry_shadowing = 1.0;
+            // 2. Calculate Reflection Direction
+            wi = reflect(-wo, h);
+
+            // --- HORIZON LIFTING FIX ---
+            
+            // Check: Is this ray pointing "underground" relative to the REAL geometry?
+            double dot_geom = dot(wi, rec.normal);
+            double geometry_shadowing = 1.0; // Default to keeping all light
+
             if (dot_geom < 0.0) {
-                L = unit_vector(L - (dot_geom * Ngeom)); // Skid along surface
-                double lift_amount = -dot_geom;
-                geometry_shadowing = std::clamp(1.0 - (rough_val * lift_amount), 0.0, 1.0);
+                // 1. Always Lift the ray to avoid pitch-black artifacts
+                // Subtract the underground component so it skids along the surface
+                wi = wi - (dot_geom * rec.normal);
+                wi = unit_vector(wi);
+                
+                // 2. Penalize the energy based on Roughness
+                // The deeper the ray was pointing (dot_geom), the more we darken it.
+                // If Roughness is 0.0 (Mirror), we don't darken at all.
+                // If Roughness is 1.0 (Matte), we darken significantly.
+                
+                // This creates a "Soft Shadow" that removes the dark spots 
+                // but keeps the matte look at the bottom.
+                double lift_amount = -dot_geom; 
+                geometry_shadowing = 1.0 - (rough * lift_amount);
+                geometry_shadowing = std::clamp(geometry_shadowing, 0.0, 1.0);
             }
-            // -----------------------------------------------
+            // -------------------------------------------
 
-            double NdotL = std::max(0.0001, dot(N, L));
-            double NdotH = std::max(0.0001, dot(N, H));
-            double VdotH = std::max(0.0001, dot(V, H));
+            // Safety Check (for the shading normal)
+            if (dot(wi, N) <= 0.0) {
+                 wi = reflect(-wo, N);
+                 if (dot(wi, N) <= 0.0) return false;
+            }
 
-            if (NdotL <= 0.0 || dot(L, N) <= 0.0) return false;
-
-            // Geometry Term (Smith)
-            // For Path Tracing, k = alpha^2 / 2
-            double k = (alpha * alpha) / 2.0;
-            double G = geometry_smith(N, V, L, k);
-
-            // Fresnel (recalculated with actual H)
-            colour F = schlick_fresnel(VdotH, F0);
-
-            // Specular Weight Calculation
-            // Weight = F * G * (V.H) / (N.V * N.H)
-            colour spec_weight = F * G * VdotH / (NdotV * NdotH);
-
-            // Apply Horizon Shadowing & PDF Compensation
-            attenuation = spec_weight * geometry_shadowing / spec_prob;
-            scattered = ray(rec.p, L, r_in.time());
-
+            // Standard Fresnel & Weight
+            double cosTheta = std::max(0.0, dot(wi, N));
+            colour F = schlick_fresnel(std::max(0.0, dot(h, wo)), F0);
+            
+            weight = F * (1.0 / std::max(0.001, spec_prob));
+            
+            // 3. Apply the Soft Shadowing Factor
+            weight *= geometry_shadowing;
         } else {
-            // ------------------------------------------
-            // DIFFUSE LOBE (Lambertian)
-            // ------------------------------------------
-            
-            // Cosine weighted sampling
-            vec3 d_local = sample_cosine_hemisphere(random_double(), random_double());
-            vec3 L = unit_vector(d_local.x() * T + d_local.y() * B + d_local.z() * N);
+            // --------------------------
+            // Diffuse (Lambertian) lobe
+            // --------------------------
+            double xi1 = random_double();
+            double xi2 = random_double();
 
-            // Calculate Diffuse Color (kD)
-            // Conservation of energy: Diffuse is whatever isn't reflected
-            colour kD = (vec3(1.0, 1.0, 1.0) - F_view) * (1.0 - metallic);
-            
-            // Lambertian Weight = Albedo
-            colour diff_weight = kD * baseColor;
+            vec3 d_local = sample_cosine_hemisphere(xi1, xi2);
 
-            // Apply PDF Compensation
-            attenuation = diff_weight / (1.0 - spec_prob);
-            scattered = ray(rec.p, L, r_in.time());
+            wi = unit_vector(
+                  d_local.x() * T
+                + d_local.y() * B
+                + d_local.z() * N
+            );
+
+            // Standard Lambertian diffuse energy is (1 - metallic)
+            colour kd = baseColor * (1.0 - metallic);
+
+            // Optional: apply (1 - average(F0)) factor for more correct energy
+            double F0_avg = (F0.x() + F0.y() + F0.z()) / 3.0;
+            kd *= (1.0 - F0_avg);
+
+            weight = kd / std::max(0.05, 1.0 - spec_prob);
         }
+
+        scattered   = ray(rec.p, wi, r_in.time());
+        attenuation = weight;
 
         return true;
     }
-
-private:
-    // Schlick Fresnel approximation
-    colour schlick_fresnel(double cosine, const colour& f0) const {
-        return f0 + (colour(1,1,1) - f0) * pow(1.0 - cosine, 5.0);
-    }
-
-    // Smith Geometry Function (G)
-    // Combines shadowing (V) and masking (L)
-    double geometry_smith(const vec3& N, const vec3& V, const vec3& L, double k) const {
-        double NdotV = std::max(0.0, dot(N, V));
-        double NdotL = std::max(0.0, dot(N, L));
-        return geometry_schlick_ggx(NdotV, k) * geometry_schlick_ggx(NdotL, k);
-    }
-
-    double geometry_schlick_ggx(double NdotX, double k) const {
-        return NdotX / (NdotX * (1.0 - k) + k);
-    }
-
-    // GGX Importance Sampling
-    // Returns a Half-Vector (H) in tangent space
-    vec3 sample_ggx_half_vector(double alpha, double xi1, double xi2) const {
-        double phi = 2.0 * 3.14159265359 * xi1;
-        double cos_theta = sqrt((1.0 - xi2) / (1.0 + (alpha * alpha - 1.0) * xi2));
-        double sin_theta = sqrt(1.0 - cos_theta * cos_theta);
-
-        return vec3(
-            sin_theta * cos(phi),
-            sin_theta * sin(phi),
-            cos_theta
-        );
-    }
-
-    // Cosine Weighted Hemisphere Sampling
-    // Returns a Light Vector (L) in tangent space
-    vec3 sample_cosine_hemisphere(double xi1, double xi2) const {
-        double r = sqrt(xi1);
-        double phi = 2.0 * 3.14159265359 * xi2;
-        
-        double x = r * cos(phi);
-        double y = r * sin(phi);
-        double z = sqrt(std::max(0.0, 1.0 - xi1));
-
-        return vec3(x, y, z);
-    }
-
-    // Helper utilities
-    double luminance(const colour& c) const {
-        return dot(c, vec3(0.2126, 0.7152, 0.0722));
-    }
-
-    double clamp01(double x) const {
-        return x < 0 ? 0 : (x > 1 ? 1 : x);
-    }
 };
+
 
 #endif // MATERIAL_H

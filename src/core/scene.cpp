@@ -353,5 +353,13 @@ hittable_list build_world_from_scene(const scene& scn)
         world.add(inst);
     }
 
-    return world;
+    // If there are no objects, just return the empty world.
+    if (world.objects.empty()) return world;
+
+    // Wrap the scene objects in a top-level BVH to accelerate ray traversal.
+    // We return a hittable_list containing a single BVH node so the rest of
+    // the renderer (which expects a hittable_list) can remain unchanged.
+    auto top_bvh = std::make_shared<bvh_node>(world.objects, 0, world.objects.size());
+    hittable_list wrapped(top_bvh);
+    return wrapped;
 }

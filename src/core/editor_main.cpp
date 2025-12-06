@@ -145,6 +145,10 @@ static GLsizei g_rasterCubeIndexCount   = 0;
 // One gpu_mesh per scene mesh asset, same index as g_scene.meshes
 static std::vector<gpu_mesh> g_gpu_meshes;
 
+// Per-light transient UI state: yaw (degrees) and time-of-day (0..24)
+static std::vector<double> g_light_yaw_deg;
+static std::vector<double> g_light_time_of_day;
+
 static GLuint g_rasterFBO      = 0;
 static GLuint g_rasterColorTex = 0;
 static GLuint g_rasterDepthRBO = 0;
@@ -164,6 +168,14 @@ static GLuint g_gizmoVBO       = 0;
 static GLuint g_gizmoConeVAO   = 0;
 static GLuint g_gizmoConeVBO   = 0;
 static int    g_gizmoConeVertexCount = 0;
+// Sun gizmo (line) buffers
+static GLuint g_sunGizmoVAO = 0;
+static GLuint g_sunGizmoVBO = 0;
+// CPU-side copy of cone triangle positions for precise hit-testing
+static std::vector<vec3> g_gizmoConeTriangles;
+static int g_gizmoConeSegments = 16;
+static double g_gizmoConeLen = 0.18;
+static double g_gizmoBaseRad = 0.06;
 
 // Snapshot for object transform to support undo/redo
 struct ObjSnapshot {
@@ -213,6 +225,30 @@ static void glfw_key_callback(GLFWwindow* /*window*/, int key, int scancode, int
 static inline double dot3(const vec3& a, const vec3& b)
 {
     return a.x()*b.x() + a.y()*b.y() + a.z()*b.z();
+}
+
+// Ray-triangle intersection (Möller–Trumbore). Returns true and sets outT to ray parameter if hit.
+static bool RayIntersectsTriangle(const ray& r, const vec3& v0, const vec3& v1, const vec3& v2, double& outT)
+{
+    const double EPS = 1e-8;
+    vec3 edge1 = v1 - v0;
+    vec3 edge2 = v2 - v0;
+    vec3 h = cross(r.direction(), edge2);
+    double a = dot(edge1, h);
+    if (std::fabs(a) < EPS) return false; // parallel
+    double f = 1.0 / a;
+    vec3 s = r.origin() - v0;
+    double u = f * dot(s, h);
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 q = cross(s, edge1);
+    double v = f * dot(r.direction(), q);
+    if (v < 0.0 || u + v > 1.0) return false;
+    double t = f * dot(edge2, q);
+    if (t > EPS) {
+        outT = t;
+        return true;
+    }
+    return false;
 }
 
 // Case-insensitive extension check
@@ -560,7 +596,7 @@ static void build_default_scene(scene& scn)
         obj.material_index = 5;
         obj.center = point3(0, 0, -1);
         obj.radius = 0.866025;
-        obj.translation = vec3(1.24724, -0.0392758, 0);
+        obj.translation = vec3(1.59406, -0.0392758, 0);
         obj.rotation_deg = vec3(0, 0, 0);
         obj.scale = vec3(0.1, 2.2, 4);
         scn.objects.push_back(obj);
@@ -572,9 +608,9 @@ static void build_default_scene(scene& scn)
         obj.material_index = -1;
         obj.center = point3(0, 0, -1);
         obj.radius = 0.866025;
-        obj.translation = vec3(0.0535498, -0.0663178, -0.949799);
+        obj.translation = vec3(0.0535498, -0.0249851, -1.92386);
         obj.rotation_deg = vec3(0, 0, 0);
-        obj.scale = vec3(2.3, 2.2, 0.1);
+        obj.scale = vec3(3, 2.2, 0.1);
         scn.objects.push_back(obj);
     }
     {
@@ -584,9 +620,9 @@ static void build_default_scene(scene& scn)
         obj.material_index = -1;
         obj.center = point3(0, 0, -1);
         obj.radius = 0.866025;
-        obj.translation = vec3(0.14756, 1.06957, -0.00132418);
+        obj.translation = vec3(0.14756, 1.11287, -0.00132418);
         obj.rotation_deg = vec3(0, 0, 0);
-        obj.scale = vec3(2.3, 0.1, 4);
+        obj.scale = vec3(3, 0.1, 4);
         scn.objects.push_back(obj);
     }
     {
@@ -610,7 +646,7 @@ static void build_default_scene(scene& scn)
         obj.radius = 0.866025;
         obj.translation = vec3(0.145035, -1.17922, 0);
         obj.rotation_deg = vec3(0, 0, 0);
-        obj.scale = vec3(2.3, 0.1, 4);
+        obj.scale = vec3(3, 0.1, 4);
         scn.objects.push_back(obj);
     }
     {
@@ -620,7 +656,7 @@ static void build_default_scene(scene& scn)
         obj.material_index = 4;
         obj.center = point3(0, 0, -1);
         obj.radius = 0.866025;
-        obj.translation = vec3(-0.952429, -0.033585, 0);
+        obj.translation = vec3(-1.30493, -0.033585, 0);
         obj.rotation_deg = vec3(0, 0, 0);
         obj.scale = vec3(0.1, 2.2, 4);
         scn.objects.push_back(obj);
@@ -632,7 +668,7 @@ static void build_default_scene(scene& scn)
         obj.material_index = -1;
         obj.center = point3(0, 0, -1);
         obj.radius = 0.866025;
-        obj.translation = vec3(-0.266196, -0.674796, -0.366528);
+        obj.translation = vec3(-0.514723, -0.674796, -0.958614);
         obj.rotation_deg = vec3(0, -24, 0);
         obj.scale = vec3(0.69, 2.25, 0.75);
         scn.objects.push_back(obj);
@@ -644,8 +680,8 @@ static void build_default_scene(scene& scn)
         obj.material_index = -1;
         obj.center = point3(0, 0, -1);
         obj.radius = 0.866025;
-        obj.translation = vec3(0.699079, -0.875483, 0.599731);
-        obj.rotation_deg = vec3(0, 24, 0);
+        obj.translation = vec3(0.829535, -0.875483, 0.431332);
+        obj.rotation_deg = vec3(0, 36, 0);
         obj.scale = vec3(0.5, 0.5, 0.5);
         scn.objects.push_back(obj);
     }
@@ -656,7 +692,7 @@ static void build_default_scene(scene& scn)
         obj.material_index = 2;
         obj.center = point3(0, 0, -1);
         obj.radius = 0.5;
-        obj.translation = vec3(-0.344305, -0.28823, 1.12807);
+        obj.translation = vec3(-0.492861, -0.28823, 0.51203);
         obj.rotation_deg = vec3(0, 0, 0);
         obj.scale = vec3(0.6, 0.6, 0.6);
         scn.objects.push_back(obj);
@@ -668,7 +704,7 @@ static void build_default_scene(scene& scn)
         obj.material_index = 2;
         obj.center = point3(0, 0, -1);
         obj.radius = 0.5;
-        obj.translation = vec3(0.611195, -0.34475, 0.747368);
+        obj.translation = vec3(0.839512, -0.428069, 0.403038);
         obj.rotation_deg = vec3(0, 0, 0);
         obj.scale = vec3(0.4, 0.4, 0.4);
         scn.objects.push_back(obj);
@@ -680,27 +716,13 @@ static void build_default_scene(scene& scn)
         obj.material_index = -1;
         obj.center = point3(0, 0, 0);
         obj.radius = 2.00049;
-        obj.translation = vec3(0.0773224, -1.13468, -0.680275);
+        obj.translation = vec3(0.0773224, -1.13078, -1.13846);
         obj.rotation_deg = vec3(0, 103, 0);
         obj.scale = vec3(0.7, 0.7, 0.7);
         obj.mesh_slot_materials = {7, 8, 9, 10};
         scn.objects.push_back(obj);
     }
-    {
-        scene_object obj;
-        obj.name = "Sphere 11";
-        obj.type = scene_object_type::sphere;
-        obj.material_index = 11;
-        obj.center = point3(0, 0, -1);
-        obj.radius = 0.5;
-        obj.translation = vec3(-0.598247, -0.317685, 0.355021);
-        obj.rotation_deg = vec3(0, 0, 0);
-        obj.scale = vec3(0.3, 0.3, 0.3);
-        scn.objects.push_back(obj);
-    }
-    scn.lights.push_back({"Sun", scene_light_type::directional});
-    scn.lights.back().radiance = vec3(3, 3, 3);
-    scn.lights.back().direction = vec3(-0.666667, -0.666667, -0.333333);
+
 
     // If AtlasedMKIV model exists, import as a mesh asset and attach to the
     // pre-created mesh_instance object named "Atlasted MK IV" (if present).
@@ -1559,12 +1581,78 @@ static void RenderRasterToTexture(int width, int height)
         }
     }
 
+    // Draw a small sun gizmo (yellow line) in the preview to indicate sun direction
+    if (g_lineShader != 0) {
+        // find first directional light
+        int sun_idx = -1;
+        for (size_t li = 0; li < g_scene.lights.size(); ++li) {
+            if (g_scene.lights[li].type == scene_light_type::directional) { sun_idx = (int)li; break; }
+        }
+
+        if (sun_idx >= 0) {
+            const auto& L = g_scene.lights[sun_idx];
+            // direction from scene toward light; we want arrow pointing to sun (sky) => -L.direction
+            vec3 arrow = unit_vector(vec3(-L.direction.x(), -L.direction.y(), -L.direction.z()));
+
+            // position the gizmo near the camera in world space so it's always visible
+            vec3 start = g_editor_cam.position + g_editor_cam.forward * 2.0f + g_editor_cam.up * -0.5f + g_editor_cam.right * 1.0f;
+            vec3 end   = start + arrow * 1.5f;
+
+            // build vertex data: pos.xyz, color.rgb
+            float verts[12];
+            verts[0] = (float)start.x(); verts[1] = (float)start.y(); verts[2] = (float)start.z(); verts[3] = 1.0f; verts[4] = 1.0f; verts[5] = 0.0f;
+            verts[6] = (float)end.x();   verts[7] = (float)end.y();   verts[8] = (float)end.z();   verts[9] = 1.0f; verts[10] = 1.0f; verts[11] = 0.0f;
+
+            // init VAO/VBO if needed
+            if (g_sunGizmoVAO == 0) {
+                glGenVertexArrays(1, &g_sunGizmoVAO);
+                glGenBuffers(1, &g_sunGizmoVBO);
+                glBindVertexArray(g_sunGizmoVAO);
+                glBindBuffer(GL_ARRAY_BUFFER, g_sunGizmoVBO);
+                glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+                glEnableVertexAttribArray(1);
+                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+                glBindVertexArray(0);
+            } else {
+                // update vertex buffer
+                glBindBuffer(GL_ARRAY_BUFFER, g_sunGizmoVBO);
+                glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+            }
+
+            // save depth state and draw on top
+            GLboolean wasDepthTest = glIsEnabled(GL_DEPTH_TEST);
+            GLint prevDepthFunc = 0; glGetIntegerv(GL_DEPTH_FUNC, &prevDepthFunc);
+            glDisable(GL_DEPTH_TEST);
+
+            glUseProgram(g_lineShader);
+            GLint locModelL = glGetUniformLocation(g_lineShader, "uModel");
+            GLint locViewL  = glGetUniformLocation(g_lineShader, "uView");
+            GLint locProjL  = glGetUniformLocation(g_lineShader, "uProj");
+            // identity model (verts in world space)
+            float modelId[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            glUniformMatrix4fv(locViewL, 1, GL_FALSE, view);
+            glUniformMatrix4fv(locProjL, 1, GL_FALSE, proj);
+            glUniformMatrix4fv(locModelL, 1, GL_FALSE, modelId);
+
+            glBindVertexArray(g_sunGizmoVAO);
+            glDrawArrays(GL_LINES, 0, 2);
+            glBindVertexArray(0);
+
+            glUseProgram(0);
+            if (wasDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+            glDepthFunc(prevDepthFunc);
+        }
+    }
+
     // Draw gizmo (render into raster FBO so it appears in the preview)
     if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size() && g_lineShader != 0) {
         const auto& obj = g_scene.objects[g_selected_object];
         float model[16];
         vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-        vec3 rot   = obj.rotation_deg;
+        // Build gizmo model without object rotation so axes remain world-aligned
+        vec3 rot   = vec3(0,0,0);
         // gizmo scale based on object's radius (mesh/cube) for reasonable size
         float gizmo_scale = 0.5f * (float)std::max(0.5, obj.radius);
         vec3 scl = vec3(gizmo_scale, gizmo_scale, gizmo_scale);
@@ -1810,7 +1898,7 @@ static void init_engine_once()
     g_camera.image_height      = 450;
     g_camera.samples_per_pixel = 20;
     g_camera.max_depth         = 20;
-    g_camera.background        = colour(0.70, 0.80, 1.00);
+    g_camera.background        = colour(0.0, 0.0, 0.0);
     to_shirley_camera(g_editor_cam, g_camera);
 
     BuildUnitSphereMesh();
@@ -1835,13 +1923,17 @@ static void init_engine_once()
 
     // Build smoother cone arrowheads (procedural) for each axis
     std::vector<float> gizmo_cones;
-    const int cone_segments = 16;
-    const float cone_len    = 0.18f; // along axis from base to apex
-    const float base_rad    = 0.06f; // radius of cone base
+    // use global constants so hit-test can reuse identical geometry
+    const int cone_segments = g_gizmoConeSegments;
+    const float cone_len    = (float)g_gizmoConeLen; // along axis from base to apex
+    const float base_rad    = (float)g_gizmoBaseRad; // radius of cone base
 
+    // Also store triangle positions (model-space) into g_gizmoConeTriangles
+    g_gizmoConeTriangles.clear();
     auto push_vertex = [&](float px, float py, float pz, float r, float g, float b) {
         gizmo_cones.push_back(px); gizmo_cones.push_back(py); gizmo_cones.push_back(pz);
         gizmo_cones.push_back(r);  gizmo_cones.push_back(g);  gizmo_cones.push_back(b);
+        g_gizmoConeTriangles.emplace_back((double)px, (double)py, (double)pz);
     };
 
     // X axis (red) - base circle centered at x=1.0, apex at x=1.0 + cone_len
@@ -2651,6 +2743,7 @@ int main()
 
     bool   show_demo_window = false;
     double last_time        = glfwGetTime();
+    static bool s_viewport_match_render = false;
 
     while (!glfwWindowShouldClose(window))
     {
@@ -2714,6 +2807,55 @@ int main()
         }
         s_prev_ctrlz = cur_ctrlz;
         s_prev_ctrly = cur_ctrly;
+
+        // Global Delete key: remove selected object when Delete pressed (works after clicking in viewport)
+        // Ignore when text input is active (WantCaptureKeyboard)
+        ImGuiIO& io = ImGui::GetIO();
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !io.WantCaptureKeyboard) {
+            if (g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size()) {
+                int del_idx = g_selected_object;
+                scene_object removed = g_scene.objects[del_idx];
+
+                // perform erase
+                g_scene.objects.erase(g_scene.objects.begin() + del_idx);
+
+                // Fix selection index
+                if (g_scene.objects.empty()) {
+                    g_selected_object = -1;
+                } else if (g_selected_object >= (int)g_scene.objects.size()) {
+                    g_selected_object = (int)g_scene.objects.size() - 1;
+                }
+
+                // Mark RT world dirty
+                g_world_dirty = true;
+                g_cached_world.reset();
+
+                // push undo action: undo = re-insert, redo = delete again
+                UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                    [del_idx, removed]() {
+                        // undo = re-insert
+                        int insert_at = del_idx;
+                        if (insert_at < 0) insert_at = 0;
+                        if (insert_at > (int)g_scene.objects.size()) insert_at = (int)g_scene.objects.size();
+                        g_scene.objects.insert(g_scene.objects.begin() + insert_at, removed);
+                        g_selected_object = insert_at;
+                        g_world_dirty = true;
+                        g_cached_world.reset();
+                    },
+                    [del_idx]() {
+                        // redo = perform delete again (after undo)
+                        if (del_idx >= 0 && del_idx < (int)g_scene.objects.size()) {
+                            g_scene.objects.erase(g_scene.objects.begin() + del_idx);
+                            if (g_scene.objects.empty()) g_selected_object = -1;
+                            else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
+                            g_world_dirty = true;
+                            g_cached_world.reset();
+                        }
+                    },
+                    "Delete Object"
+                ));
+            }
+        }
 
         // Dockspace
         {
@@ -2961,18 +3103,8 @@ int main()
                 g_world_dirty = true;
                 g_cached_world.reset();
 
-                // push undo action to restore object
+                // push undo action: undo = re-insert, redo = delete again
                 UndoManager::Instance().push(std::make_unique<LambdaAction>(
-                    [del_idx]() {
-                        // redo = perform delete again (after undo)
-                        if (del_idx >= 0 && del_idx < (int)g_scene.objects.size()) {
-                            g_scene.objects.erase(g_scene.objects.begin() + del_idx);
-                            if (g_scene.objects.empty()) g_selected_object = -1;
-                            else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
-                            g_world_dirty = true;
-                            g_cached_world.reset();
-                        }
-                    },
                     [del_idx, removed]() {
                         // undo = re-insert
                         int insert_at = del_idx;
@@ -2982,6 +3114,16 @@ int main()
                         g_selected_object = insert_at;
                         g_world_dirty = true;
                         g_cached_world.reset();
+                    },
+                    [del_idx]() {
+                        // redo = perform delete again (after undo)
+                        if (del_idx >= 0 && del_idx < (int)g_scene.objects.size()) {
+                            g_scene.objects.erase(g_scene.objects.begin() + del_idx);
+                            if (g_scene.objects.empty()) g_selected_object = -1;
+                            else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
+                            g_world_dirty = true;
+                            g_cached_world.reset();
+                        }
                     },
                     "Delete Object"
                 ));
@@ -3011,6 +3153,149 @@ int main()
 
         if (g_scene.textures.empty()) {
             ImGui::TextDisabled("No textures in scene. Drag PNG/JPG/TGA/BMP into window.");
+        }
+
+        ImGui::End();
+
+        // ---------------------------------------------------------------------
+        // Lights
+        // ---------------------------------------------------------------------
+        ImGui::Begin("Lights");
+
+        // Keep transient UI arrays in sync with scene lights
+        if (g_light_yaw_deg.size() != g_scene.lights.size()) {
+            g_light_yaw_deg.resize(g_scene.lights.size(), 0.0);
+        }
+        if (g_light_time_of_day.size() != g_scene.lights.size()) {
+            g_light_time_of_day.resize(g_scene.lights.size(), 12.0);
+        }
+
+        ImGui::Text("Scene Lights (%d)", (int)g_scene.lights.size());
+        ImGui::Separator();
+
+        if (ImGui::Button("Add Sun")) {
+            scene_light sl;
+            sl.name = "Sun";
+            sl.type = scene_light_type::directional;
+            sl.radiance = vec3(3.0, 3.0, 3.0);
+            sl.direction = vec3(-0.666667, -0.666667, -0.333333);
+            g_scene.lights.push_back(sl);
+            // push default UI state
+            g_light_yaw_deg.push_back(0.0);
+            g_light_time_of_day.push_back(12.0);
+            g_world_dirty = true;
+            g_cached_world.reset();
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Remove Last Light") && !g_scene.lights.empty()) {
+            g_scene.lights.pop_back();
+            if (!g_light_yaw_deg.empty()) g_light_yaw_deg.pop_back();
+            if (!g_light_time_of_day.empty()) g_light_time_of_day.pop_back();
+            g_world_dirty = true;
+            g_cached_world.reset();
+        }
+
+        ImGui::Separator();
+
+        // List lights with editable properties
+        for (size_t li = 0; li < g_scene.lights.size(); ++li) {
+            auto& L = g_scene.lights[li];
+            ImGui::PushID((int)li);
+            bool open = ImGui::TreeNode(L.name.c_str());
+            if (open) {
+                // Name
+                char namebuf[256] = {0};
+                std::strncpy(namebuf, L.name.c_str(), sizeof(namebuf)-1);
+                if (ImGui::InputText("Name", namebuf, sizeof(namebuf))) {
+                    L.name = std::string(namebuf);
+                }
+
+                // Radiance (colour + intensity)
+                float radR = (float)L.radiance.x();
+                float radG = (float)L.radiance.y();
+                float radB = (float)L.radiance.z();
+                float intensity = std::max(1e-6f, std::max(std::max(radR, radG), radB));
+                float color[3] = { radR / intensity, radG / intensity, radB / intensity };
+
+                bool changed = false;
+                if (ImGui::ColorEdit3("Sun Color", color)) {
+                    changed = true;
+                }
+                float inten_f = intensity;
+                if (ImGui::DragFloat("Intensity", &inten_f, 0.1f, 0.0f, 1e6f)) {
+                    if (inten_f < 0.0f) inten_f = 0.0f;
+                    changed = true;
+                }
+
+                if (changed) {
+                    L.radiance = vec3(color[0] * inten_f, color[1] * inten_f, color[2] * inten_f);
+                    g_world_dirty = true; g_cached_world.reset();
+                }
+
+                // Type
+                if (L.type == scene_light_type::directional) {
+                    ImGui::TextDisabled("Type: Directional");
+
+                    // yaw around Y (degrees)
+                    double yaw = g_light_yaw_deg[li];
+                    double yaw_min = -180.0, yaw_max = 180.0;
+                    if (ImGui::SliderScalar("Yaw (deg)", ImGuiDataType_Double, &yaw, &yaw_min, &yaw_max)) {
+                        g_light_yaw_deg[li] = yaw;
+                    }
+
+                    // day cycle: 0..24
+                    double tod = g_light_time_of_day[li];
+                    double tod_min = 0.0, tod_max = 24.0;
+                    if (ImGui::SliderScalar("Time of day", ImGuiDataType_Double, &tod, &tod_min, &tod_max)) {
+                        g_light_time_of_day[li] = tod;
+                    }
+
+                    // Compute direction from yaw & time-of-day
+                    // elevation angle (deg) follows simple sine curve: 0@midnight, peak@noon
+                    double t = g_light_time_of_day[li];
+                    double elev_frac = std::sin(3.14159265358979323846 * (t / 24.0));
+                    double max_elev_deg = 80.0; // maximum elevation at noon
+                    double elev_deg = elev_frac * max_elev_deg;
+                    double yaw_rad = g_light_yaw_deg[li] * (3.14159265358979323846 / 180.0);
+                    double elev_rad = elev_deg * (3.14159265358979323846 / 180.0);
+
+                    double cos_theta = std::cos(elev_rad);
+                    double sin_theta = std::sin(elev_rad);
+
+                    // direction = (cosθ * sinφ, -sinθ, cosθ * cosφ)
+                    vec3 dir((float)(cos_theta * std::sin(yaw_rad)),
+                             (float)(-sin_theta),
+                             (float)(cos_theta * std::cos(yaw_rad)));
+
+                    L.direction = dir;
+
+                    // Mirror into camera sun parameters for preview/quick use
+                    // Note: `scene_light.direction` is defined as "from light toward scene",
+                    // while the renderer and sun helper expect a direction *from scene toward sun*.
+                    // Pass the negated direction so gizmo, preview and shadow rays align.
+                    g_camera.use_sun = true;
+                    g_camera.sun_dir = -dir; // from scene toward sun
+                    g_camera.sun_radiance = colour(L.radiance.x(), L.radiance.y(), L.radiance.z());
+                    g_world_dirty = true; g_cached_world.reset();
+
+                    ImGui::Text("Computed direction: (%.3f, %.3f, %.3f)", (double)L.direction.x(), (double)L.direction.y(), (double)L.direction.z());
+                } else {
+                    ImGui::TextDisabled("Type: Point");
+                    float posf[3] = { (float)L.position.x(), (float)L.position.y(), (float)L.position.z() };
+                    if (ImGui::DragFloat3("Position", posf, 0.1f)) {
+                        L.position = point3(posf[0], posf[1], posf[2]);
+                        g_world_dirty = true; g_cached_world.reset();
+                    }
+                    float rangef = (float)L.range;
+                    if (ImGui::DragFloat("Range", &rangef, 0.1f, 0.0f, 1e6f)) {
+                        L.range = rangef; g_world_dirty = true; g_cached_world.reset();
+                    }
+                }
+
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
         }
 
         ImGui::End();
@@ -3070,6 +3355,54 @@ int main()
             ImGui::TextDisabled("Linear exposure multiplier applied before tone mapping.");
         }
 
+        // Denoiser (OpenImageDenoise) controls
+        {
+            bool use_dn = g_renderer.use_denoiser;
+            if (ImGui::Checkbox("Use Denoiser (OIDN)", &use_dn)) {
+                g_renderer.use_denoiser = use_dn;
+            }
+#ifdef HAVE_OIDN
+            float ds = (float)g_renderer.denoiser_strength;
+            if (ImGui::DragFloat("Denoiser Strength", &ds, 0.01f, 0.0f, 1.0f, "%.3f")) {
+                if (ds < 0.0f) ds = 0.0f;
+                if (ds > 1.0f) ds = 1.0f;
+                g_renderer.denoiser_strength = ds;
+            }
+            ImGui::TextDisabled("Strength controls the aggressiveness of OIDN (0 = off).");
+#else
+            ImGui::TextDisabled("OpenImageDenoise not available in this build.");
+#endif
+            // Adaptive sampling controls
+            ImGui::Separator();
+            bool adapt = g_renderer.adaptive_sampling;
+            if (ImGui::Checkbox("Adaptive Sampling (per-pixel)", &adapt)) {
+                g_renderer.adaptive_sampling = adapt;
+            }
+            if (g_renderer.adaptive_sampling) {
+                int amin = g_renderer.adaptive_min_samples;
+                if (ImGui::InputInt("Min samples before check", &amin)) {
+                    if (amin < 1) amin = 1;
+                    g_renderer.adaptive_min_samples = amin;
+                }
+                int aint = g_renderer.adaptive_check_interval;
+                if (ImGui::InputInt("Check interval (samples)", &aint)) {
+                    if (aint < 1) aint = 1;
+                    g_renderer.adaptive_check_interval = aint;
+                }
+                float arel = (float)g_renderer.adaptive_rel_threshold;
+                if (ImGui::DragFloat("Relative std-error threshold", &arel, 0.001f, 0.0001f, 0.5f, "%.4f")) {
+                    if (arel < 0.0f) arel = 0.0f;
+                    g_renderer.adaptive_rel_threshold = arel;
+                }
+                float aabs = (float)g_renderer.adaptive_abs_threshold;
+                if (ImGui::InputFloat("Absolute std-error threshold", &aabs, 0.0f, 0.0f, "%.6f")) {
+                    if (aabs < 0.0f) aabs = 0.0f;
+                    g_renderer.adaptive_abs_threshold = aabs;
+                }
+                ImGui::TextDisabled("Adaptive stops sampling a pixel when estimated std-error is small.");
+            }
+        }
+
         ImGui::TextDisabled("Higher = cleaner but slower.");
 
         ImGui::Separator();
@@ -3088,6 +3421,9 @@ int main()
         if (ImGui::Button("Apply Resolution")) {
             g_camera.image_width  = res_w;
             g_camera.image_height = res_h;
+        }
+        if (ImGui::Checkbox("Viewport matches Render Resolution", &s_viewport_match_render)) {
+            // no immediate action; viewport will pick this up next frame
         }
         ImGui::TextDisabled("Changes take effect next render.");
 
@@ -3880,6 +4216,20 @@ int main()
                 auto world_copy = g_cached_world;
                 camera cam_copy = g_camera;
                 g_render_final_image_ready.store(false);
+
+                // Defensive: if the global thread object still holds a joinable thread
+                // (shouldn't normally happen while g_render_in_progress is true), join
+                // it here to avoid std::terminate from assigning a new std::thread to a
+                // joinable thread object.
+                if (g_render_thread.joinable()) {
+                    std::fprintf(stderr, "Warning: joining previous render thread before starting new one\n");
+                    try {
+                        g_render_thread.join();
+                    } catch (...) {
+                        std::fprintf(stderr, "Exception while joining previous render thread\n");
+                    }
+                }
+
                 g_render_thread = std::thread([world_copy, cam_copy]() mutable {
                     render_result img =
                         g_renderer.render(*world_copy, cam_copy,
@@ -3980,45 +4330,47 @@ int main()
             if (tex_w > 0 && tex_h > 0) {
                 // Record where ImGui will draw the image on screen so we can
                 // convert mouse coordinates into texture-local coords for picking.
-                ImVec2 screen_pos = ImGui::GetCursorScreenPos();
+                    ImVec2 screen_pos = ImGui::GetCursorScreenPos();
 
-                RenderRasterToTexture(tex_w, tex_h);
+                    // If user wants the viewport to match the configured render resolution,
+                    // render into an FBO at that resolution; otherwise render at viewport size.
+                    if (s_viewport_match_render) {
+                        tex_w = g_camera.image_width;
+                        tex_h = g_camera.image_height;
+                    } else {
+                        tex_w = (int)vp_size.x;
+                        tex_h = (int)vp_size.y;
+                    }
 
-                // Handle mouse click / drag -> gizmo interaction or pick
-                ImGuiIO& io = ImGui::GetIO();
-                if (g_viewport_hovered) {
-                    ImVec2 m = io.MousePos;
-                    float local_x = m.x - screen_pos.x;
-                    float local_y = m.y - screen_pos.y;
+                    RenderRasterToTexture(tex_w, tex_h);
 
-                    if (local_x >= 0 && local_x < tex_w && local_y >= 0 && local_y < tex_h) {
+                    // Handle mouse click / drag -> gizmo interaction or pick
+                    ImGuiIO& io = ImGui::GetIO();
+                    if (g_viewport_hovered) {
+                        ImVec2 m = io.MousePos;
+                        float local_x = m.x - screen_pos.x;
+                        float local_y = m.y - screen_pos.y;
+
+                        // Map the mouse position in viewport pixels to texture-local coords
+                        double scale_x = (vp_size.x > 0.0f) ? ((double)tex_w / (double)vp_size.x) : 1.0;
+                        double scale_y = (vp_size.y > 0.0f) ? ((double)tex_h / (double)vp_size.y) : 1.0;
+                        double sx = (double)local_x * scale_x;
+                        double sy = (double)local_y * scale_y;
+
+                        if (sx >= 0 && sx < tex_w && sy >= 0 && sy < tex_h) {
                         // Mouse down: attempt gizmo axis hit first, otherwise pick scene
                         if (ImGui::IsMouseClicked(0)) {
                             bool did_hit_gizmo = false;
                             if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size()) {
-                                // build ray
-                                ray r = ScreenPointToRay(g_editor_cam, tex_w, tex_h, local_x, local_y);
+                                // build ray (map to texture coords sx,sy)
+                                ray r = ScreenPointToRay(g_editor_cam, tex_w, tex_h, (float)sx, (float)sy);
                                 // gizmo origin and axes in world space
                                 const auto& obj = g_scene.objects[g_selected_object];
                                 vec3 origin = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-                                // transform axes by object's rotation
-                                float tmpModel[16];
-                                make_model_trs(vec3(0,0,0), obj.rotation_deg, vec3(1,1,1), tmpModel);
-                                // unit axes in local space
-                                vec3 axes[3] = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
-                                // rotate axes by R (use R part from model matrix)
-                                auto transform_vec3_by_model = [&](const float M[16], const vec3& v) {
-                                    return vec3(
-                                        M[0]*v.x() + M[1]*v.y() + M[2]*v.z(),
-                                        M[4]*v.x() + M[5]*v.y() + M[6]*v.z(),
-                                        M[8]*v.x() + M[9]*v.y() + M[10]*v.z()
-                                    );
-                                };
+                                // Use world-aligned axes (gizmo should follow world X/Y/Z)
+                                vec3 axis_world[3] = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
 
-                                vec3 axis_world[3];
-                                for (int a=0;a<3;++a) axis_world[a] = unit_vector(transform_vec3_by_model(tmpModel, axes[a]));
-
-                                // test closest distance to each axis
+                                // test closest distance to each axis and to arrow tip (cone)
                                 double best_dist = 1e9; int best_axis = -1; vec3 best_cp1, best_cp2;
                                 for (int a=0;a<3;++a) {
                                     double s,t;
@@ -4026,10 +4378,63 @@ int main()
                                     vec3 cp_axis = origin + axis_world[a] * (float)s;
                                     vec3 cp_ray  = r.origin() + r.direction() * (float)t;
                                     double dist = (cp_axis - cp_ray).length();
-                                    // threshold based on object size
+
+                                    // threshold based on object size for axis-line hit
                                     double gizmo_scale = 0.5 * std::max(0.5, obj.radius);
-                                    double thresh = gizmo_scale * 0.12; // heuristic
-                                    if (dist < best_dist && dist < thresh) {
+                                    double axis_thresh = gizmo_scale * 0.12; // heuristic
+
+                                    bool axis_hit = (dist < axis_thresh);
+
+                                    // Precise cone-triangle intersection for arrowhead: transform cone triangles for this axis
+                                    // Cone triangles are stored in g_gizmoConeTriangles in model-space, grouped per-axis.
+                                    // Build full model matrix used when rendering the gizmo so we transform triangles the same way.
+
+                                    // Build cone triangle model without object rotation so arrowheads point along world axes
+                                    vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+                                    float modelFull[16];
+                                    vec3 scl = vec3((float)gizmo_scale, (float)gizmo_scale, (float)gizmo_scale);
+                                    make_model_trs(trans, vec3(0,0,0), scl, modelFull);
+
+                                    // helper to transform a model-space point (includes translation)
+                                    auto transform_point_by_model = [&](const float M[16], const vec3& v) {
+                                        return vec3(
+                                            M[0]*v.x() + M[1]*v.y() + M[2]*v.z() + M[12],
+                                            M[4]*v.x() + M[5]*v.y() + M[6]*v.z() + M[13],
+                                            M[8]*v.x() + M[9]*v.y() + M[10]*v.z() + M[14]
+                                        );
+                                    };
+
+                                    // cone triangles per axis: cone_segments triangles, each triangle = 3 consecutive vec3 in g_gizmoConeTriangles
+                                    int segs = g_gizmoConeSegments;
+                                    int verts_per_axis = segs * 3; // number of vec3 entries per axis
+                                    int axis_offset = a * verts_per_axis;
+
+                                    double best_t_tri = 1e18;
+                                    bool tri_hit = false;
+                                    vec3 tri_hit_point;
+
+                                    for (int sidx = 0; sidx < segs; ++sidx) {
+                                        int base = axis_offset + sidx * 3;
+                                        if (base + 2 >= (int)g_gizmoConeTriangles.size()) break;
+                                        vec3 v0 = transform_point_by_model(modelFull, g_gizmoConeTriangles[base + 0]);
+                                        vec3 v1 = transform_point_by_model(modelFull, g_gizmoConeTriangles[base + 1]);
+                                        vec3 v2 = transform_point_by_model(modelFull, g_gizmoConeTriangles[base + 2]);
+                                        double ttri;
+                                        if (RayIntersectsTriangle(r, v0, v1, v2, ttri)) {
+                                            if (ttri > 0.0 && ttri < best_t_tri) {
+                                                best_t_tri = ttri;
+                                                tri_hit = true;
+                                                tri_hit_point = r.origin() + r.direction() * (float)ttri;
+                                            }
+                                        }
+                                    }
+
+                                    if (tri_hit && best_t_tri < best_dist) {
+                                        best_dist = best_t_tri;
+                                        best_axis = a;
+                                        best_cp1 = tri_hit_point;
+                                        best_cp2 = tri_hit_point; // both points approximate
+                                    } else if (axis_hit && dist < best_dist) {
                                         best_dist = dist;
                                         best_axis = a;
                                         best_cp1 = cp_axis;
@@ -4053,7 +4458,7 @@ int main()
                             }
 
                             if (!did_hit_gizmo) {
-                                int picked = PerformPick(tex_w, tex_h, (int)local_x, (int)local_y);
+                                int picked = PerformPick(tex_w, tex_h, (int)sx, (int)sy);
                                 if (picked >= 0 && picked < (int)g_scene.objects.size()) {
                                     g_selected_object = picked;
                                     g_show_gizmo = true;
@@ -4067,20 +4472,15 @@ int main()
 
                         // Mouse dragging: if active axis, compute new closest point and move object
                         if (g_active_gizmo_axis >= 0 && ImGui::IsMouseDown(0) && g_selected_object >= 0) {
-                            ray rnow = ScreenPointToRay(g_editor_cam, tex_w, tex_h, local_x, local_y);
+                            ray rnow = ScreenPointToRay(g_editor_cam, tex_w, tex_h, (float)sx, (float)sy);
                             const auto& obj = g_scene.objects[g_selected_object];
                             vec3 origin = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-                            float tmpModel[16];
-                            make_model_trs(vec3(0,0,0), obj.rotation_deg, vec3(1,1,1), tmpModel);
-                            vec3 axes[3] = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
-                            auto transform_vec3_by_model = [&](const float M[16], const vec3& v) {
-                                return vec3(
-                                    M[0]*v.x() + M[1]*v.y() + M[2]*v.z(),
-                                    M[4]*v.x() + M[5]*v.y() + M[6]*v.z(),
-                                    M[8]*v.x() + M[9]*v.y() + M[10]*v.z()
-                                );
-                            };
-                            vec3 axis_world = unit_vector(transform_vec3_by_model(tmpModel, axes[g_active_gizmo_axis]));
+                            // World-aligned axis for dragging
+                            vec3 axis_world = vec3(0,0,0);
+                            if (g_active_gizmo_axis == 0) axis_world = vec3(1,0,0);
+                            else if (g_active_gizmo_axis == 1) axis_world = vec3(0,1,0);
+                            else if (g_active_gizmo_axis == 2) axis_world = vec3(0,0,1);
+                            axis_world = unit_vector(axis_world);
 
                             double s_now, t_now;
                             if (ClosestPointsBetweenLines(origin, axis_world, rnow.origin(), rnow.direction(), s_now, t_now)) {

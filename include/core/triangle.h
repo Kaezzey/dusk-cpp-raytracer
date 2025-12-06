@@ -8,6 +8,10 @@
 #include "AABB.h"
 #include "vec3.h"
 
+#ifdef HAVE_EMBREE
+#include "embree_accel.h"
+#endif
+
 inline void compute_triangle_tangent_bitangent(
     const point3& p0, const point3& p1, const point3& p2,
     double u0, double v0,
@@ -325,8 +329,13 @@ public:
             return;
         }
 
+#ifdef HAVE_EMBREE
+        // Use Embree-backed accel when available for faster ray/triangle traversal.
+        accel = make_shared<embree_triangle_accel>(*this);
+#else
         // Wrap in BVH directly
         accel = make_shared<bvh_node>(triangles, 0, triangles.size());
+#endif
     }
 
     bool hit(const ray& r, interval ray_t, hit_record& rec) const override {

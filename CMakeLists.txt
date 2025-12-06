@@ -113,6 +113,85 @@ target_include_directories(Dusktracer PRIVATE ${ASSIMP_INCLUDE_DIR})
 target_link_libraries(Dusktracer PRIVATE ${ASSIMP_LIB_RELEASE})
 
 # ---------------------------------------------------------------------------
+# OpenImageDenoise (optional)
+# Auto-detect SDK under external/OpenImageDenoise so a plain `cmake ..` works
+# ---------------------------------------------------------------------------
+set(OIDN_SDK_DIR "${CMAKE_SOURCE_DIR}/external/OpenImageDenoise")
+set(OIDN_SDK_EXISTS FALSE)
+if (EXISTS "${OIDN_SDK_DIR}/include" AND EXISTS "${OIDN_SDK_DIR}/lib")
+    set(OIDN_SDK_EXISTS TRUE)
+endif()
+
+# ---------------------------------------------------------------------------
+# Embree (optional)
+# Auto-detect SDK under external/embree so a plain `cmake ..` works
+# ---------------------------------------------------------------------------
+set(EMBREE_SDK_DIR "${CMAKE_SOURCE_DIR}/external/embree")
+set(EMBREE_SDK_EXISTS FALSE)
+if (EXISTS "${EMBREE_SDK_DIR}/include" AND EXISTS "${EMBREE_SDK_DIR}/lib")
+    set(EMBREE_SDK_EXISTS TRUE)
+endif()
+
+# Default USE_EMBREE to ON. Configure will fail if Embree is requested but not found.
+option(USE_EMBREE "Enable Intel Embree acceleration support" ON)
+if (USE_EMBREE)
+    # Prefer embree3 layout but also accept embree4 (some SDK distributions use embree4/)
+    find_path(EMBREE_INCLUDE_DIR NAMES "embree3/rtcore.h" PATHS "${EMBREE_SDK_DIR}/include" NO_DEFAULT_PATH)
+    if (NOT EMBREE_INCLUDE_DIR)
+        find_path(EMBREE_INCLUDE_DIR NAMES "embree4/rtcore.h" PATHS "${EMBREE_SDK_DIR}/include" NO_DEFAULT_PATH)
+    endif()
+
+    # Try common library names including embree4.lib on Windows
+    find_library(EMBREE_LIBRARY NAMES embree4 embree3 Embree4 Embree3 rtcore PATHS "${EMBREE_SDK_DIR}/lib" NO_DEFAULT_PATH)
+
+    if (NOT EMBREE_INCLUDE_DIR)
+        find_path(EMBREE_INCLUDE_DIR NAMES "embree3/rtcore.h")
+    endif()
+    if (NOT EMBREE_LIBRARY)
+        find_library(EMBREE_LIBRARY NAMES embree3 Embree3 rtcore)
+    endif()
+
+    if (EMBREE_INCLUDE_DIR AND EMBREE_LIBRARY)
+        add_library(Embree::Embree UNKNOWN IMPORTED)
+        set_target_properties(Embree::Embree PROPERTIES
+            IMPORTED_LOCATION "${EMBREE_LIBRARY}" )
+        target_include_directories(Embree::Embree INTERFACE ${EMBREE_INCLUDE_DIR})
+        target_link_libraries(Dusktracer PRIVATE Embree::Embree)
+        target_compile_definitions(Dusktracer PRIVATE HAVE_EMBREE=1)
+        message(STATUS "Embree found: ${EMBREE_LIBRARY}")
+    else()
+        message(FATAL_ERROR "USE_EMBREE=ON but Embree not found. Please install Embree into 'external/embree' or re-run CMake with -DUSE_EMBREE=OFF to proceed without Embree.")
+    endif()
+endif()
+
+# Default USE_OIDN to ON when the SDK folder is present so plain `cmake ..` enables it.
+option(USE_OIDN "Enable OpenImageDenoise support" ${OIDN_SDK_EXISTS})
+if (USE_OIDN)
+    # Prefer explicit SDK subfolders, fall back to system search if not found there.
+    find_path(OIDN_INCLUDE_DIR NAMES "OpenImageDenoise/oidn.hpp" PATHS "${OIDN_SDK_DIR}/include" NO_DEFAULT_PATH)
+    find_library(OIDN_LIBRARY NAMES OpenImageDenoise OpenImageDenoise.lib oidn oidn.lib PATHS "${OIDN_SDK_DIR}/lib" NO_DEFAULT_PATH)
+
+    if (NOT OIDN_INCLUDE_DIR)
+        find_path(OIDN_INCLUDE_DIR NAMES "OpenImageDenoise/oidn.hpp")
+    endif()
+    if (NOT OIDN_LIBRARY)
+        find_library(OIDN_LIBRARY NAMES OpenImageDenoise oidn PATHS "${CMAKE_SOURCE_DIR}/external/" ENV PATH)
+    endif()
+
+    if (OIDN_INCLUDE_DIR AND OIDN_LIBRARY)
+        add_library(OpenImageDenoise::OpenImageDenoise UNKNOWN IMPORTED)
+        set_target_properties(OpenImageDenoise::OpenImageDenoise PROPERTIES
+            IMPORTED_LOCATION "${OIDN_LIBRARY}" )
+        target_include_directories(OpenImageDenoise::OpenImageDenoise INTERFACE ${OIDN_INCLUDE_DIR})
+        target_link_libraries(Dusktracer PRIVATE OpenImageDenoise::OpenImageDenoise)
+        target_compile_definitions(Dusktracer PRIVATE HAVE_OIDN=1)
+        message(STATUS "OpenImageDenoise found: ${OIDN_LIBRARY}")
+    else()
+        message(WARNING "USE_OIDN=ON but OpenImageDenoise not found. Denoiser will be disabled.")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # OpenGL + link ImGui + GLFW + GLEW into the editor
 # ---------------------------------------------------------------------------
 find_package(OpenGL REQUIRED)
@@ -179,3 +258,25 @@ add_custom_command(TARGET Dusktracer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
         "$<TARGET_FILE_DIR:Dusktracer>/Renders"
 )
+
+# ---------------------------------------------------------------------------
+# Post-build: copy OpenImageDenoise runtime DLLs if available
+# ---------------------------------------------------------------------------
+if (EXISTS "${CMAKE_SOURCE_DIR}/external/OpenImageDenoise/bin")
+    add_custom_command(TARGET Dusktracer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/external/OpenImageDenoise/bin"
+            "$<TARGET_FILE_DIR:Dusktracer>"
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# Post-build: copy Embree runtime DLLs if available
+# ---------------------------------------------------------------------------
+if (EXISTS "${CMAKE_SOURCE_DIR}/external/embree/bin")
+    add_custom_command(TARGET Dusktracer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/external/embree/bin"
+            "$<TARGET_FILE_DIR:Dusktracer>"
+    )
+endif()

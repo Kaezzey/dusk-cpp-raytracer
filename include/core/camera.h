@@ -52,6 +52,7 @@ class camera {
     vec3   sun_dir = vec3(0,0,0);
     colour sun_radiance = colour(0,0,0);
     double sun_angular_radius = 0.0;
+    int    sun_shadow_samples = 8; // number of shadow samples for soft sun (0 = off)
 
     void render(const hittable& world, std::ostream& out = std::cout){
         
@@ -191,7 +192,14 @@ class camera {
     vec3 defocus_disk_v;
 
     void initialize() {
-        image_height = int(image_width / aspect_ratio);
+        // If the caller explicitly set an image_height (e.g. via the Editor UI),
+        // honour that value. Otherwise compute height from width and aspect ratio.
+        if (image_height <= 0) {
+            image_height = int(image_width / aspect_ratio);
+        } else {
+            // Keep aspect ratio in sync with the explicitly requested resolution.
+            aspect_ratio = double(image_width) / double(image_height);
+        }
         image_height = (image_height < 1) ? 1 : image_height;
 
         pixel_samples_scale = 1.0 / samples_per_pixel;
@@ -288,7 +296,8 @@ class camera {
         return double(nn) / double(0x7fffffffu);
     }
 
-    colour ray_colour(const ray& r0, int max_depth, const hittable& world) const {
+    // Optionally returns the first-hit surface albedo and normal via out parameters
+    colour ray_colour(const ray& r0, int max_depth, const hittable& world, colour* out_albedo = nullptr, vec3* out_normal = nullptr) const {
         ray    current_ray = r0;
         colour throughput(1.0, 1.0, 1.0);
         colour result(0,0,0);
@@ -301,6 +310,17 @@ class camera {
             if (!world.hit(current_ray, interval(0.001, infinity), rec)) {
                 result += throughput * background;
                 break;
+            }
+
+            // On the first surface hit, optionally return albedo and normal for AOVs
+            if (depth == 0) {
+                if (out_albedo) {
+                    if (rec.mat) *out_albedo = rec.mat->albedo(rec);
+                    else *out_albedo = colour(0,0,0);
+                }
+                if (out_normal) {
+                    *out_normal = rec.normal;
+                }
             }
 
             // Emission at the hit point
@@ -316,32 +336,62 @@ class camera {
                 break;
             }
 
-            //reimplement later
-            // if (use_sun) {
+            // Sun lighting (directional/emissive sun disk) with soft shadow sampling.
+            if (use_sun) {
+                // central sun direction (FROM scene toward sun)
+                vec3 Lc = unit_vector(sun_dir);
+                double NdotLc = dot(rec.normal, Lc);
+                if (NdotLc > 0.0) {
+                    // If angular radius is effectively zero or samples == 1, do a single shadow ray
+                    int samples = std::max(1, sun_shadow_samples);
+                    double ang_rad = degrees_to_radians(sun_angular_radius);
+                    double cos_theta_max = std::cos(ang_rad);
 
-            //     vec3 L = unit_vector(sun_dir);
-            //     double NdotL = dot(rec.normal, L);
+                    double vis = 0.0;
+                    for (int si = 0; si < samples; ++si) {
+                        vec3 Ls = Lc;
+                        if (ang_rad > 0.0 && samples > 1) {
+                            // sample a direction within the spherical cap around Lc
+                            double u = random_double();
+                            double v = random_double();
+                            double cos_theta = (1.0 - u) + u * cos_theta_max; // mix in [1, cos_theta_max]
+                            double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
+                            double phi = 2.0 * pi * v;
 
-            //     if (NdotL > 0.0) {
+                            // sample direction in local coordinates (z = center)
+                            double x = sin_theta * std::cos(phi);
+                            double y = sin_theta * std::sin(phi);
+                            double z = cos_theta;
 
-            //         // IMPORTANT: ray has THREE args: origin, dir, time
-            //         ray shadow_ray(
-            //             rec.p + rec.normal * 0.001,
-            //             L,
-            //             current_ray.time()
-            //         );
+                            // build orthonormal basis around Lc
+                            vec3 w_s = Lc;
+                            vec3 a = (std::fabs(w_s.x()) > 0.1) ? vec3(0,1,0) : vec3(1,0,0);
+                            vec3 u_s = unit_vector(cross(a, w_s));
+                            vec3 v_s = cross(w_s, u_s);
 
-            //         hit_record shadow_rec;
+                            Ls = unit_vector(u_s * (float)x + v_s * (float)y + w_s * (float)z);
+                        }
 
-            //         if (!world.hit(shadow_ray, interval(0.001, infinity), shadow_rec)) {
+                        double NdotL = dot(rec.normal, Ls);
+                        if (NdotL <= 0.0) continue;
 
-            //             colour base = rec.mat->albedo(rec);
-            //             colour direct = base * sun_radiance * (NdotL / pi);
+                        // shadow ray from slightly offset point
+                        ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
+                        hit_record shadow_rec;
+                        if (!world.hit(shadow_ray, interval(0.001, infinity), shadow_rec)) {
+                            vis += 1.0;
+                        }
+                    }
 
-            //             result += throughput * direct;
-            //         }
-            //     }
-            // }
+                    vis /= double(samples);
+                    if (vis > 0.0) {
+                        // Evaluate material-specific direct shading (PBR-aware override)
+                        vec3 V = -unit_vector(current_ray.direction());
+                        colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance);
+                        result += throughput * (direct * (float)vis);
+                    }
+                }
+            }
 
             // Update throughput & ray
             throughput = throughput * attenuation;
