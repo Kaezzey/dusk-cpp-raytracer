@@ -15,6 +15,7 @@ It serves as a hands-on exploration of real-time editor systems, physically-base
 
 ## Active Editor
 <img width="2560" alt="Dusktracer Editor" src="https://github.com/user-attachments/assets/dc21bea5-6b67-4773-aad5-7f60da5d536c" />
+<img width="2560" height="1440" alt="CornellBoxHero" src="https://github.com/user-attachments/assets/1d30c475-d0f5-4bd1-8490-e4351e90b866" />
 
 ---
 
