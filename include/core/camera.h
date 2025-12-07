@@ -48,6 +48,7 @@ class camera {
     enum sampling_method_e { RANDOM_SAMPLES = 0, HALTON_SAMPLES = 1 };
     sampling_method_e sampling_method = HALTON_SAMPLES;
 
+    // Camera-side directional sun fields (can be mirrored from scene directional light)
     bool   use_sun = false;
     vec3   sun_dir = vec3(0,0,0);
     colour sun_radiance = colour(0,0,0);
@@ -336,13 +337,12 @@ class camera {
                 break;
             }
 
-            // Sun lighting (directional/emissive sun disk) with soft shadow sampling.
+            // Directional sun (camera-mirrored) support: sample soft sun/shadows if enabled.
             if (use_sun) {
                 // central sun direction (FROM scene toward sun)
                 vec3 Lc = unit_vector(sun_dir);
                 double NdotLc = dot(rec.normal, Lc);
                 if (NdotLc > 0.0) {
-                    // If angular radius is effectively zero or samples == 1, do a single shadow ray
                     int samples = std::max(1, sun_shadow_samples);
                     double ang_rad = degrees_to_radians(sun_angular_radius);
                     double cos_theta_max = std::cos(ang_rad);
@@ -358,7 +358,6 @@ class camera {
                             double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
                             double phi = 2.0 * pi * v;
 
-                            // sample direction in local coordinates (z = center)
                             double x = sin_theta * std::cos(phi);
                             double y = sin_theta * std::sin(phi);
                             double z = cos_theta;
@@ -375,7 +374,6 @@ class camera {
                         double NdotL = dot(rec.normal, Ls);
                         if (NdotL <= 0.0) continue;
 
-                        // shadow ray from slightly offset point
                         ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
                         hit_record shadow_rec;
                         if (!world.hit(shadow_ray, interval(0.001, infinity), shadow_rec)) {
@@ -385,7 +383,6 @@ class camera {
 
                     vis /= double(samples);
                     if (vis > 0.0) {
-                        // Evaluate material-specific direct shading (PBR-aware override)
                         vec3 V = -unit_vector(current_ray.direction());
                         colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance);
                         result += throughput * (direct * (float)vis);

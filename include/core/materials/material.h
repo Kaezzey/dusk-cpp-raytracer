@@ -82,7 +82,7 @@ class material {
     // direct-diffuse lighting (e.g. lambert terms) for them.
         virtual bool is_specular() const { return false; }
 
-    // Direct-shading hook for direct lights (used by sun). Default is
+    // Direct-shading hook for direct lights. Default is
     // Lambertian: albedo * Li * (NdotL / pi). V is the view direction
     // (pointing out from the surface).
     virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const {
@@ -278,12 +278,9 @@ class dielectric : public material {
         // contribution = brdf_spec * Li * NdotL -> simplifies to (D*G*F)/(4*NdotV) * Li
         colour spec_term = F * (float)((D * G) / (4.0 * NdotV + 1e-12));
 
-        // Boost factor based on incoming radiance intensity so bright
-        // directional lights create larger, more visible highlights.
-        double incoming_lum = luminance(Li);
-        double boost = 1.0 + std::clamp(incoming_lum * 2.0, 0.0, 8.0);
-
-        return spec_term * (float)boost * Li;
+        // Final outgoing radiance: specular term * incoming radiance
+        // (No ad-hoc intensity boost; keep energy consistent.)
+        return spec_term * Li * (float)NdotL;
     }
 
     colour albedo(const hit_record& rec) const override {
@@ -599,6 +596,98 @@ public:
         attenuation = weight;
 
         return true;
+    }
+
+    // Proper PBR direct shading using GGX microfacet BRDF (energy-conserving)
+    virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const override {
+        // Reconstruct the shading normal from the normal map (if present)
+        vec3 Ngeom = rec.normal;
+        vec3 N = Ngeom;
+
+        // Use tangent & bitangent from hit_record as the ONB
+        vec3 T = rec.tangent;
+        vec3 B = rec.bitangent;
+
+        if (normal_tex) {
+            colour n_tex = normal_tex->value(rec.u, rec.v, rec.p);
+            vec3 n_tan_raw(
+                2.0 * n_tex.x() - 1.0,
+                2.0 * n_tex.y() - 1.0,
+                2.0 * n_tex.z() - 1.0
+            );
+
+            vec3 n_tan(
+                n_tan_raw.x() * normal_strength,
+                n_tan_raw.y() * normal_strength,
+                n_tan_raw.z()
+            );
+
+            n_tan = unit_vector(n_tan);
+
+            N = unit_vector(
+                n_tan.x() * T +
+                n_tan.y() * B +
+                n_tan.z() * Ngeom
+            );
+        }
+
+        // Same normal-map fade used in scatter: fade normal map at grazing angles
+        vec3 view_dir = unit_vector(V);
+        double NdotV_geo = std::max(0.0, dot(Ngeom, view_dir));
+        double strength = NdotV_geo * 5.0;
+        strength = std::clamp(strength, 0.0, 1.0);
+        N = unit_vector(N * strength + Ngeom * (1.0 - strength));
+        vec3 L = unit_vector(Ldir);
+        vec3 Vn = unit_vector(V);
+
+        double NdotL = std::max(0.0, dot(N, L));
+        double NdotV = std::max(0.0, dot(N, Vn));
+        if (NdotL <= 0.0 || NdotV <= 0.0) return colour(0,0,0);
+
+        // Fetch material parameters at this shading point
+        colour baseColor = base_tex ? base_tex->value(rec.u, rec.v, rec.p) : colour(1,1,1);
+        double metallic = metallic_tex ? luminance(metallic_tex->value(rec.u, rec.v, rec.p)) : 0.0;
+        double rough = roughness_tex ? luminance(roughness_tex->value(rec.u, rec.v, rec.p)) : 0.5;
+        metallic = clamp01(metallic);
+        rough    = clamp01(rough);
+        double alpha = perceptual_to_alpha(rough);
+
+        // F0 mix between dielectric F0 and baseColor for metals
+        colour F0 = (vec3(1.0,1.0,1.0) - vec3(metallic, metallic, metallic)) * dielectric_F0
+                    + vec3(metallic, metallic, metallic) * baseColor;
+
+        // Half vector
+        vec3 H = unit_vector(L + Vn);
+        double NdotH = std::max(1e-6, dot(N, H));
+        double VdotH = std::max(1e-6, dot(Vn, H));
+
+        // Microfacet D term (GGX)
+        double a2 = alpha * alpha;
+        double denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+        double D = (a2) / (pi * denom * denom + 1e-12);
+
+        // Smith G (Schlick-GGX)
+        double k = (alpha * alpha) / 2.0;
+        auto geometry_schlick = [&](double NdotX) {
+            return NdotX / (NdotX * (1.0 - k) + k);
+        };
+        double G = geometry_schlick(NdotV) * geometry_schlick(NdotL);
+
+        // Fresnel
+        colour F = schlick_fresnel(std::max(0.0, VdotH), F0);
+
+        // Specular BRDF value
+        colour spec = F * (float)((D * G) / (4.0 * NdotV * NdotL + 1e-12));
+
+        // Diffuse term (energy-conserving): (1 - metallic) * baseColor * (1 - Favg) / pi
+        double Favg = (F0.x() + F0.y() + F0.z()) / 3.0;
+        colour kd = baseColor * (1.0 - metallic);
+        kd *= (1.0 - Favg);
+
+        colour brdf = kd * (float)(1.0 / pi) + spec;
+
+        // Final outgoing radiance: f * Li * cosθ
+        return brdf * Li * (float)NdotL;
     }
 };
 

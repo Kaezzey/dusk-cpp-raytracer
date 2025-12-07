@@ -37,6 +37,8 @@ public:
     // 0.0 = off (stronger = smoother, typical 0.2-0.5), interpreted by OIDN when enabled
     double denoiser_strength = 0.0;
 
+    // Photon mapping removed: no-op (was used for caustic photon pre-pass)
+
     // Adaptive sampling: when enabled, the renderer will estimate per-pixel
     // variance and stop sampling a pixel early when its estimate of the
     // pixel mean has sufficiently low standard error.

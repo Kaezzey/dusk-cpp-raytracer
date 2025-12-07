@@ -140,13 +140,16 @@ enum class scene_light_type {
 
 struct scene_light {
     std::string      name;
-    scene_light_type type = scene_light_type::directional;
+    scene_light_type type = scene_light_type::point;
 
-    // Radiance / intensity * colour
+    // Radiance / intensity (radiance for directional, intensity for point)
     vec3   radiance  = vec3(1.0, 1.0, 1.0);
 
     // Directional light: direction *from light toward scene*, normalized
     vec3   direction = vec3(-1, -1, -1);
+
+    // Directional light angular radius (degrees). 0 = delta directional
+    double angular_radius_deg = 0.0;
 
     // Point light: world position + simple range
     point3 position  = point3(0, 5, 0);

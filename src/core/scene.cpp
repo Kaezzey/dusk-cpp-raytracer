@@ -330,13 +330,14 @@ hittable_list build_world_from_scene(const scene& scn)
         if (!tri_list || tri_list->objects.empty())
             continue;
 
-        // Build BVH for this instance's triangles
-        auto bvh = std::make_shared<bvh_node>(
-            tri_list->objects, 0, tri_list->objects.size()
-        );
+        // Build an acceleration structure for this instance's triangles.
+        // Prefer `triangle_mesh`, which will use an Embree-backed accel when
+        // compiled with Embree support (HAVE_EMBREE). If Embree is not
+        // available, `triangle_mesh` falls back to a BVH.
+        auto tri_mesh = std::make_shared<triangle_mesh>(tri_list->objects);
 
         // Apply instance transform (translation, rotation_deg, uniform scale)
-            vec3 scl = obj.scale;
+        vec3 scl = obj.scale;
             if (scl.x() <= 0.0) scl = vec3(1.0, scl.y(), scl.z());
             if (scl.y() <= 0.0) scl = vec3(scl.x(), 1.0, scl.z());
             if (scl.z() <= 0.0) scl = vec3(scl.x(), scl.y(), 1.0);
@@ -344,7 +345,7 @@ hittable_list build_world_from_scene(const scene& scn)
             vec3 translation = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
 
             auto inst = std::make_shared<transform>(
-                bvh,
+                tri_mesh,
                 translation,
                 obj.rotation_deg,  // degrees
                 scl

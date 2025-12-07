@@ -23,6 +23,12 @@ inline double degrees_to_radians(double degrees) {
     return degrees * pi / 180.0;
 }
 
+// Ensure M_PI is available on MSVC and other environments that don't
+// expose it by default when <cmath> is included.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 // ------------------------------------------------------
 //       FAST PER-THREAD RNG (xorshift64*)
 // ------------------------------------------------------

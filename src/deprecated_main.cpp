@@ -9,7 +9,7 @@
 #include "../../include/core/quad.h"
 #include "../../include/core/sphere.h"
 #include "../../include/core/triangle.h"
-#include "../../include/core/sun.h"
+// directional helpers removed; directional lighting support deprecated
 #include "../../include/core/materials/texture.h"
 #include "../../include/core/mesh_loader.h"
 

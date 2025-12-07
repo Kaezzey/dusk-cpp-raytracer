@@ -146,8 +146,7 @@ static GLsizei g_rasterCubeIndexCount   = 0;
 static std::vector<gpu_mesh> g_gpu_meshes;
 
 // Per-light transient UI state: yaw (degrees) and time-of-day (0..24)
-static std::vector<double> g_light_yaw_deg;
-static std::vector<double> g_light_time_of_day;
+// Per-light transient UI state removed (directional controls removed)
 
 static GLuint g_rasterFBO      = 0;
 static GLuint g_rasterColorTex = 0;
@@ -168,9 +167,7 @@ static GLuint g_gizmoVBO       = 0;
 static GLuint g_gizmoConeVAO   = 0;
 static GLuint g_gizmoConeVBO   = 0;
 static int    g_gizmoConeVertexCount = 0;
-// Sun gizmo (line) buffers
-static GLuint g_sunGizmoVAO = 0;
-static GLuint g_sunGizmoVBO = 0;
+// Legacy gizmo buffers (directional gizmo removed)
 // CPU-side copy of cone triangle positions for precise hit-testing
 static std::vector<vec3> g_gizmoConeTriangles;
 static int g_gizmoConeSegments = 16;
@@ -391,11 +388,16 @@ static void export_scene_as_cpp(const scene& scn, const std::string& path)
     // Lights
     for (const auto& L : scn.lights) {
         out << "scn.lights.push_back({\"" << esc(L.name) << "\", ";
-        out << (L.type == scene_light_type::directional ? "scene_light_type::directional" : "scene_light_type::point");
+        if (L.type == scene_light_type::directional) {
+            out << "scene_light_type::directional";
+        } else {
+            out << "scene_light_type::point";
+        }
         out << "});\n";
         out << "scn.lights.back().radiance = vec3(" << L.radiance.x() << ", " << L.radiance.y() << ", " << L.radiance.z() << ");\n";
         if (L.type == scene_light_type::directional) {
             out << "scn.lights.back().direction = vec3(" << L.direction.x() << ", " << L.direction.y() << ", " << L.direction.z() << ");\n";
+            out << "scn.lights.back().angular_radius_deg = " << L.angular_radius_deg << ";\n";
         } else {
             out << "scn.lights.back().position = point3(" << L.position.x() << ", " << L.position.y() << ", " << L.position.z() << ");\n";
             out << "scn.lights.back().range = " << L.range << ";\n";
@@ -1496,8 +1498,15 @@ static void RenderRasterToTexture(int width, int height)
     glUniformMatrix4fv(locView, 1, GL_FALSE, view);
     glUniformMatrix4fv(locProj, 1, GL_FALSE, proj);
 
-    vec3 L = unit_vector(vec3(-1.0, -1.0, -0.5));
-    glUniform3f(locLightDir, (float)L.x(), (float)L.y(), (float)L.z());
+    // Raster viewport: prefer camera sun direction if enabled, otherwise use a fixed preview light
+    vec3 lightDir;
+    if (g_camera.use_sun && !g_camera.sun_dir.near_zero()) {
+        // g_camera.sun_dir is from scene -> sun; raster uniform expects light -> scene
+        lightDir = unit_vector(-g_camera.sun_dir);
+    } else {
+        lightDir = unit_vector(vec3(-1.0, -1.0, -0.5));
+    }
+    glUniform3f(locLightDir, (float)lightDir.x(), (float)lightDir.y(), (float)lightDir.z());
 
     for (const auto& obj : g_scene.objects)
     {
@@ -1581,70 +1590,7 @@ static void RenderRasterToTexture(int width, int height)
         }
     }
 
-    // Draw a small sun gizmo (yellow line) in the preview to indicate sun direction
-    if (g_lineShader != 0) {
-        // find first directional light
-        int sun_idx = -1;
-        for (size_t li = 0; li < g_scene.lights.size(); ++li) {
-            if (g_scene.lights[li].type == scene_light_type::directional) { sun_idx = (int)li; break; }
-        }
-
-        if (sun_idx >= 0) {
-            const auto& L = g_scene.lights[sun_idx];
-            // direction from scene toward light; we want arrow pointing to sun (sky) => -L.direction
-            vec3 arrow = unit_vector(vec3(-L.direction.x(), -L.direction.y(), -L.direction.z()));
-
-            // position the gizmo near the camera in world space so it's always visible
-            vec3 start = g_editor_cam.position + g_editor_cam.forward * 2.0f + g_editor_cam.up * -0.5f + g_editor_cam.right * 1.0f;
-            vec3 end   = start + arrow * 1.5f;
-
-            // build vertex data: pos.xyz, color.rgb
-            float verts[12];
-            verts[0] = (float)start.x(); verts[1] = (float)start.y(); verts[2] = (float)start.z(); verts[3] = 1.0f; verts[4] = 1.0f; verts[5] = 0.0f;
-            verts[6] = (float)end.x();   verts[7] = (float)end.y();   verts[8] = (float)end.z();   verts[9] = 1.0f; verts[10] = 1.0f; verts[11] = 0.0f;
-
-            // init VAO/VBO if needed
-            if (g_sunGizmoVAO == 0) {
-                glGenVertexArrays(1, &g_sunGizmoVAO);
-                glGenBuffers(1, &g_sunGizmoVBO);
-                glBindVertexArray(g_sunGizmoVAO);
-                glBindBuffer(GL_ARRAY_BUFFER, g_sunGizmoVBO);
-                glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
-                glEnableVertexAttribArray(0);
-                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-                glEnableVertexAttribArray(1);
-                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
-                glBindVertexArray(0);
-            } else {
-                // update vertex buffer
-                glBindBuffer(GL_ARRAY_BUFFER, g_sunGizmoVBO);
-                glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
-            }
-
-            // save depth state and draw on top
-            GLboolean wasDepthTest = glIsEnabled(GL_DEPTH_TEST);
-            GLint prevDepthFunc = 0; glGetIntegerv(GL_DEPTH_FUNC, &prevDepthFunc);
-            glDisable(GL_DEPTH_TEST);
-
-            glUseProgram(g_lineShader);
-            GLint locModelL = glGetUniformLocation(g_lineShader, "uModel");
-            GLint locViewL  = glGetUniformLocation(g_lineShader, "uView");
-            GLint locProjL  = glGetUniformLocation(g_lineShader, "uProj");
-            // identity model (verts in world space)
-            float modelId[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-            glUniformMatrix4fv(locViewL, 1, GL_FALSE, view);
-            glUniformMatrix4fv(locProjL, 1, GL_FALSE, proj);
-            glUniformMatrix4fv(locModelL, 1, GL_FALSE, modelId);
-
-            glBindVertexArray(g_sunGizmoVAO);
-            glDrawArrays(GL_LINES, 0, 2);
-            glBindVertexArray(0);
-
-            glUseProgram(0);
-            if (wasDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-            glDepthFunc(prevDepthFunc);
-        }
-    }
+    // Directional support removed: viewport lighting uses a fixed preview light.
 
     // Draw gizmo (render into raster FBO so it appears in the preview)
     if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size() && g_lineShader != 0) {
@@ -3162,27 +3108,40 @@ int main()
         // ---------------------------------------------------------------------
         ImGui::Begin("Lights");
 
-        // Keep transient UI arrays in sync with scene lights
-        if (g_light_yaw_deg.size() != g_scene.lights.size()) {
-            g_light_yaw_deg.resize(g_scene.lights.size(), 0.0);
-        }
-        if (g_light_time_of_day.size() != g_scene.lights.size()) {
-            g_light_time_of_day.resize(g_scene.lights.size(), 12.0);
-        }
+        // Lights support both Point and Directional (Sun) types.
 
         ImGui::Text("Scene Lights (%d)", (int)g_scene.lights.size());
         ImGui::Separator();
 
+        if (ImGui::Button("Add Light")) {
+            scene_light sl;
+            sl.name = "Light";
+            sl.type = scene_light_type::point;
+            sl.radiance = vec3(3.0, 3.0, 3.0);
+            sl.position = point3(0.0, 5.0, 0.0);
+            sl.range = 10.0;
+            g_scene.lights.push_back(sl);
+            g_world_dirty = true;
+            g_cached_world.reset();
+        }
+
+        ImGui::SameLine();
         if (ImGui::Button("Add Sun")) {
             scene_light sl;
             sl.name = "Sun";
             sl.type = scene_light_type::directional;
-            sl.radiance = vec3(3.0, 3.0, 3.0);
-            sl.direction = vec3(-0.666667, -0.666667, -0.333333);
+            sl.radiance = vec3(20.0, 20.0, 20.0);
+            sl.direction = unit_vector(vec3(-0.3, -1.0, 0.2));
+            sl.angular_radius_deg = 0.53; // approximate real sun radius in degrees
             g_scene.lights.push_back(sl);
-            // push default UI state
-            g_light_yaw_deg.push_back(0.0);
-            g_light_time_of_day.push_back(12.0);
+
+            // Mirror into camera preview defaults
+            g_camera.use_sun = true;
+            g_camera.sun_dir = -sl.direction;
+            g_camera.sun_radiance = colour(sl.radiance.x(), sl.radiance.y(), sl.radiance.z());
+            g_camera.sun_angular_radius = sl.angular_radius_deg;
+            g_camera.sun_shadow_samples = 16;
+
             g_world_dirty = true;
             g_cached_world.reset();
         }
@@ -3190,8 +3149,6 @@ int main()
         ImGui::SameLine();
         if (ImGui::Button("Remove Last Light") && !g_scene.lights.empty()) {
             g_scene.lights.pop_back();
-            if (!g_light_yaw_deg.empty()) g_light_yaw_deg.pop_back();
-            if (!g_light_time_of_day.empty()) g_light_time_of_day.pop_back();
             g_world_dirty = true;
             g_cached_world.reset();
         }
@@ -3219,7 +3176,7 @@ int main()
                 float color[3] = { radR / intensity, radG / intensity, radB / intensity };
 
                 bool changed = false;
-                if (ImGui::ColorEdit3("Sun Color", color)) {
+                if (ImGui::ColorEdit3("Light Color", color)) {
                     changed = true;
                 }
                 float inten_f = intensity;
@@ -3233,53 +3190,62 @@ int main()
                     g_world_dirty = true; g_cached_world.reset();
                 }
 
-                // Type
                 if (L.type == scene_light_type::directional) {
                     ImGui::TextDisabled("Type: Directional");
 
-                    // yaw around Y (degrees)
-                    double yaw = g_light_yaw_deg[li];
-                    double yaw_min = -180.0, yaw_max = 180.0;
-                    if (ImGui::SliderScalar("Yaw (deg)", ImGuiDataType_Double, &yaw, &yaw_min, &yaw_max)) {
-                        g_light_yaw_deg[li] = yaw;
+                    // Convert stored light.direction (light -> scene) to a user-friendly
+                    // sun direction from scene -> sun for angles. We expose Azimuth and
+                    // Elevation (degrees) sliders which are easier to reason about.
+                    vec3 sun_dir = -L.direction; // scene -> sun
+
+                    // Compute azimuth (0..360) and elevation (-90..90) from sun_dir
+                    double toDeg = 180.0 / 3.14159265358979323846;
+                    double toRad = 3.14159265358979323846 / 180.0;
+                    double az = std::atan2((double)sun_dir.z(), (double)sun_dir.x()) * toDeg;
+                    if (az < 0.0) az += 360.0;
+                    double el = std::asin(std::clamp((double)sun_dir.y(), -1.0, 1.0)) * toDeg;
+
+                    float azf = (float)az;
+                    float elf = (float)el;
+                    bool ang_changed = false;
+                    if (ImGui::SliderFloat("Azimuth (deg)", &azf, 0.0f, 360.0f)) ang_changed = true;
+                    if (ImGui::SliderFloat("Elevation (deg)", &elf, -90.0f, 90.0f)) ang_changed = true;
+
+                    if (ang_changed) {
+                        double azr = (double)azf * toRad;
+                        double elr = (double)elf * toRad;
+                        vec3 new_sun_dir((float)(std::cos(elr) * std::cos(azr)),
+                                         (float)std::sin(elr),
+                                         (float)(std::cos(elr) * std::sin(azr)));
+                        L.direction = -new_sun_dir; // store as light -> scene
+                        g_world_dirty = true; g_cached_world.reset();
+
+                        // Mirror into camera sun parameters for preview and renderer
+                        g_camera.use_sun = true;
+                        g_camera.sun_dir = new_sun_dir; // scene -> sun
+                        g_camera.sun_radiance = colour(L.radiance.x(), L.radiance.y(), L.radiance.z());
                     }
 
-                    // day cycle: 0..24
-                    double tod = g_light_time_of_day[li];
-                    double tod_min = 0.0, tod_max = 24.0;
-                    if (ImGui::SliderScalar("Time of day", ImGuiDataType_Double, &tod, &tod_min, &tod_max)) {
-                        g_light_time_of_day[li] = tod;
+                    // Show computed direction (read-only) for clarity
+                    float dirf[3] = { (float)L.direction.x(), (float)L.direction.y(), (float)L.direction.z() };
+                    ImGui::Text("Direction (light->scene): %.3f, %.3f, %.3f", dirf[0], dirf[1], dirf[2]);
+
+                    // Angular radius control (degrees)
+                    double angv = L.angular_radius_deg;
+                    double ang_min = 0.0, ang_max = 10.0;
+                    if (ImGui::SliderScalar("Angular radius (deg)", ImGuiDataType_Double, &angv, &ang_min, &ang_max)) {
+                        L.angular_radius_deg = angv;
+                        g_camera.sun_angular_radius = angv;
+                        g_world_dirty = true; g_cached_world.reset();
                     }
 
-                    // Compute direction from yaw & time-of-day
-                    // elevation angle (deg) follows simple sine curve: 0@midnight, peak@noon
-                    double t = g_light_time_of_day[li];
-                    double elev_frac = std::sin(3.14159265358979323846 * (t / 24.0));
-                    double max_elev_deg = 80.0; // maximum elevation at noon
-                    double elev_deg = elev_frac * max_elev_deg;
-                    double yaw_rad = g_light_yaw_deg[li] * (3.14159265358979323846 / 180.0);
-                    double elev_rad = elev_deg * (3.14159265358979323846 / 180.0);
-
-                    double cos_theta = std::cos(elev_rad);
-                    double sin_theta = std::sin(elev_rad);
-
-                    // direction = (cosθ * sinφ, -sinθ, cosθ * cosφ)
-                    vec3 dir((float)(cos_theta * std::sin(yaw_rad)),
-                             (float)(-sin_theta),
-                             (float)(cos_theta * std::cos(yaw_rad)));
-
-                    L.direction = dir;
-
-                    // Mirror into camera sun parameters for preview/quick use
-                    // Note: `scene_light.direction` is defined as "from light toward scene",
-                    // while the renderer and sun helper expect a direction *from scene toward sun*.
-                    // Pass the negated direction so gizmo, preview and shadow rays align.
-                    g_camera.use_sun = true;
-                    g_camera.sun_dir = -dir; // from scene toward sun
-                    g_camera.sun_radiance = colour(L.radiance.x(), L.radiance.y(), L.radiance.z());
-                    g_world_dirty = true; g_cached_world.reset();
-
-                    ImGui::Text("Computed direction: (%.3f, %.3f, %.3f)", (double)L.direction.x(), (double)L.direction.y(), (double)L.direction.z());
+                    int sun_samples = g_camera.sun_shadow_samples;
+                    if (ImGui::DragInt("Sun shadow samples", &sun_samples, 1, 0, 64)) {
+                        if (sun_samples < 0) sun_samples = 0;
+                        if (sun_samples > 256) sun_samples = 256;
+                        g_camera.sun_shadow_samples = sun_samples;
+                        g_world_dirty = true; g_cached_world.reset();
+                    }
                 } else {
                     ImGui::TextDisabled("Type: Point");
                     float posf[3] = { (float)L.position.x(), (float)L.position.y(), (float)L.position.z() };

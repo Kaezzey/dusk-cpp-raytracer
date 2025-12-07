@@ -3,7 +3,10 @@
 
 #include <cmath>        
 #include <iostream>   
-#include "dusktracer.h" 
+// Forward-declare RNG helpers to avoid pulling in `dusktracer.h` here
+// (including dusktracer.h from here caused a circular include with colour.h).
+double random_double();
+double random_double(double min, double max);
 
 class vec3 {
     public:
