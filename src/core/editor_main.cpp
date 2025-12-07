@@ -1590,6 +1590,31 @@ static void RenderRasterToTexture(int width, int height)
         }
     }
 
+    // Draw point-light icons in the raster preview
+    for (const auto& L : g_scene.lights) {
+        if (L.type != scene_light_type::point) continue;
+
+        float model[16];
+        vec3 trans = vec3((float)L.position.x(), (float)L.position.y(), (float)L.position.z());
+        vec3 rot = vec3(0,0,0);
+        // Icon size (small); optionally scale with range but keep readable
+        float icon_scale = 0.08f;
+        vec3 scl = vec3(icon_scale, icon_scale, icon_scale);
+
+        make_model_trs(trans, rot, scl, model);
+        glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
+
+        // Use light colour as icon colour (clamped)
+        float cr = std::min(1.0f, (float)L.radiance.x());
+        float cg = std::min(1.0f, (float)L.radiance.y());
+        float cb = std::min(1.0f, (float)L.radiance.z());
+        glUniform3f(locColor, cr, cg, cb);
+
+        glBindVertexArray(g_rasterSphereVAO);
+        glDrawElements(GL_TRIANGLES, g_rasterSphereIndexCount,
+                       GL_UNSIGNED_INT, (void*)0);
+    }
+
     // Directional support removed: viewport lighting uses a fixed preview light.
 
     // Draw gizmo (render into raster FBO so it appears in the preview)
@@ -1971,6 +1996,25 @@ static void sync_camera_from_editor(float viewport_width, float viewport_height)
         g_camera.aspect_ratio = viewport_width / viewport_height;
     }
     to_shirley_camera(g_editor_cam, g_camera);
+
+    // Mirror scene lights into the RT camera for preview rendering.
+    g_camera.point_lights.clear();
+    g_camera.use_sun = false;
+    for (const auto& L : g_scene.lights) {
+        if (L.type == scene_light_type::directional) {
+            g_camera.use_sun = true;
+            // In UI 'Add Sun' we set sun_dir = -sl.direction, so mirror that here.
+            g_camera.sun_dir = -L.direction;
+            g_camera.sun_radiance = colour((float)L.radiance.x(), (float)L.radiance.y(), (float)L.radiance.z());
+            g_camera.sun_angular_radius = L.angular_radius_deg;
+        } else {
+            camera::point_light pl;
+            pl.position = L.position;
+            pl.radiance = colour((float)L.radiance.x(), (float)L.radiance.y(), (float)L.radiance.z());
+            pl.range = L.range;
+            g_camera.point_lights.push_back(pl);
+        }
+    }
 }
 
 // Convert render_result to RGBA8 texture

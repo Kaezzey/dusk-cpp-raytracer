@@ -55,6 +55,16 @@ class camera {
     double sun_angular_radius = 0.0;
     int    sun_shadow_samples = 8; // number of shadow samples for soft sun (0 = off)
 
+    // Point lights copied from the editor scene. Simple point lights with
+    // position, radiance, and optional range (range<=0 => infinite).
+    struct point_light {
+        point3 position = point3(0,0,0);
+        colour  radiance = colour(1,1,1);
+        double  range = 0.0; // if >0, max influence distance
+    };
+
+    std::vector<point_light> point_lights;
+
     void render(const hittable& world, std::ostream& out = std::cout){
         
         initialize();
@@ -388,6 +398,34 @@ class camera {
                         result += throughput * (direct * (float)vis);
                     }
                 }
+            }
+
+            // Point lights: simple single-sample point lights with inverse-square falloff
+            for (const auto& pl : point_lights) {
+                vec3 toLight = pl.position - rec.p;
+                double dist = toLight.length();
+                if (dist <= 1e-6) continue;
+                vec3 Ldir = unit_vector(toLight);
+
+                double NdotL = dot(rec.normal, Ldir);
+                if (NdotL <= 0.0) continue;
+
+                // Range culling
+                if (pl.range > 0.0 && dist > pl.range) continue;
+
+                // Shadow check: cast toward light, limit to distance
+                ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
+                hit_record shadow_rec;
+                bool occluded = world.hit(shadow_ray, interval(0.001, dist - 0.001), shadow_rec);
+                if (occluded) continue;
+
+                // Attenuate by inverse-square (clamp to avoid huge values)
+                double att = 1.0 / std::max(1e-4, dist * dist);
+                colour Li = pl.radiance * (float)att;
+
+                vec3 V = -unit_vector(current_ray.direction());
+                colour direct = rec.mat->shade_direct(rec, V, Ldir, Li);
+                result += throughput * direct;
             }
 
             // Update throughput & ray
