@@ -68,6 +68,9 @@ class image_texture : public texture {
   public:
     image_texture(const char* filename) : image(filename) {}
 
+    // Expose whether the loaded image contains an alpha channel.
+    bool has_alpha() const { return image.has_alpha(); }
+
     colour value(double u, double v, const point3& p) const override {
         //no texture data, then return solid cyan as a debugging aid
         if (image.height() <= 0) return colour(0,1,1);

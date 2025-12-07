@@ -171,6 +171,17 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
         std::shared_ptr<texture> alpha_tex =
             load_scene_texture(scn, m.alpha_tex); // can be nullptr
 
+        // Force double-sided masking if either an explicit alpha map is
+        // provided or the albedo texture contains an alpha channel.
+        bool effective_double_sided = m.alpha_double_sided;
+        if (alpha_tex) effective_double_sided = true;
+        else {
+            // If base_tex is an image_texture, query whether it has alpha.
+            if (auto img_tex = std::dynamic_pointer_cast<image_texture>(base_tex)) {
+                if (img_tex->has_alpha()) effective_double_sided = true;
+            }
+        }
+
         return std::make_shared<pbr_material>(
             base_tex,
             metallic_tex,
@@ -181,7 +192,7 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
                    m.dielectric_F0.y(),
                    m.dielectric_F0.z()),
             alpha_tex,
-            m.alpha_double_sided,
+            effective_double_sided,
             m.alpha_cutoff
         );
     }

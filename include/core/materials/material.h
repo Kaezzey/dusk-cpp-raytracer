@@ -453,11 +453,24 @@ public:
 
         double a_res = resolve_alpha(rec);
         if (alpha_double_sided || rec.front_face) {
-            if (a_res < alpha_cutoff) {
-                // Continue ray through transparent mask
+            // Fast-path fully transparent or opaque
+            if (a_res <= 0.0 || a_res < alpha_cutoff) {
                 scattered = ray(rec.p + r_in.direction() * 0.001, r_in.direction(), r_in.time());
                 attenuation = colour(1.0, 1.0, 1.0);
                 return true;
+            }
+
+            if (a_res >= 1.0) {
+                // fully opaque, continue into regular scattering
+            } else {
+                // Stochastic alpha: treat the hit as opaque with probability a_res,
+                // otherwise continue the ray (transparent). This produces soft
+                // alpha edges when averaged across multiple samples.
+                if (random_double() > a_res) {
+                    scattered = ray(rec.p + r_in.direction() * 0.001, r_in.direction(), r_in.time());
+                    attenuation = colour(1.0, 1.0, 1.0);
+                    return true;
+                }
             }
         }
 
@@ -646,7 +659,11 @@ public:
         if (alpha_tex) a_ds = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
         else if (base_tex) a_ds = base_tex->alpha_at(rec.u, rec.v, rec.p);
         if (alpha_double_sided || rec.front_face) {
-            if (a_ds < alpha_cutoff) return colour(0,0,0);
+            if (a_ds <= 0.0 || a_ds < alpha_cutoff) return colour(0,0,0);
+            if (a_ds < 1.0) {
+                // Stochastic test for direct lighting contribution.
+                if (random_double() > a_ds) return colour(0,0,0);
+            }
         }
         // Reconstruct the shading normal from the normal map (if present)
         vec3 Ngeom = rec.normal;
@@ -744,7 +761,10 @@ public:
             if (alpha_tex) a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
             else if (base_tex) a = base_tex->alpha_at(rec.u, rec.v, rec.p);
             if (alpha_double_sided || rec.front_face) {
-                return a < alpha_cutoff;
+                // Fast discard when clearly below cutoff or fully transparent.
+                if (a <= 0.0 || a < alpha_cutoff) return true;
+                // Stochastic discard: treat as miss with probability (1-a).
+                if (a < 1.0 && random_double() > a) return true;
             }
             return false;
         }
