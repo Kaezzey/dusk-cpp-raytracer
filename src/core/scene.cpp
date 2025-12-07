@@ -167,7 +167,10 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
         std::shared_ptr<texture> normal_tex =
             load_scene_texture(scn, m.normal_tex); // can be nullptr
 
-        // Construct PBR material (alpha/opacity not provided by scene material)
+        // Alpha map (optional)
+        std::shared_ptr<texture> alpha_tex =
+            load_scene_texture(scn, m.alpha_tex); // can be nullptr
+
         return std::make_shared<pbr_material>(
             base_tex,
             metallic_tex,
@@ -176,7 +179,10 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
             m.normal_strength,
             colour(m.dielectric_F0.x(),
                    m.dielectric_F0.y(),
-                   m.dielectric_F0.z())
+                   m.dielectric_F0.z()),
+            alpha_tex,
+            m.alpha_double_sided,
+            m.alpha_cutoff
         );
     }
 

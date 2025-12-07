@@ -49,11 +49,15 @@ public:
         std::cerr << "ERROR: Could not load image file '" << image_filename << "'.\n";
     }
 
-    // Alpha helpers: this simple loader currently only supports RGB images.
-    // Provide stubs so higher-level code can query alpha without requiring
-    // the loader to implement alpha support.
-    bool has_alpha() const { return false; }
-    unsigned char pixel_alpha_byte(int /*x*/, int /*y*/) const { return 255; }
+    // Alpha helpers: support images with an alpha channel (RGBA).
+    bool has_alpha() const { return bytes_per_pixel >= 4; }
+    unsigned char pixel_alpha_byte(int x, int y) const {
+        if (!bdata || !has_alpha()) return 255;
+        x = clamp(x, 0, image_width);
+        y = clamp(y, 0, image_height);
+        const unsigned char* p = bdata + y * bytes_per_scanline + x * bytes_per_pixel;
+        return p[3];
+    }
 
     ~rtw_image() {
         delete[] bdata;
@@ -61,10 +65,12 @@ public:
     }
 
     bool load(const std::string& filename) {
-        int n = bytes_per_pixel;
-        fdata = stbi_loadf(filename.c_str(), &image_width, &image_height, &n, bytes_per_pixel);
+        int n = 0;
+        // Let stb tell us how many components the file has (n). Request no forced comp.
+        fdata = stbi_loadf(filename.c_str(), &image_width, &image_height, &n, 0);
         if (!fdata) return false;
 
+        bytes_per_pixel = (n > 0) ? n : 3;
         bytes_per_scanline = image_width * bytes_per_pixel;
         convert_to_bytes();
         return true;
@@ -84,7 +90,7 @@ public:
     }
 
 private:
-    const int      bytes_per_pixel = 3;
+    int            bytes_per_pixel = 3;
     float         *fdata = nullptr;
     unsigned char *bdata = nullptr;
     int            image_width = 0;

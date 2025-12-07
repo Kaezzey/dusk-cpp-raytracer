@@ -436,11 +436,28 @@ public:
         ray& scattered
     ) const override {
 
-        // Alpha mask: if present and indicates transparent, behave as if no hit
-        if (alpha_tex) {
-            double a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
-            if (alpha_double_sided || rec.front_face) {
-                if (a < alpha_cutoff) return false;
+        // Alpha mask: if present and indicates transparent, behave as if no hit.
+        // For triangle/Embree paths this is already checked at intersection time
+        // via is_masked_transparent(). For other primitives (quads/spheres) we
+        // need to continue the ray through the surface when masked instead of
+        // terminating the path. We implement that by spawning a continuation
+        // ray in the same direction and returning 'true' with neutral
+        // attenuation so the renderer treats it as a miss.
+        // Resolve alpha: prefer explicit alpha map, otherwise fall back to
+        // the base/albedo texture's alpha channel (if any).
+        auto resolve_alpha = [&](const hit_record& hrec) {
+            if (alpha_tex) return alpha_tex->alpha_at(hrec.u, hrec.v, hrec.p);
+            if (base_tex) return base_tex->alpha_at(hrec.u, hrec.v, hrec.p);
+            return 1.0;
+        };
+
+        double a_res = resolve_alpha(rec);
+        if (alpha_double_sided || rec.front_face) {
+            if (a_res < alpha_cutoff) {
+                // Continue ray through transparent mask
+                scattered = ray(rec.p + r_in.direction() * 0.001, r_in.direction(), r_in.time());
+                attenuation = colour(1.0, 1.0, 1.0);
+                return true;
             }
         }
 
@@ -624,11 +641,12 @@ public:
     // Proper PBR direct shading using GGX microfacet BRDF (energy-conserving)
     virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const override {
         // Alpha mask: if present and transparent, contribute nothing
-        if (alpha_tex) {
-            double a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
-            if (alpha_double_sided || rec.front_face) {
-                if (a < alpha_cutoff) return colour(0,0,0);
-            }
+        // Alpha mask: skip contribution if transparent (alpha map or albedo alpha)
+        double a_ds = 1.0;
+        if (alpha_tex) a_ds = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+        else if (base_tex) a_ds = base_tex->alpha_at(rec.u, rec.v, rec.p);
+        if (alpha_double_sided || rec.front_face) {
+            if (a_ds < alpha_cutoff) return colour(0,0,0);
         }
         // Reconstruct the shading normal from the normal map (if present)
         vec3 Ngeom = rec.normal;
@@ -722,8 +740,9 @@ public:
 
         // Mask test for triangle-level discard
         virtual bool is_masked_transparent(const hit_record& rec) const override {
-            if (!alpha_tex) return false;
-            double a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+            double a = 1.0;
+            if (alpha_tex) a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+            else if (base_tex) a = base_tex->alpha_at(rec.u, rec.v, rec.p);
             if (alpha_double_sided || rec.front_face) {
                 return a < alpha_cutoff;
             }

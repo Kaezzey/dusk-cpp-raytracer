@@ -61,6 +61,10 @@ struct scene_material {
     int metallic_tex  = -1;   // greyscale in [0,1]
     int roughness_tex = -1;   // greyscale in [0,1]
     int normal_tex    = -1;   // tangent-space normal map
+    // Optional alpha/opacity mask (single-channel or image alpha)
+    int alpha_tex     = -1;   // alpha mask index into scene.textures
+    bool alpha_double_sided = true;
+    double alpha_cutoff = 0.5;
 };
 
 // Convert an editor-facing scene_material into a runtime material*
