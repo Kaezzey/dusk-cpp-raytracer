@@ -2471,17 +2471,43 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
             g_world_dirty     = true;
         }
 
-        // Subsurface scattering controls (thin/translucent approximation)
+        // Subsurface scattering (simplified controls)
         float sss_f = (float)mat.sss_strength;
-        float sss_scale_f = (float)mat.sss_scale;
-
         if (ImGui::SliderFloat("SSS Strength", &sss_f, 0.0f, 1.0f)) {
             mat.sss_strength = (double)sss_f;
             g_world_dirty = true;
         }
-        if (ImGui::SliderFloat("SSS Scale", &sss_scale_f, 0.01f, 10.0f)) {
-            mat.sss_scale = (double)sss_scale_f;
+
+        float sss_radius_f = (float)mat.sss_radius;
+        if (ImGui::SliderFloat("SSS Radius", &sss_radius_f, 0.01f, 10.0f)) {
+            mat.sss_radius = (double)sss_radius_f;
+            // Keep legacy sss_scale in sync for the single-scatter fallback
+            mat.sss_scale = mat.sss_radius;
             g_world_dirty = true;
+        }
+
+        // Compact model selector: None / Single / Dipole
+        const char* sss_items_simple[] = { "None", "Single", "Dipole (Burley)" };
+        int sss_model_idx = 0;
+        // Map runtime enum values to combo index
+        if (mat.sss_model == SSS_NONE) sss_model_idx = 0;
+        else if (mat.sss_model == SSS_SINGLE_SCATTER) sss_model_idx = 1;
+        else if (mat.sss_model == SSS_DIPOLE_BURLEY) sss_model_idx = 2;
+
+        if (ImGui::Combo("SSS Model", &sss_model_idx, sss_items_simple, IM_ARRAYSIZE(sss_items_simple))) {
+            if (sss_model_idx == 0) mat.sss_model = SSS_NONE;
+            else if (sss_model_idx == 1) mat.sss_model = SSS_SINGLE_SCATTER;
+            else mat.sss_model = SSS_DIPOLE_BURLEY;
+            g_world_dirty = true;
+        }
+
+        // Only expose sample count when Dipole is selected (advanced)
+        if (mat.sss_model == SSS_DIPOLE_BURLEY) {
+            int sss_samples_i = mat.sss_samples;
+            if (ImGui::SliderInt("SSS Samples (advanced)", &sss_samples_i, 1, 32)) {
+                mat.sss_samples = sss_samples_i;
+                g_world_dirty = true;
+            }
         }
 
         ImGui::Separator();
@@ -2526,6 +2552,8 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         draw_tex_slot("Metallic",  mat.metallic_tex);
         draw_tex_slot("Roughness", mat.roughness_tex);
         draw_tex_slot("Normal",    mat.normal_tex);
+        draw_tex_slot("Opacity Mask (optional)", mat.alpha_tex);
+        ImGui::TextDisabled("If Opacity Mask is empty, the albedo's alpha channel will be used.");
 
         ImGui::TextDisabled("build_world_from_scene must hook these into pbr_material.");
     } break;

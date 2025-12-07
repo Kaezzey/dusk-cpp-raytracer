@@ -57,6 +57,15 @@ struct scene_material {
     // Note: the SSS tint uses the material albedo (base_color).
     double sss_strength = 0.0;
     double sss_scale    = 1.0;
+    // Extended dipole/diffusion parameters (editor-facing). sss_model is
+    // an integer mapping to runtime SSSModel; defaults choose the existing
+    // single-scatter behaviour for backwards compatibility.
+    int    sss_model    = 1;    // 0=none,1=single,2=multi-single,3=dipole-burley
+    int    sss_samples  = 4;
+    double sss_radius   = 1.0;
+    double sss_eta      = 1.3;
+    bool   sss_color_override_enabled = false;
+    vec3   sss_color_override_color = vec3(1.0, 1.0, 1.0);
     double emission_intensity = 1.0;                  // intensity multiplier for diffuse_light
     vec3   dielectric_F0    = vec3(0.04, 0.04, 0.04); // PBR dielectric F0
     double normal_strength  = 1.0;                    // PBR normal strength

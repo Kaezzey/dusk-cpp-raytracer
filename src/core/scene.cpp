@@ -199,6 +199,17 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
         // Propagate subsurface scattering (SSS) settings from editor material
         mat->sss_strength = m.sss_strength;
         mat->sss_scale = m.sss_scale;
+        // Extended dipole/diffusion params
+        mat->sss_model = static_cast<SSSModel>(m.sss_model);
+        mat->sss_samples = m.sss_samples;
+        mat->sss_radius = m.sss_radius;
+        mat->sss_eta = m.sss_eta;
+        mat->sss_color_override = m.sss_color_override_enabled;
+        mat->sss_color_override_col = colour(
+            (float)m.sss_color_override_color.x(),
+            (float)m.sss_color_override_color.y(),
+            (float)m.sss_color_override_color.z()
+        );
 
         return mat;
     }

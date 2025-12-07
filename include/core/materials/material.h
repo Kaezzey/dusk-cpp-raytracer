@@ -3,6 +3,7 @@
 
 #include "../hittable.h"
 #include "texture.h"
+#include "sss.h"
 #include <limits>
 
 inline vec3 refract(const vec3& uv, const vec3& n, double etai_over_etat) {
@@ -356,6 +357,14 @@ class isotropic : public material {
 // PBR material
 // ----------------------------
 
+// SSS model choices
+enum SSSModel {
+    SSS_NONE = 0,
+    SSS_SINGLE_SCATTER = 1,
+    SSS_MULTI_SINGLE_SCATTER = 2,
+    SSS_DIPOLE_BURLEY = 3
+};
+
 class pbr_material : public material {
 public:
     // Base color, metallic, roughness, specular F0, normal map
@@ -380,6 +389,13 @@ public:
     // sss tint colour is required.
     double sss_strength = 0.0;
     double sss_scale = 1.0;
+    // Dipole/diffusion parameters
+    SSSModel sss_model = SSS_SINGLE_SCATTER;
+    int      sss_samples = 4;        // number of exit-point samples for dipole
+    double   sss_radius  = 1.0;      // mean free path / diffusion radius
+    double   sss_eta     = 1.3;      // relative index (not yet used)
+    bool     sss_color_override = false;
+    colour   sss_color_override_col = colour(1.0, 1.0, 1.0);
 
 public:
     // (A) Constant base/metal/rough with optional normal map
@@ -772,56 +788,111 @@ public:
         // Final outgoing radiance: f * Li * cosθ
         colour direct = brdf * Li * (float)NdotL;
 
-        // Higher-quality single-scatter SSS that can bleed through to the
-        // opposite side: cast a short ray into the surface along -N to find
-        // an exit point. If we find an exit on another surface, sample its
-        // albedo and add a transmitted contribution attenuated by travel
-        // distance and the material's SSS parameters.
+        // Subsurface scattering support. Modes available:
+        // - SSS_SINGLE_SCATTER: the previous cheap exit-point trace (fast)
+        // - SSS_DIPOLE_BURLEY: dipole-style diffusion sampling (same-triangle
+        //   / local exit-point attempt). This is a pragmatic initial
+        //   implementation and uses the Burley-like radial profile in
+        //   include/core/materials/sss.h.
         if (sss_strength > 0.0) {
-            // Ray into the surface
-            vec3 into_dir = -rec.normal;
-            ray into_ray(rec.p + into_dir * 0.001, into_dir, 0.0);
-            hit_record exit_rec;
+            if (sss_model == SSS_DIPOLE_BURLEY) {
+                // Importance sample radial distances and angles around the shading point.
+                colour sss_acc(0,0,0);
+                int ns = std::max(1, sss_samples);
+                for (int si = 0; si < ns; ++si) {
+                    double u1 = random_double();
+                    double u2 = random_double();
+                    double r = sss::sample_r_exponential(sss_radius, u1);
+                    double theta = 2.0 * pi * u2;
 
-            if (world.hit(into_ray, interval(0.001, infinity), exit_rec)) {
-                double travel = (exit_rec.p - rec.p).length();
+                    double dx = r * std::cos(theta);
+                    double dy = r * std::sin(theta);
 
-                // Attenuation based on mean free path (exponential falloff)
-                double trans = std::exp(-travel / std::max(1e-6, sss_scale));
+                    // Probe point offset in tangent plane slightly above the surface
+                    point3 probe = rec.p + T * (float)dx + B * (float)dy + rec.normal * 0.001f;
 
-                // Fresnel-average damping to avoid boosting reflective surfaces
-                double Favg_loc = (F0.x() + F0.y() + F0.z()) / 3.0;
+                    // Cast a short ray inward at the probe to find an exit point
+                    ray probe_into(probe, -rec.normal, 0.0);
+                    hit_record exit_rec;
+                    if (!world.hit(probe_into, interval(0.001, infinity), exit_rec))
+                        continue;
 
-                // Determine whether the exit point is lit from the same light
-                // direction. Use Ldir as an approximation for directional and
-                // point lights (approximate for point lights).
-                vec3 L_exit = unit_vector(Ldir);
-                double NdotL_exit = std::max(0.0, dot(exit_rec.normal, L_exit));
+                    double travel = (exit_rec.p - rec.p).length();
+                    double trans = std::exp(-travel / std::max(1e-6, sss_radius));
 
-                if (NdotL_exit > 0.0) {
-                    // Compute deterministic transmittance from exit point toward the light
+                    // Evaluate diffusion profile and area pdf
+                    double base_lum = luminance(baseColor);
+                    double Rd = sss::burley_Rd(r, base_lum, sss_radius);
+                    double pdf_area = sss::pdf_area_from_radius(r, sss_radius);
+                    if (pdf_area <= 0.0) continue;
+
+                    // Determine light-side visibility from exit point toward light
+                    vec3 L_exit = unit_vector(Ldir);
+                    double NdotL_exit = std::max(0.0, dot(exit_rec.normal, L_exit));
+                    if (NdotL_exit <= 0.0) continue;
+
+                    // Deterministic transmittance from exit to light (accumulate transparency)
                     ray shadow_from_exit(exit_rec.p + exit_rec.normal * 0.001, L_exit, 0.0);
-                    double T = 1.0;
+                    double Tvis = 1.0;
                     hit_record sh;
                     double tmin_local = 0.001;
-                    // accumulate transparency (1 - opacity) along the ray
                     while (world.hit(shadow_from_exit, interval(tmin_local, std::numeric_limits<double>::infinity()), sh)) {
                         double opacity = 1.0;
                         if (sh.mat) opacity = sh.mat->opacity_at(sh);
                         double t_here = 1.0 - clamp01(opacity);
-                        if (t_here <= 1e-6) { T = 0.0; break; }
-                        T *= t_here;
-                        if (T <= 1e-6) { T = 0.0; break; }
+                        if (t_here <= 1e-6) { Tvis = 0.0; break; }
+                        Tvis *= t_here;
+                        if (Tvis <= 1e-6) { Tvis = 0.0; break; }
                         tmin_local = sh.t + 0.001;
                         shadow_from_exit = ray(sh.p + sh.normal * 0.001, L_exit, 0.0);
                     }
+                    if (Tvis <= 1e-6) continue;
 
-                    if (T > 1e-6) {
-                        colour exit_alb = exit_rec.mat ? exit_rec.mat->albedo(exit_rec) : baseColor;
+                    colour exit_alb = exit_rec.mat ? exit_rec.mat->albedo(exit_rec) : baseColor;
 
-                        // Transmitted contribution (single-scatter approx), modulated by transmittance
-                        colour sss = exit_alb * (float)(sss_strength * trans * (1.0 - Favg_loc)) * Li * (float)NdotL_exit * (float)T;
-                        direct += sss;
+                    // Per-sample contribution: Rd (per unit incident flux) times exit albedo
+                    // We divide by the area-pdf to account for sampling in the tangent plane.
+                    colour contrib = exit_alb * (float)(sss_strength * trans * Rd / pdf_area) * Li * (float)NdotL_exit * (float)Tvis;
+                    sss_acc += contrib;
+                }
+                direct += sss_acc * (float)(1.0 / std::max(1, sss_samples));
+            } else {
+                // Fallback: original single-scatter into->exit trace
+                vec3 into_dir = -rec.normal;
+                ray into_ray(rec.p + into_dir * 0.001, into_dir, 0.0);
+                hit_record exit_rec;
+
+                if (world.hit(into_ray, interval(0.001, infinity), exit_rec)) {
+                    double travel = (exit_rec.p - rec.p).length();
+
+                    double trans = std::exp(-travel / std::max(1e-6, sss_scale));
+
+                    double Favg_loc = (F0.x() + F0.y() + F0.z()) / 3.0;
+
+                    vec3 L_exit = unit_vector(Ldir);
+                    double NdotL_exit = std::max(0.0, dot(exit_rec.normal, L_exit));
+
+                    if (NdotL_exit > 0.0) {
+                        ray shadow_from_exit(exit_rec.p + exit_rec.normal * 0.001, L_exit, 0.0);
+                        double T = 1.0;
+                        hit_record sh;
+                        double tmin_local = 0.001;
+                        while (world.hit(shadow_from_exit, interval(tmin_local, std::numeric_limits<double>::infinity()), sh)) {
+                            double opacity = 1.0;
+                            if (sh.mat) opacity = sh.mat->opacity_at(sh);
+                            double t_here = 1.0 - clamp01(opacity);
+                            if (t_here <= 1e-6) { T = 0.0; break; }
+                            T *= t_here;
+                            if (T <= 1e-6) { T = 0.0; break; }
+                            tmin_local = sh.t + 0.001;
+                            shadow_from_exit = ray(sh.p + sh.normal * 0.001, L_exit, 0.0);
+                        }
+
+                        if (T > 1e-6) {
+                            colour exit_alb = exit_rec.mat ? exit_rec.mat->albedo(exit_rec) : baseColor;
+                            colour sss = exit_alb * (float)(sss_strength * trans * (1.0 - Favg_loc)) * Li * (float)NdotL_exit * (float)T;
+                            direct += sss;
+                        }
                     }
                 }
             }
