@@ -1,15 +1,13 @@
 # Dusktracer — Hybrid Ray Tracer + Interactive Editor
 
-[![CMake](https://img.shields.io/badge/build-cmake-blue.svg)](https://cmake.org)
+[![CMake](https://img.shields.io/badge/build-cmake-blue.svg)](https://cmake.org)  
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, featuring:
-- **CPU path tracing** (GGX PBR, dielectric Fresnel, microfacet BRDFs)
-- **GPU raster preview** for instant feedback (OpenGL, correct TRS)
-- **Interactive ImGui editor** with gizmo, picking, materials, and scene graph
-- **Assimp-powered import pipeline** (OBJ/FBX + textures)
-
-It serves as a hands-on exploration of real-time editor systems, physically-based shading, transform-correct ray tracing, and asset pipelines.
+- CPU path tracing (GGX PBR, dielectric Fresnel, microfacet BRDFs)
+- GPU raster preview for instant feedback (OpenGL, correct TRS)
+- Interactive ImGui editor with gizmo, picking, and scene graph
+- Assimp-powered import pipeline (OBJ/FBX + textures)
 
 ---
 
@@ -21,41 +19,78 @@ It serves as a hands-on exploration of real-time editor systems, physically-base
 
 ## Features
 ### Rendering
-- **GGX PBR** with metallic/roughness workflow  
-- **Dielectric Fresnel** (Schlick/Shirley) & microfacet sampling  
-- Correct **inverse-transpose normals** under non-uniform scale  
+- GGX PBR with metallic/roughness workflow  
+- Dielectric Fresnel (Schlick/Shirley) & microfacet sampling  
+- Correct inverse-transpose normals under non-uniform scale  
 - Unified transform wrapper for spheres, cubes, and meshes  
-- BVH acceleration & AABB optimisations
+- BVH acceleration & AABB optimisations  
+- Support for alpha in albedo textures (RGBA PNGs used as transparency source when no explicit alpha map is set)
+- Stochastic alpha testing for soft, Monte‑Carlo-correct transparent edges (alpha_cutoff retained as a fast-path)
+- Double-sided masked transparency for materials that use alpha
+- Point-light direct illumination with inverse-square attenuation and shadow checks
+- Embree path UV interpolation fix to ensure correct texture sampling on hardware-accelerated geometry
 
 ### Editor Features
-- **GPU-based picking** via RGB8 ID buffer  
-- **Screen-space gizmo:** axis translation with closest-point ray math  
-- **Scene Hierarchy**, **Inspector**, and **Material Editor**  
-- Drag & drop **mesh/texture import**
+- GPU-based picking via RGB8 ID buffer  
+- Screen-space gizmo: axis translation with closest-point ray math  
+- Scene Hierarchy, Inspector, and Material Editor  
+- Drag & drop mesh/texture import  
+- Viewport selection + Delete key: click object in viewport to select and press Del (viewport-focused) to remove (undoable)
+- Raster preview draws point-light icons for easy placement
 
 ### Raster Preview
 - Modern OpenGL (VAO/VBO/EBO)  
 - Perfect TRS parity with CPU ray tracer (Rz → Ry → Rx)  
-- Per-mesh material slot binding
+- Per-mesh material slot binding  
+- Robust raster picking and gizmo interaction
 
 ---
 
 ## What I Learned Building This
-- Implementing **physically-based BRDFs** (GGX, Smith, Fresnel)  
-- Building a **material system** with textured base/rough/metal/normal maps  
-- Writing robust **inverse + inverse-transpose** transform math  
-- Designing an **editor → render-world** translation layer  
+- Implementing physically-based BRDFs (GGX, Smith, Fresnel)  
+- Building a material system with textured base/rough/metal/normal maps  
+- Writing robust inverse + inverse-transpose transform math  
+- Designing an editor → render-world translation layer  
 - GPU picking pipelines, gizmo interaction, and editor UX  
 - BVH/AABB performance tradeoffs and ray-offset fixes  
-- End-to-end **mesh import → normalization → GPU upload**
+- End-to-end mesh import → normalization → GPU upload
 
 ---
 
 ## Technical Highlights
 - CPU path tracer (multi-bounce, MIS-inspired sampling)
 - Energy-conserving metallic/roughness shading
+- Dielectric F0 control and correct Fresnel
 - Tangent-space normal mapping with adjustable strength
 - Stable gizmo translation via line–ray closest points
 - Raster preview shares exact TRS math with ray tracer
 - Reverse-mapping transforms for correct ray intersection
-- In-editor material slot binding for multi-material meshes
+- Per-material alpha masking with stochastic sampling and automatic double-sided handling for masked materials
+
+---
+
+## How to test transparency and lights
+1. Drag an RGBA PNG with transparent regions into the Textures window.
+2. Assign it to a material's Albedo slot (or supply an explicit alpha map).
+3. Apply that material to geometry (leaves/sprites/meshes).
+4. Render with higher SPP to see soft edges from stochastic alpha testing.
+5. Add point lights and position them in the viewport — they will appear as icons in the raster preview and light the ray-traced render.
+
+Notes:
+- Loader treats 0 = fully transparent, 255 = opaque.
+- alpha_cutoff remains available to cull near‑fully transparent pixels as a performance fast-path.
+- If backface masking artifacts appear, double-sided masking is automatically enabled when alpha is present.
+
+---
+
+## Build / Run (Windows, PowerShell)
+- Configure & generate build:
+  - mkdir build; cd build
+  - cmake .. -DCMAKE_BUILD_TYPE=Release
+- Build:
+  - cmake --build . --config Release
+  or
+  - msbuild Dusktracer.sln /p:Configuration=Release
+- Run the editor (from build\Release or appropriate output folder).
+
+---
