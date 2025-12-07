@@ -135,11 +135,19 @@ bool embree_triangle_accel::hit(const ray& r, interval ray_t, hit_record& rec) c
     double u = rh.hit.u;
     double v = rh.hit.v;
     double w = 1.0 - u - v;
-    rec.u = u; rec.v = v;
+
+    // Interpolate texture coordinates (Embree gives barycentrics; we need UVs)
+    // Match the behavior of triangle::hit which stores interpolated UVs in rec.u/rec.v
+    rec.u = u; rec.v = v; // temporary assignment (will be overridden if we have per-prim data)
 
     unsigned int prim = rh.hit.primID;
     if (prim < m_triangle_data.size()) {
         const TriangleData& td = m_triangle_data[prim];
+
+        // Interpolate texture coordinates from per-vertex UVs
+        double iu = w * td.u0 + u * td.u1 + v * td.u2;
+        double iv = w * td.v0_uv + u * td.v1_uv + v * td.v2_uv;
+        rec.u = iu; rec.v = iv;
 
         // Interpolate smooth normal
         vec3 interpN = (td.n0 * (float)w) + (td.n1 * (float)u) + (td.n2 * (float)v);

@@ -2754,10 +2754,10 @@ int main()
         s_prev_ctrlz = cur_ctrlz;
         s_prev_ctrly = cur_ctrly;
 
-        // Global Delete key: remove selected object when Delete pressed (works after clicking in viewport)
-        // Ignore when text input is active (WantCaptureKeyboard)
+        // Global Delete key: remove selected object when Delete pressed.
+        // Allow Delete when viewport is focused even if ImGui requests keyboard capture
         ImGuiIO& io = ImGui::GetIO();
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !io.WantCaptureKeyboard) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && (g_viewport_focused || !io.WantCaptureKeyboard)) {
             if (g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size()) {
                 int del_idx = g_selected_object;
                 scene_object removed = g_scene.objects[del_idx];

@@ -20,17 +20,32 @@ public:
     explicit rtw_image(const char* image_filename) {
         auto filename = std::string(image_filename);
         auto imagedir = getenv("RTW_IMAGES");
+        if (imagedir && load(std::string(imagedir) + "/" + filename)) {
+            std::printf("Loaded image from RTW_IMAGES: %s\n", (std::string(imagedir) + "/" + filename).c_str());
+            return;
+        }
 
-        if (imagedir && load(std::string(imagedir) + "/" + filename)) return;
-        if (load(filename)) return;
-        if (load("images/" + filename)) return;
-        if (load("../images/" + filename)) return;
-        if (load("../../images/" + filename)) return;
-        if (load("../../../images/" + filename)) return;
-        if (load("../../../../images/" + filename)) return;
-        if (load("../../../../../images/" + filename)) return;
-        if (load("../../../../../../images/" + filename)) return;
+        // Try the exact path first (handles paths like "models/.." or absolute paths)
+        if (load(filename)) {
+            std::printf("Loaded image: %s\n", filename.c_str());
+            return;
+        }
 
+        // Common asset folders to try (images, textures, models) with a few parent levels
+        const char* search_folders[] = { "images/", "textures/", "models/" };
+        const int max_up = 6;
+
+        for (int up = 0; up <= max_up; ++up) {
+            std::string prefix;
+            for (int k = 0; k < up; ++k) prefix += "../";
+            for (const char* folder : search_folders) {
+                std::string try_path = prefix + folder + filename;
+                if (load(try_path)) {
+                    std::printf("Loaded image: %s\n", try_path.c_str());
+                    return;
+                }
+            }
+        }
         std::cerr << "ERROR: Could not load image file '" << image_filename << "'.\n";
     }
 
