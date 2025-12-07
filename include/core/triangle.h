@@ -194,15 +194,12 @@ public:
         interpN = unit_vector(interpN);
         rec.set_face_normal(r, interpN);
 
-        // Alpha Mask: ask the material if this hit should be discarded
-        if (mat) {
-            // We can use a temporary hit_record referencing current u/v/p/front_face
-            hit_record tmp = rec;
-            tmp.mat = mat;
-            if (mat->is_masked_transparent(tmp)) {
-                return false;
-            }
-        }
+        // Alpha Mask: previously we sometimes discarded hits here to
+        // implement stochastic transparency. For visibility/shadow rays we
+        // want deterministic alpha values (and to allow accumulation of
+        // partial transmittance), so we no longer early-discard. The
+        // material's scatter() / is_masked_transparent() logic will still
+        // handle stochastic continuation for path sampling.
 
         // Interpolate tangent and bitangent
         vec3 interpT = w * t0 + u * t1 + v * t2;

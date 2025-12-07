@@ -2471,6 +2471,19 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
             g_world_dirty     = true;
         }
 
+        // Subsurface scattering controls (thin/translucent approximation)
+        float sss_f = (float)mat.sss_strength;
+        float sss_scale_f = (float)mat.sss_scale;
+
+        if (ImGui::SliderFloat("SSS Strength", &sss_f, 0.0f, 1.0f)) {
+            mat.sss_strength = (double)sss_f;
+            g_world_dirty = true;
+        }
+        if (ImGui::SliderFloat("SSS Scale", &sss_scale_f, 0.01f, 10.0f)) {
+            mat.sss_scale = (double)sss_scale_f;
+            g_world_dirty = true;
+        }
+
         ImGui::Separator();
         ImGui::Text("PBR Texture Maps (drag from Textures window)");
 

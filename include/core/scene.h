@@ -51,6 +51,12 @@ struct scene_material {
     double fuzz             = 0.0;                    // metal fuzz
     double ior              = 1.5;                    // dielectric IOR
     vec3   emission         = vec3(0, 0, 0);          // diffuse_light color
+    // Sub-surface scattering (thin/translucent approximation)
+    // - sss_strength: [0..1] amount of subsurface transmission
+    // - sss_scale: mean free path / scattering scale (larger -> more transmission)
+    // Note: the SSS tint uses the material albedo (base_color).
+    double sss_strength = 0.0;
+    double sss_scale    = 1.0;
     double emission_intensity = 1.0;                  // intensity multiplier for diffuse_light
     vec3   dielectric_F0    = vec3(0.04, 0.04, 0.04); // PBR dielectric F0
     double normal_strength  = 1.0;                    // PBR normal strength

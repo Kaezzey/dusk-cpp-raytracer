@@ -182,7 +182,7 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
             }
         }
 
-        return std::make_shared<pbr_material>(
+        auto mat = std::make_shared<pbr_material>(
             base_tex,
             metallic_tex,
             roughness_tex,
@@ -195,6 +195,12 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
             effective_double_sided,
             m.alpha_cutoff
         );
+
+        // Propagate subsurface scattering (SSS) settings from editor material
+        mat->sss_strength = m.sss_strength;
+        mat->sss_scale = m.sss_scale;
+
+        return mat;
     }
 
     case scene_material_model::isotropic:

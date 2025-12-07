@@ -181,14 +181,11 @@ bool embree_triangle_accel::hit(const ray& r, interval ray_t, hit_record& rec) c
         rec.bitangent = interpB;
 
         rec.mat = td.mat;
-        // If material indicates masked transparency at this UV, treat as a miss
-        if (rec.mat) {
-            hit_record tmp = rec;
-            tmp.mat = rec.mat;
-            if (rec.mat->is_masked_transparent(tmp)) {
-                return false;
-            }
-        }
+        // Note: do not early-discard masked-transparent hits here. We want
+        // the renderer to always observe hits so that visibility/shadow
+        // transmittance can be computed deterministically from material
+        // opacity. Stochastic continuation is handled later in material
+        // scatter()/is_masked_transparent() where appropriate.
     } else {
         // Fallback: use geometric normal from Embree if we didn't store triangle data
         vec3 Ng((double)rh.hit.Ng_x, (double)rh.hit.Ng_y, (double)rh.hit.Ng_z);

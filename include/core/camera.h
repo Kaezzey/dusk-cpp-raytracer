@@ -8,6 +8,7 @@
 #include <chrono>
 #include <vector>
 #include <atomic>
+#include <limits>
 
 class renderer;
 
@@ -385,16 +386,15 @@ class camera {
                         if (NdotL <= 0.0) continue;
 
                         ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
-                        hit_record shadow_rec;
-                        if (!world.hit(shadow_ray, interval(0.001, infinity), shadow_rec)) {
-                            vis += 1.0;
-                        }
+                        // Compute deterministic transmittance along the shadow ray
+                        double tr = compute_transmittance(shadow_ray, std::numeric_limits<double>::infinity(), world);
+                        vis += tr;
                     }
 
                     vis /= double(samples);
                     if (vis > 0.0) {
                         vec3 V = -unit_vector(current_ray.direction());
-                        colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance);
+                        colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance, world);
                         result += throughput * (direct * (float)vis);
                     }
                 }
@@ -413,18 +413,19 @@ class camera {
                 // Range culling
                 if (pl.range > 0.0 && dist > pl.range) continue;
 
-                // Shadow check: cast toward light, limit to distance
+                // Shadow check: cast toward light, limit to distance. Use
+                // deterministic transmittance to allow partial transmission
+                // through opacity-masked surfaces.
                 ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
-                hit_record shadow_rec;
-                bool occluded = world.hit(shadow_ray, interval(0.001, dist - 0.001), shadow_rec);
-                if (occluded) continue;
+                double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
+                if (tr <= 0.0) continue;
 
                 // Attenuate by inverse-square (clamp to avoid huge values)
                 double att = 1.0 / std::max(1e-4, dist * dist);
-                colour Li = pl.radiance * (float)att;
+                colour Li = pl.radiance * (float)att * (float)tr;
 
                 vec3 V = -unit_vector(current_ray.direction());
-                colour direct = rec.mat->shade_direct(rec, V, Ldir, Li);
+                colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
                 result += throughput * direct;
             }
 
@@ -448,6 +449,35 @@ class camera {
         }
 
         return result;
+    }
+
+    // Compute deterministic transmittance along a ray up to max_t by
+    // accumulating per-hit material opacity (alpha). Returns value in
+    // [0,1], where 0 = fully blocked, 1 = fully clear.
+    double compute_transmittance(const ray& r, double max_t, const hittable& world) const {
+        double T = 1.0;
+        double tmin = 0.001;
+        double tmax = max_t;
+        hit_record rec;
+
+        while (tmin < tmax && world.hit(r, interval(tmin, tmax), rec)) {
+            double opacity = 1.0;
+            if (rec.mat) opacity = rec.mat->opacity_at(rec);
+
+            // transparency is (1 - opacity)
+            double trans = 1.0 - clamp01(opacity);
+
+            // If fully opaque, blocked
+            if (trans <= 1e-6) return 0.0;
+
+            T *= trans;
+            if (T <= 1e-6) return 0.0;
+
+            // Advance min t to just beyond this hit and continue
+            tmin = rec.t + 0.001;
+        }
+
+        return T;
     }
 
 };

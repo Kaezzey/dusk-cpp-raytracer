@@ -3,6 +3,7 @@
 
 #include "../hittable.h"
 #include "texture.h"
+#include <limits>
 
 inline vec3 refract(const vec3& uv, const vec3& n, double etai_over_etat) {
     double cos_theta = fmin(dot(-uv, n), 1.0);
@@ -85,11 +86,15 @@ class material {
     // Direct-shading hook for direct lights. Default is
     // Lambertian: albedo * Li * (NdotL / pi). V is the view direction
     // (pointing out from the surface).
-    virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const {
+    // `vis` is the deterministic visibility/transmittance of the light
+    // toward the shading point (in [0,1]). Materials should multiply their
+    // surface BRDF contribution by `vis` but may perform independent
+    // visibility checks for subsurface/external contributions.
+    virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li, const hittable& world, double vis = 1.0) const {
         double NdotL = std::max(0.0, dot(rec.normal, unit_vector(Ldir)));
         if (NdotL <= 0.0) return colour(0,0,0);
         colour base = albedo(rec);
-        return base * Li * (NdotL / pi);
+        return base * Li * (NdotL / pi) * (float)vis;
     }
 
     //diffuse "base color" hook (used later for direct lighting)
@@ -100,6 +105,11 @@ class material {
     // Alpha/mask test: return true if this material wants the current
     // hit to be treated as transparent (i.e. discarded) based on opacity.
     virtual bool is_masked_transparent(const hit_record& rec) const { return false; }
+
+    // Deterministic opacity query in [0,1]. Default is fully opaque (1.0).
+    // This is used for visibility/shadow queries where we need a stable
+    // alpha value rather than a stochastic discard.
+    virtual double opacity_at(const hit_record& rec) const { (void)rec; return 1.0; }
 };
 
 class lambertian : public material {
@@ -153,7 +163,7 @@ class metal : public material {
     }
 
     bool is_specular() const override { return true; }
-    colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const override {
+    colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li, const hittable& /*world*/, double vis = 1.0) const override {
         return colour(0,0,0);
     }
 
@@ -233,7 +243,7 @@ class dielectric : public material {
     // (no diffuse). Transmission of light into the scene is handled by
     // refracted scattering paths, so shadows behind the glass remain
     // dark unless light is transmitted through the medium.
-    colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const override {
+    colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li, const hittable& /*world*/, double vis = 1.0) const override {
         vec3 N = rec.normal;
         vec3 L = unit_vector(Ldir);
         vec3 Vn = unit_vector(V);
@@ -284,7 +294,7 @@ class dielectric : public material {
 
         // Final outgoing radiance: specular term * incoming radiance
         // (No ad-hoc intensity boost; keep energy consistent.)
-        return spec_term * Li * (float)NdotL;
+        return spec_term * Li * (float)NdotL * (float)vis;
     }
 
     colour albedo(const hit_record& rec) const override {
@@ -362,6 +372,14 @@ public:
 
     // Dielectric F0 when metallic = 0 (0.04 is common)
     colour  dielectric_F0;
+
+    // Simple thin-subsurface approximation parameters
+    // sss_strength: [0,1] how much light is transmitted/scattered through the thin material
+    // sss_scale: user-facing scale controlling amount of transmission (mean free path)
+    // The SSS tint now uses the material albedo (baseColor) so no explicit
+    // sss tint colour is required.
+    double sss_strength = 0.0;
+    double sss_scale = 1.0;
 
 public:
     // (A) Constant base/metal/rough with optional normal map
@@ -652,7 +670,7 @@ public:
     }
 
     // Proper PBR direct shading using GGX microfacet BRDF (energy-conserving)
-    virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const override {
+    virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li, const hittable& world, double vis = 1.0) const override {
         // Alpha mask: if present and transparent, contribute nothing
         // Alpha mask: skip contribution if transparent (alpha map or albedo alpha)
         double a_ds = 1.0;
@@ -752,7 +770,64 @@ public:
         colour brdf = kd * (float)(1.0 / pi) + spec;
 
         // Final outgoing radiance: f * Li * cosθ
-        return brdf * Li * (float)NdotL;
+        colour direct = brdf * Li * (float)NdotL;
+
+        // Higher-quality single-scatter SSS that can bleed through to the
+        // opposite side: cast a short ray into the surface along -N to find
+        // an exit point. If we find an exit on another surface, sample its
+        // albedo and add a transmitted contribution attenuated by travel
+        // distance and the material's SSS parameters.
+        if (sss_strength > 0.0) {
+            // Ray into the surface
+            vec3 into_dir = -rec.normal;
+            ray into_ray(rec.p + into_dir * 0.001, into_dir, 0.0);
+            hit_record exit_rec;
+
+            if (world.hit(into_ray, interval(0.001, infinity), exit_rec)) {
+                double travel = (exit_rec.p - rec.p).length();
+
+                // Attenuation based on mean free path (exponential falloff)
+                double trans = std::exp(-travel / std::max(1e-6, sss_scale));
+
+                // Fresnel-average damping to avoid boosting reflective surfaces
+                double Favg_loc = (F0.x() + F0.y() + F0.z()) / 3.0;
+
+                // Determine whether the exit point is lit from the same light
+                // direction. Use Ldir as an approximation for directional and
+                // point lights (approximate for point lights).
+                vec3 L_exit = unit_vector(Ldir);
+                double NdotL_exit = std::max(0.0, dot(exit_rec.normal, L_exit));
+
+                if (NdotL_exit > 0.0) {
+                    // Compute deterministic transmittance from exit point toward the light
+                    ray shadow_from_exit(exit_rec.p + exit_rec.normal * 0.001, L_exit, 0.0);
+                    double T = 1.0;
+                    hit_record sh;
+                    double tmin_local = 0.001;
+                    // accumulate transparency (1 - opacity) along the ray
+                    while (world.hit(shadow_from_exit, interval(tmin_local, std::numeric_limits<double>::infinity()), sh)) {
+                        double opacity = 1.0;
+                        if (sh.mat) opacity = sh.mat->opacity_at(sh);
+                        double t_here = 1.0 - clamp01(opacity);
+                        if (t_here <= 1e-6) { T = 0.0; break; }
+                        T *= t_here;
+                        if (T <= 1e-6) { T = 0.0; break; }
+                        tmin_local = sh.t + 0.001;
+                        shadow_from_exit = ray(sh.p + sh.normal * 0.001, L_exit, 0.0);
+                    }
+
+                    if (T > 1e-6) {
+                        colour exit_alb = exit_rec.mat ? exit_rec.mat->albedo(exit_rec) : baseColor;
+
+                        // Transmitted contribution (single-scatter approx), modulated by transmittance
+                        colour sss = exit_alb * (float)(sss_strength * trans * (1.0 - Favg_loc)) * Li * (float)NdotL_exit * (float)T;
+                        direct += sss;
+                    }
+                }
+            }
+        }
+
+        return direct;
     }
 
         // Mask test for triangle-level discard
@@ -767,6 +842,14 @@ public:
                 if (a < 1.0 && random_double() > a) return true;
             }
             return false;
+        }
+
+        // Deterministic opacity query used for visibility/shadow calculations.
+        virtual double opacity_at(const hit_record& rec) const override {
+                double a = 1.0;
+                if (alpha_tex) a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+                else if (base_tex) a = base_tex->alpha_at(rec.u, rec.v, rec.p);
+                return clamp01(a);
         }
 };
 
