@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "hittable.h"
+#include "materials/material.h"
 #include "BVH.h"
 #include "AABB.h"
 #include "vec3.h"
@@ -192,6 +193,16 @@ public:
         vec3 interpN = w * n0 + u * n1 + v * n2;
         interpN = unit_vector(interpN);
         rec.set_face_normal(r, interpN);
+
+        // Alpha Mask: ask the material if this hit should be discarded
+        if (mat) {
+            // We can use a temporary hit_record referencing current u/v/p/front_face
+            hit_record tmp = rec;
+            tmp.mat = mat;
+            if (mat->is_masked_transparent(tmp)) {
+                return false;
+            }
+        }
 
         // Interpolate tangent and bitangent
         vec3 interpT = w * t0 + u * t1 + v * t2;

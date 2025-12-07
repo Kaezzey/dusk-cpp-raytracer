@@ -167,6 +167,7 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
         std::shared_ptr<texture> normal_tex =
             load_scene_texture(scn, m.normal_tex); // can be nullptr
 
+        // Construct PBR material (alpha/opacity not provided by scene material)
         return std::make_shared<pbr_material>(
             base_tex,
             metallic_tex,

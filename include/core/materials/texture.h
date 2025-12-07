@@ -8,8 +8,9 @@
 class texture {
   public:
     virtual ~texture() = default;
-
     virtual colour value(double u, double v, const point3& p) const = 0;
+    // Alpha sampling: return alpha in [0,1]. Default = 1 (opaque)
+    virtual double alpha_at(double u, double v, const point3& p) const { return 1.0; }
 };
 
 class solid_colour : public texture {
@@ -84,6 +85,19 @@ class image_texture : public texture {
         auto color_scale = 1.0 / 255.0;
         return colour(color_scale*pixel[0], color_scale*pixel[1], color_scale*pixel[2]);
     }
+
+      double alpha_at(double u, double v, const point3& p) const override {
+        if (image.height() <= 0) return 1.0;
+
+        u = interval(0,1).clamp(u);
+        v = 1.0 - interval(0,1).clamp(v);
+
+        auto i = int(u * image.width());
+        auto j = int(v * image.height());
+        if (!image.has_alpha()) return 1.0;
+        auto a = image.pixel_alpha_byte(i, j);
+        return double(a) / 255.0;
+      }
 
   private:
     rtw_image image;

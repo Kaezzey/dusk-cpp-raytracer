@@ -49,6 +49,12 @@ public:
         std::cerr << "ERROR: Could not load image file '" << image_filename << "'.\n";
     }
 
+    // Alpha helpers: this simple loader currently only supports RGB images.
+    // Provide stubs so higher-level code can query alpha without requiring
+    // the loader to implement alpha support.
+    bool has_alpha() const { return false; }
+    unsigned char pixel_alpha_byte(int /*x*/, int /*y*/) const { return 255; }
+
     ~rtw_image() {
         delete[] bdata;
         stbi_image_free(fdata);  // <-- use function, not STBI_FREE macro

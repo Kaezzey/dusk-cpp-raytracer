@@ -96,6 +96,10 @@ class material {
     virtual colour albedo(const hit_record& rec) const {
         return colour(1,1,1);
     }
+
+    // Alpha/mask test: return true if this material wants the current
+    // hit to be treated as transparent (i.e. discarded) based on opacity.
+    virtual bool is_masked_transparent(const hit_record& rec) const { return false; }
 };
 
 class lambertian : public material {
@@ -351,6 +355,11 @@ public:
     shared_ptr<texture> normal_tex;     // tangent-space normal map
     double normal_strength;
 
+    // Optional alpha mask texture (single-channel or image alpha)
+    shared_ptr<texture> alpha_tex;
+    bool alpha_double_sided = true;
+    double alpha_cutoff = 0.5;
+
     // Dielectric F0 when metallic = 0 (0.04 is common)
     colour  dielectric_F0;
 
@@ -398,14 +407,20 @@ public:
         shared_ptr<texture> roughness,
         shared_ptr<texture> normal_map,
         double normal_strength_in = 1.0,
-        const colour& dielectric_specular = colour(0.04, 0.04, 0.04)
+        const colour& dielectric_specular = colour(0.04, 0.04, 0.04),
+        shared_ptr<texture> alpha_map = nullptr,
+        bool alpha_double_sided_in = true,
+        double alpha_cutoff_in = 0.5
     )
         : dielectric_F0(dielectric_specular),
           base_tex(base_color),
           metallic_tex(metallic),
           roughness_tex(roughness),
           normal_tex(normal_map),
-          normal_strength(normal_strength_in)
+          normal_strength(normal_strength_in),
+          alpha_tex(alpha_map),
+          alpha_double_sided(alpha_double_sided_in),
+          alpha_cutoff(alpha_cutoff_in)
     {}
 
     virtual colour albedo(const hit_record& rec) const override {
@@ -420,6 +435,14 @@ public:
         colour& attenuation,
         ray& scattered
     ) const override {
+
+        // Alpha mask: if present and indicates transparent, behave as if no hit
+        if (alpha_tex) {
+            double a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+            if (alpha_double_sided || rec.front_face) {
+                if (a < alpha_cutoff) return false;
+            }
+        }
 
         // ----------------
         // Fetch parameters
@@ -600,6 +623,13 @@ public:
 
     // Proper PBR direct shading using GGX microfacet BRDF (energy-conserving)
     virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li) const override {
+        // Alpha mask: if present and transparent, contribute nothing
+        if (alpha_tex) {
+            double a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+            if (alpha_double_sided || rec.front_face) {
+                if (a < alpha_cutoff) return colour(0,0,0);
+            }
+        }
         // Reconstruct the shading normal from the normal map (if present)
         vec3 Ngeom = rec.normal;
         vec3 N = Ngeom;
@@ -689,6 +719,16 @@ public:
         // Final outgoing radiance: f * Li * cosθ
         return brdf * Li * (float)NdotL;
     }
+
+        // Mask test for triangle-level discard
+        virtual bool is_masked_transparent(const hit_record& rec) const override {
+            if (!alpha_tex) return false;
+            double a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+            if (alpha_double_sided || rec.front_face) {
+                return a < alpha_cutoff;
+            }
+            return false;
+        }
 };
 
 
