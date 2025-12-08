@@ -6,6 +6,7 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include "caustics.h"
 #include <vector>
 #include <atomic>
 #include <limits>
@@ -300,6 +301,13 @@ class camera {
         return result;
     }
 
+    public:
+    // Public setter for caustics photon map
+    void set_caustics(const photon_map& pm, double radius) {
+        caustics = pm;
+        caustics_radius = radius;
+    }
+
     // simple integer hash -> double in [0,1)
     static double pixel_hash_double(int a, int b) {
         unsigned int n = (unsigned int)(a * 73856093u ^ b * 19349663u);
@@ -313,14 +321,35 @@ class camera {
         ray    current_ray = r0;
         colour throughput(1.0, 1.0, 1.0);
         colour result(0,0,0);
+        bool passed_through_glass = false;  // track if ray went through dielectric
 
         for (int depth = 0; depth < max_depth; ++depth) {
 
             hit_record rec;
 
-            // Miss: accumulate background and stop
+            // Miss: accumulate environment background (optionally sun disc) and stop
             if (!world.hit(current_ray, interval(0.001, infinity), rec)) {
-                result += throughput * background;
+                colour env = background;
+
+                // If sun is enabled, add environment sun radiance when ray
+                // points toward the sun disc. This lets path-traced rays
+                // pick up sun light like emissive backgrounds.
+                if (use_sun) {
+                    vec3 w = unit_vector(current_ray.direction());   // from camera into scene
+                    vec3 to_sun = unit_vector(sun_dir);               // scene -> sun
+
+                    double ang_rad = degrees_to_radians(sun_angular_radius);
+                    double cos_max = std::cos(std::max(0.0, ang_rad));
+                    double cos_theta = dot(w, to_sun);
+                    if (cos_theta >= cos_max) {
+                        // Soft edge weighting: map cosθ in [cos_max, 1] to [0,1]
+                        double t = (cos_theta - cos_max) / std::max(1e-6, (1.0 - cos_max));
+                        t = std::clamp(t, 0.0, 1.0);
+                        env += sun_radiance * (float)t;
+                    }
+                }
+
+                result += throughput * env;
                 break;
             }
 
@@ -339,6 +368,15 @@ class camera {
             colour emitted = rec.mat->emitted(rec.u, rec.v, rec.p);
             result += throughput * emitted;
 
+            // Caustics lookup on diffuse receivers.
+            // Since the photon map stores only caustic photons (paths that
+            // went through a dielectric), we can query unconditionally on
+            // non-specular hits.
+            if (!rec.mat->is_specular()) {
+                colour Lc = caustics.query(rec.p, caustics_radius);
+                result += throughput * Lc;
+            }
+
             // Scatter
             ray    scattered;
             colour attenuation;
@@ -348,55 +386,52 @@ class camera {
                 break;
             }
 
+            // Track whether path went through glass (for future use/debug)
+            if (!rec.front_face && rec.mat->is_dielectric()) passed_through_glass = true;
+
             // Directional sun (camera-mirrored) support: sample soft sun/shadows if enabled.
             if (use_sun) {
                 // central sun direction (FROM scene toward sun)
                 vec3 Lc = unit_vector(sun_dir);
-                double NdotLc = dot(rec.normal, Lc);
-                if (NdotLc > 0.0) {
-                    int samples = std::max(1, sun_shadow_samples);
-                    double ang_rad = degrees_to_radians(sun_angular_radius);
-                    double cos_theta_max = std::cos(ang_rad);
+                int samples = std::max(1, sun_shadow_samples);
+                double ang_rad = degrees_to_radians(sun_angular_radius);
+                double cos_theta_max = std::cos(ang_rad);
 
-                    double vis = 0.0;
-                    for (int si = 0; si < samples; ++si) {
-                        vec3 Ls = Lc;
-                        if (ang_rad > 0.0 && samples > 1) {
-                            // sample a direction within the spherical cap around Lc
-                            double u = random_double();
-                            double v = random_double();
-                            double cos_theta = (1.0 - u) + u * cos_theta_max; // mix in [1, cos_theta_max]
-                            double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
-                            double phi = 2.0 * pi * v;
+                double vis = 0.0;
+                for (int si = 0; si < samples; ++si) {
+                    vec3 Ls = Lc;
+                    if (ang_rad > 0.0 && samples > 1) {
+                        // sample a direction within the spherical cap around Lc
+                        double u = random_double();
+                        double v = random_double();
+                        double cos_theta = (1.0 - u) + u * cos_theta_max; // mix in [1, cos_theta_max]
+                        double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
+                        double phi = 2.0 * pi * v;
 
-                            double x = sin_theta * std::cos(phi);
-                            double y = sin_theta * std::sin(phi);
-                            double z = cos_theta;
+                        double x = sin_theta * std::cos(phi);
+                        double y = sin_theta * std::sin(phi);
+                        double z = cos_theta;
 
-                            // build orthonormal basis around Lc
-                            vec3 w_s = Lc;
-                            vec3 a = (std::fabs(w_s.x()) > 0.1) ? vec3(0,1,0) : vec3(1,0,0);
-                            vec3 u_s = unit_vector(cross(a, w_s));
-                            vec3 v_s = cross(w_s, u_s);
+                        // build orthonormal basis around Lc
+                        vec3 w_s = Lc;
+                        vec3 a = (std::fabs(w_s.x()) > 0.1) ? vec3(0,1,0) : vec3(1,0,0);
+                        vec3 u_s = unit_vector(cross(a, w_s));
+                        vec3 v_s = cross(w_s, u_s);
 
-                            Ls = unit_vector(u_s * (float)x + v_s * (float)y + w_s * (float)z);
-                        }
-
-                        double NdotL = dot(rec.normal, Ls);
-                        if (NdotL <= 0.0) continue;
-
-                        ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
-                        // Compute deterministic transmittance along the shadow ray
-                        double tr = compute_transmittance(shadow_ray, std::numeric_limits<double>::infinity(), world);
-                        vis += tr;
+                        Ls = unit_vector(u_s * (float)x + v_s * (float)y + w_s * (float)z);
                     }
 
-                    vis /= double(samples);
-                    if (vis > 0.0) {
-                        vec3 V = -unit_vector(current_ray.direction());
-                        colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance, world);
-                        result += throughput * (direct * (float)vis);
-                    }
+                    // Shadow ray transmittance regardless of N⋅L sign so dielectrics can transmit
+                    ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
+                    double tr = compute_transmittance(shadow_ray, std::numeric_limits<double>::infinity(), world);
+                    vis += tr;
+                }
+
+                vis /= double(samples);
+                if (vis > 0.0) {
+                    vec3 V = -unit_vector(current_ray.direction());
+                    colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance, world);
+                    result += throughput * (direct * (float)vis);
                 }
             }
 
@@ -450,6 +485,11 @@ class camera {
 
         return result;
     }
+
+    public:
+        // Caustics photon map (built externally before rendering); queried on diffuse hits
+        photon_map caustics;
+        double     caustics_radius = 0.08; // gather radius
 
     // Compute deterministic transmittance along a ray up to max_t by
     // accumulating per-hit material opacity (alpha). Returns value in

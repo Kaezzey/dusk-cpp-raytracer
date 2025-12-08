@@ -4282,22 +4282,86 @@ int main()
                 }
 
                 g_render_thread = std::thread([world_copy, cam_copy]() mutable {
-                    render_result img =
-                        g_renderer.render(*world_copy, cam_copy,
-                                          &g_cancel_flag, &g_render_progress,
-                                          // progress callback: write partial image into shared result
-                                          [](const render_result& partial) {
-                                              std::lock_guard<std::mutex> lock(g_render_mutex);
-                                              g_render_result = partial;
-                                              g_render_has_result = true;
-                                          });
+                    try {
+                        std::fprintf(stderr, "\n=== RENDER THREAD START ===\n");
+                        std::fprintf(stderr, "[RENDER] Thread ID: %zu\n", std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                        std::fprintf(stderr, "[RENDER] World copy valid: %s\n", world_copy ? "YES" : "NO");
+                        std::fprintf(stderr, "[RENDER] Camera image size: %dx%d\n", cam_copy.image_width, cam_copy.image_height);
+                        std::fprintf(stderr, "[RENDER] Camera use_sun: %s\n", cam_copy.use_sun ? "YES" : "NO");
+                        
+                        // Build caustics photon map once before render
+                        if (cam_copy.use_sun) {
+                            std::fprintf(stderr, "[CAUSTICS] Starting photon map build...\n");
+                            std::fprintf(stderr, "[CAUSTICS] Sun direction: (%.3f, %.3f, %.3f)\n", 
+                                cam_copy.sun_dir.x(), cam_copy.sun_dir.y(), cam_copy.sun_dir.z());
+                            std::fprintf(stderr, "[CAUSTICS] Sun radiance: (%.3f, %.3f, %.3f)\n", 
+                                cam_copy.sun_radiance.x(), cam_copy.sun_radiance.y(), cam_copy.sun_radiance.z());
+                            
+                            caustics_config cfg;
+                            cfg.photon_count   = 2000000;
+                            cfg.max_bounces    = 10;
+                            cfg.deposit_radius = 0.2;
+                            cfg.intensity_scale= 85.0;
+                            
+                            std::fprintf(stderr, "[CAUSTICS] Config: photons=%d, bounces=%d, radius=%.3f, scale=%.1f\n",
+                                cfg.photon_count, (int)cfg.max_bounces, cfg.deposit_radius, cfg.intensity_scale);
+                            
+                            photon_map pm;
+                            std::fprintf(stderr, "[CAUSTICS] Photon map allocated\n");
+                            
+                            build_sun_caustics(cam_copy.sun_dir, cam_copy.sun_radiance,
+                                               *world_copy, cfg, pm);
+                            
+                            std::fprintf(stderr, "[CAUSTICS] Photon map built. Size: %zu photons\n", pm.size());
+                            
+                            cam_copy.set_caustics(pm, cfg.deposit_radius);
+                            std::fprintf(stderr, "[CAUSTICS] Photon map assigned to camera\n");
+                        }
+                        
+                        std::fprintf(stderr, "[RENDER] Starting renderer.render()...\n");
+                        render_result img =
+                            g_renderer.render(*world_copy, cam_copy,
+                                              &g_cancel_flag, &g_render_progress,
+                                              // progress callback: write partial image into shared result
+                                              [](const render_result& partial) {
+                                                  try {
+                                                      std::lock_guard<std::mutex> lock(g_render_mutex);
+                                                      g_render_result = partial;
+                                                      g_render_has_result = true;
+                                                  } catch (const std::exception& e) {
+                                                      std::fprintf(stderr, "[ERROR] Progress callback exception: %s\n", e.what());
+                                                  } catch (...) {
+                                                      std::fprintf(stderr, "[ERROR] Progress callback unknown exception\n");
+                                                  }
+                                              });
 
-                    // final result: store and mark final-ready
-                    {
-                        std::lock_guard<std::mutex> lock(g_render_mutex);
-                        g_render_result = std::move(img);
-                        g_render_has_result = true;
-                        g_render_final_image_ready.store(true);
+                        std::fprintf(stderr, "[RENDER] Render completed. Image size: %dx%d, %zu pixels\n",
+                            img.width, img.height, img.pixels.size());
+
+                        // final result: store and mark final-ready
+                        {
+                            std::fprintf(stderr, "[RENDER] Acquiring mutex for final result...\n");
+                            std::lock_guard<std::mutex> lock(g_render_mutex);
+                            std::fprintf(stderr, "[RENDER] Moving result to global...\n");
+                            g_render_result = std::move(img);
+                            g_render_has_result = true;
+                            g_render_final_image_ready.store(true);
+                            std::fprintf(stderr, "[RENDER] Final result stored successfully\n");
+                        }
+                        
+                        std::fprintf(stderr, "=== RENDER THREAD END (success) ===\n\n");
+                        
+                    } catch (const std::bad_alloc& e) {
+                        std::fprintf(stderr, "\n!!! FATAL: Memory allocation failed in render thread !!!\n");
+                        std::fprintf(stderr, "[EXCEPTION] bad_alloc: %s\n", e.what());
+                        std::fprintf(stderr, "[CRASH] Likely ran out of memory during photon map or render buffer allocation\n");
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "\n!!! FATAL: Exception in render thread !!!\n");
+                        std::fprintf(stderr, "[EXCEPTION] Type: std::exception\n");
+                        std::fprintf(stderr, "[EXCEPTION] what(): %s\n", e.what());
+                    } catch (...) {
+                        std::fprintf(stderr, "\n!!! FATAL: Unknown exception in render thread !!!\n");
+                        std::fprintf(stderr, "[CRASH] Caught non-standard exception (possible access violation or segfault)\n");
                     }
                 });
             }

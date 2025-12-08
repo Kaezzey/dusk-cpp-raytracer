@@ -84,6 +84,10 @@ class material {
     // direct-diffuse lighting (e.g. lambert terms) for them.
         virtual bool is_specular() const { return false; }
 
+    // Identify dielectric materials explicitly (glass, water, etc.)
+    // Default false; overridden by dielectric.
+    virtual bool is_dielectric() const { return false; }
+
     // Direct-shading hook for direct lights. Default is
     // Lambertian: albedo * Li * (NdotL / pi). V is the view direction
     // (pointing out from the surface).
@@ -239,11 +243,12 @@ class dielectric : public material {
     }
     
     bool is_specular() const override { return true; }
+    bool is_dielectric() const override { return true; }
 
-    // Direct shading for dielectrics: only a specular Fresnel reflection
-    // (no diffuse). Transmission of light into the scene is handled by
-    // refracted scattering paths, so shadows behind the glass remain
-    // dark unless light is transmitted through the medium.
+    // Direct shading for dielectrics: add specular Fresnel reflection
+    // and a thin transmission lobe toward directional/point lights.
+    // This helps reproduce the bright caustic spot beneath glass when
+    // using direct lights (sun) similarly to emissive geometry.
     colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li, const hittable& /*world*/, double vis = 1.0) const override {
         vec3 N = rec.normal;
         vec3 L = unit_vector(Ldir);
@@ -287,6 +292,55 @@ class dielectric : public material {
         double r0 = (etai - etat) / (etai + etat);
         r0 = r0 * r0;
         colour F = schlick_fresnel(std::max(0.0, VdotH), colour((float)r0, (float)r0, (float)r0));
+
+        // --- Specular reflection term (microfacet GGX) ---
+        colour spec = F * (float)((D * G) / std::max(1e-6, 4.0 * NdotL * NdotV));
+        colour direct_reflect = spec * Li * (float)NdotL * (float)vis;
+
+        // --- Transmission term (thin refraction toward light) ---
+        // Model a microfacet transmission lobe that approximates how
+        // directional lights focus under glass. We use (1-F) energy for
+        // transmission and a simple thin-surface refraction factor.
+        colour direct_transmit(0,0,0);
+        {
+            // Compute a refracted light direction through a thin interface.
+            // This improves the hotspot by aiming transmission toward the exit.
+            double eta = etai / etat;
+            vec3 L_refr;
+            bool has_refract = false;
+            {
+                vec3 L_in = L;
+                double cosI = clamp01(dot(-L_in, N));
+                double sin2T = eta * eta * std::max(0.0, 1.0 - cosI * cosI);
+                if (sin2T < 1.0) {
+                    double cosT = std::sqrt(std::max(0.0, 1.0 - sin2T));
+                    L_refr = eta * L_in + (eta * cosI - cosT) * N;
+                    L_refr = unit_vector(L_refr);
+                    has_refract = true;
+                }
+            }
+
+            if (has_refract) {
+                // Use exit-facing cosine for energy coupling
+                double NdotL_exit = std::max(0.0, dot(-N, L_refr));
+
+                // Microfacet transmission factor
+                double denom_t = std::max(1e-6, (NdotL * NdotV));
+                double T_micro = (D * G) * std::abs(NdotL) * std::abs(NdotV) / denom_t;
+
+                // Fresnel transmission energy
+                double Fav = (F.x() + F.y() + F.z()) / 3.0;
+                double Ft = std::max(0.0, 1.0 - Fav);
+
+                // Boost for caustic sharpness; conservative cap
+                double thin_scale = 2.0 / std::max(1e-3, eta * eta);
+
+                colour T = Li * (float)(Ft * T_micro * thin_scale * NdotL_exit);
+                direct_transmit = T * (float)vis;
+            }
+        }
+
+        return direct_reflect + direct_transmit;
 
         // Specular BRDF (microfacet). Convert to outgoing radiance contribution.
         // brdf_spec = D * G * F / (4 * NdotV * NdotL)
