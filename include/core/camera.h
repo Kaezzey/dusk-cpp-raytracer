@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include "caustics.h"
+#include "mnee.h"
 #include <vector>
 #include <atomic>
 #include <limits>
@@ -66,6 +67,21 @@ class camera {
     };
 
     std::vector<point_light> point_lights;
+
+    // MNEE single-sphere caustics toggle and parameters (populated by editor)
+    bool   enable_mnee = false;
+    bool   mnee_has_sphere = false;
+    point3 mnee_sphere_center = point3(0,0,0);
+    double mnee_sphere_radius = 0.0;
+    double mnee_sphere_ior    = 1.5;
+    // MNEE solver tuning
+    int    mnee_per_thread_budget = 1024;
+    int    mnee_newton_max_iters  = 8;
+    double mnee_newton_tol        = 1e-5;
+    double mnee_step_eps          = 1e-3;
+    // Sun disc sampling and gain control for broader/brighter caustics
+    int    mnee_sun_samples       = 4;
+    double mnee_gain_scale        = 1.0;
 
     void render(const hittable& world, std::ostream& out = std::cout){
         
@@ -375,6 +391,24 @@ class camera {
             if (!rec.mat->is_specular()) {
                 colour Lc = caustics.query(rec.p, caustics_radius);
                 result += throughput * Lc;
+
+                if (enable_mnee && mnee_has_sphere && use_sun) {
+                    mnee_config mc;
+                    mc.newton_max_iters = mnee_newton_max_iters;
+                    mc.newton_tol       = mnee_newton_tol;
+                    mc.step_eps         = mnee_step_eps;
+                    mc.per_thread_budget= mnee_per_thread_budget;
+                    mc.sun_ang_radius   = sun_angular_radius * (pi / 180.0);
+                    mc.sun_samples      = mnee_sun_samples;
+                    mc.gain_scale       = mnee_gain_scale;
+                    colour Lm = mnee_single_sphere_estimate(
+                        rec.p, rec.normal,
+                        unit_vector(sun_dir), sun_radiance,
+                        mnee_sphere_center, mnee_sphere_radius, mnee_sphere_ior,
+                        world, mc
+                    );
+                    result += throughput * Lm;
+                }
             }
 
             // Scatter

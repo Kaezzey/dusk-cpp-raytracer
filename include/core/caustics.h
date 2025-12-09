@@ -29,8 +29,8 @@ public:
         ++count;
     }
 
-    // Query photons within radius r around p; return accumulated radiance estimate
-    colour query(const point3& p, double radius) const {
+    // Fixed-radius query around p; return accumulated radiance estimate
+    colour query_radius(const point3& p, double radius) const {
         if (count == 0) return colour(0,0,0);
         colour sum(0,0,0);
         double r2 = radius * radius;
@@ -65,11 +65,68 @@ public:
         return sum * (float)(intensity_scale / norm);
     }
 
+    // Backward-compatible query: if knn_k > 0 use k-NN, else fixed radius
+    colour query(const point3& p, double radius) const {
+        if (knn_k > 0) return query_knn(p, knn_k);
+        return query_radius(p, radius);
+    }
+
+    // k-NN query with cone filter: gather closest k photons and normalize by an effective radius
+    colour query_knn(const point3& p, int k) const {
+        if (count == 0 || k <= 0) return colour(0,0,0);
+
+        // Collect candidate photons from neighboring buckets
+        struct Cand { const photon* ph; double dist2; };
+        std::vector<Cand> cands;
+        cands.reserve((size_t)k * 4);
+
+        ivec3 base = cell_coord(p);
+        for (int dz=-1; dz<=1; ++dz)
+        for (int dy=-1; dy<=1; ++dy)
+        for (int dx=-1; dx<=1; ++dx) {
+            ivec3 c = ivec3(base.x+dx, base.y+dy, base.z+dz);
+            auto it = buckets.find(cell_hash(c));
+            if (it == buckets.end()) continue;
+            for (const auto& ph : it->second) {
+                vec3 d = ph.pos - p;
+                double dist2 = dot(d,d);
+                cands.push_back(Cand{&ph, dist2});
+            }
+        }
+
+        if (cands.empty()) return colour(0,0,0);
+
+        // Partial sort to get k closest
+        int kk = std::min<int>(k, (int)cands.size());
+        std::nth_element(cands.begin(), cands.begin()+kk, cands.end(),
+                         [](const Cand& a, const Cand& b){ return a.dist2 < b.dist2; });
+
+        // Effective radius = distance to k-th neighbor
+        double r2_eff = cands[kk-1].dist2;
+        if (r2_eff <= 0.0) r2_eff = 1e-12; // avoid zero
+        double r_eff = std::sqrt(r2_eff);
+
+        colour sum(0,0,0);
+        for (int i = 0; i < kk; ++i) {
+            const photon* ph = cands[i].ph;
+            double dist = std::sqrt(cands[i].dist2);
+            double weight = 1.0 - (dist / r_eff);
+            if (weight < 0.0) weight = 0.0;
+            weight = weight * weight;
+            sum += ph->power * (float)weight;
+        }
+
+        // Normalize by cone kernel integral using r_eff
+        double norm = (2.0 / 3.0) * M_PI * r_eff * r_eff;
+        return sum * (float)(intensity_scale / norm);
+    }
+
     size_t size() const { return count; }
 
     // Configuration
     double cell_size = 0.2; // world units; tune per scene scale
     double intensity_scale = 1.0; // global gain applied to queries
+    int    knn_k = 64; // k for k-NN queries
 
 private:
     struct ivec3 { int x,y,z; ivec3(int a=0,int b=0,int c=0):x(a),y(b),z(c){} };
@@ -100,6 +157,8 @@ struct caustics_config {
     double deposit_radius     = 0.05;    // gather radius
     double termination_prob   = 0.0;     // optional RR
     double intensity_scale    = 50.0;    // boost to match sun energy scale
+    int    min_specular_events= 2;       // require N specular events before deposit
+    int    knn_k              = 64;      // k-NN k
 };
 
 // Build a caustics photon map by emitting photons from sun
@@ -111,6 +170,7 @@ inline void build_sun_caustics(const vec3& sun_dir, const colour& sun_radiance,
     std::fprintf(stderr, "[CAUSTICS::BUILD] Entry\n");
     out_map.clear();
     out_map.intensity_scale = cfg.intensity_scale;
+    out_map.knn_k = cfg.knn_k;
     std::fprintf(stderr, "[CAUSTICS::BUILD] Map cleared, intensity_scale=%.1f\n", cfg.intensity_scale);
     
     // L is direction FROM scene toward sun; we shoot photons in -L direction
@@ -162,6 +222,7 @@ inline void build_sun_caustics(const vec3& sun_dir, const colour& sun_radiance,
         ray r(origin, shoot_dir, 0.0);
         colour throughput = flux;
         bool saw_dielectric = false; // require at least one dielectric event before deposit
+        int  spec_events = 0;
 
         for (int b=0; b<cfg.max_bounces; ++b) {
             hit_record rec;
@@ -172,7 +233,7 @@ inline void build_sun_caustics(const vec3& sun_dir, const colour& sun_radiance,
 
             // If we hit a diffuse surface, deposit and terminate
             if (!rec.mat || (!rec.mat->is_specular())) {
-                if (saw_dielectric) {
+                if (saw_dielectric && spec_events >= cfg.min_specular_events) {
                     photon ph;
                     ph.pos   = rec.p;
                     ph.dir   = unit_vector(r.direction());  // direction photon was traveling
@@ -185,6 +246,7 @@ inline void build_sun_caustics(const vec3& sun_dir, const colour& sun_radiance,
             }
 
             hit_specular++;
+            spec_events++;
             
             // Specular: scatter (reflect/refract)
             ray scattered;

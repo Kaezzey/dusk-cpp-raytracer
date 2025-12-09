@@ -7,6 +7,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG")
 
+# Enable AddressSanitizer for MSVC Debug builds to pinpoint memory errors
+if (MSVC)
+    # Ensure all targets use the dynamic runtime in Debug (ASan requires /MDd)
+    # Apply to targets after creation as well (we also set it again per-target below)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
 # Headers (your core engine)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
@@ -30,6 +37,11 @@ add_library(imgui STATIC ${IMGUI_SOURCES})
 target_include_directories(imgui PUBLIC
     ${IMGUI_DIR}
 )
+
+if (MSVC)
+    # Match runtime library; avoid LNK2038 CRT mismatch in Debug
+    set_property(TARGET imgui PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
 
 # ---------------------------------------------------------------------------
 # GLFW: headers + prebuilt libs in include/external
@@ -83,6 +95,40 @@ add_executable(Dusktracer
     src/core/editor_main.cpp
     ${DUSK_SOURCES}
 )
+
+if (MSVC)
+    # AddressSanitizer only for Debug configuration
+    target_compile_options(Dusktracer PRIVATE
+        $<$<CONFIG:Debug>:/fsanitize=address>
+        $<$<CONFIG:Debug>:/Zi>
+        $<$<CONFIG:Debug>:/Od>
+    )
+    target_link_options(Dusktracer PRIVATE
+        $<$<CONFIG:Debug>:/fsanitize=address>
+        $<$<CONFIG:Debug>:/DEBUG:FULL>
+        $<$<CONFIG:Debug>:/INCREMENTAL:NO>
+    )
+    # Ensure the expected runtime in Debug for ASan
+    set_property(TARGET Dusktracer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
+    # Configure ASan logging and a helper run target
+    set(ASAN_LOG_DIR "${CMAKE_BINARY_DIR}/asan-logs")
+    file(MAKE_DIRECTORY "${ASAN_LOG_DIR}")
+    set(_ASAN_ENV "ASAN_OPTIONS=log_path=${ASAN_LOG_DIR}/asan;fast_unwind_on_fatal=0;handle_abort=1;handle_segv=1;halt_on_error=1;verbosity=1")
+    set(_OMP_ENV "OMP_NUM_THREADS=1")
+
+    # When launching under Visual Studio, set environment and working dir
+    set_property(TARGET Dusktracer PROPERTY VS_DEBUGGER_ENVIRONMENT "${_ASAN_ENV}\n${_OMP_ENV}")
+    set_property(TARGET Dusktracer PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+    # Convenience target to run with ASan env from CMake/CLI
+    add_custom_target(ASanRun
+        COMMAND ${CMAKE_COMMAND} -E env ${_ASAN_ENV} ${_OMP_ENV} $<TARGET_FILE:Dusktracer>
+        DEPENDS Dusktracer
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        VERBATIM
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # Windows icon resource (for EXE/taskbar/titlebar)

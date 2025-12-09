@@ -53,6 +53,13 @@ render_result renderer::render(
 
     const int total_scanlines = h;
     const int chunk_size      = 4; // update ETA every N lines
+    const int progress_min_interval_ms = 500; // throttle partial updates
+
+    // Track which scanlines are fully written to HDR buffer
+    std::vector<char> row_done(h, 0);
+
+    // Throttle progress callbacks across all OMP workers
+    static std::atomic<long long> s_last_progress_ms{0};
 
     if (progress) {
         progress->total_scanlines           = total_scanlines;
@@ -271,50 +278,64 @@ render_result renderer::render(
 
                     progress->eta_seconds.store(eta);
                     progress->elapsed_seconds.store(elapsed);
+                }
+            }
+        }
 
-                    // If UI provided a progress callback, give it a partial image
-                    if (progress_callback) {
-                        // build a partial 8-bit image from the HDR buffer for completed rows
-                        render_result partial;
-                        partial.width = w;
-                        partial.height = h;
-                        partial.pixels.resize(w * h * 3);
+        // Mark this scanline as complete for safe partial display
+        row_done[j] = 1;
 
-                        // Tonemap/gamma only for completed scanlines (rows 0 .. done-1)
-                        auto aces_film_small = [](double x) -> double {
-                            const double a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-                            double v = (x * (a * x + b)) / (x * (c * x + d) + e);
-                            if (!std::isfinite(v) || v < 0.0) return 0.0;
-                            if (v > 1.0) return 1.0;
-                            return v;
-                        };
+        // Outside critical section: throttled partial image callback
+        if (progress_callback) {
+            auto now = clock::now();
+            long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+            long long last_ms = s_last_progress_ms.load();
+            if (now_ms - last_ms >= progress_min_interval_ms) {
+                if (s_last_progress_ms.compare_exchange_strong(last_ms, now_ms)) {
+                    // Build partial 8-bit image from completed scanlines only
+                    render_result partial;
+                    partial.width = w;
+                    partial.height = h;
+                    partial.pixels.resize((size_t)w * (size_t)h * 3);
 
-                        for (int yy = 0; yy < h; ++yy) {
-                            for (int xx = 0; xx < w; ++xx) {
-                                int idx = 3 * (yy * w + xx);
-                                if (yy < done) {
-                                    int hidx = idx;
-                                    double r_lin = (double)hdr_buffer[hidx + 0];
-                                    double g_lin = (double)hdr_buffer[hidx + 1];
-                                    double b_lin = (double)hdr_buffer[hidx + 2];
-                                    double r_t = aces_film_small(r_lin);
-                                    double g_t = aces_film_small(g_lin);
-                                    double b_t = aces_film_small(b_lin);
-                                    double r_g = linear_to_gamma(r_t);
-                                    double g_g = linear_to_gamma(g_t);
-                                    double b_g = linear_to_gamma(b_t);
-                                    partial.pixels[idx + 0] = (std::uint8_t)(int(256 * intensity.clamp(r_g)));
-                                    partial.pixels[idx + 1] = (std::uint8_t)(int(256 * intensity.clamp(g_g)));
-                                    partial.pixels[idx + 2] = (std::uint8_t)(int(256 * intensity.clamp(b_g)));
-                                } else {
-                                    partial.pixels[idx + 0] = 0;
-                                    partial.pixels[idx + 1] = 0;
-                                    partial.pixels[idx + 2] = 0;
-                                }
+                    auto aces_film_small = [](double x) -> double {
+                        const double a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+                        double v = (x * (a * x + b)) / (x * (c * x + d) + e);
+                        if (!std::isfinite(v) || v < 0.0) return 0.0;
+                        if (v > 1.0) return 1.0;
+                        return v;
+                    };
+
+                    for (int yy = 0; yy < h; ++yy) {
+                        bool done_line = (row_done[yy] != 0);
+                        for (int xx = 0; xx < w; ++xx) {
+                            int idx = 3 * (yy * w + xx);
+                            if (done_line) {
+                                int hidx = idx;
+                                double r_lin = (double)hdr_buffer[hidx + 0];
+                                double g_lin = (double)hdr_buffer[hidx + 1];
+                                double b_lin = (double)hdr_buffer[hidx + 2];
+                                double r_t = aces_film_small(r_lin);
+                                double g_t = aces_film_small(g_lin);
+                                double b_t = aces_film_small(b_lin);
+                                double r_g = linear_to_gamma(r_t);
+                                double g_g = linear_to_gamma(g_t);
+                                double b_g = linear_to_gamma(b_t);
+                                partial.pixels[idx + 0] = (std::uint8_t)(int(256 * intensity.clamp(r_g)));
+                                partial.pixels[idx + 1] = (std::uint8_t)(int(256 * intensity.clamp(g_g)));
+                                partial.pixels[idx + 2] = (std::uint8_t)(int(256 * intensity.clamp(b_g)));
+                            } else {
+                                partial.pixels[idx + 0] = 0;
+                                partial.pixels[idx + 1] = 0;
+                                partial.pixels[idx + 2] = 0;
                             }
                         }
+                    }
 
+                    try {
                         progress_callback(partial);
+                    } catch (...) {
+                        // swallow any callback exceptions to avoid breaking render
                     }
                 }
             }

@@ -98,6 +98,42 @@ static std::vector<std::string> g_dropped_files;
 static std::shared_ptr<hittable_list> g_cached_world;
 static bool g_world_dirty = true;
 
+// Update camera's MNEE sphere parameters by scanning the current scene for
+// the first dielectric sphere. Approximates world-space center and radius.
+static void UpdateMNEEFromScene()
+{
+    // Map material index -> is dielectric and store IOR
+    std::unordered_map<int, double> dielectric_ior;
+    for (int mi = 0; mi < (int)g_scene.materials.size(); ++mi) {
+        const auto& m = g_scene.materials[mi];
+        if (m.model == scene_material_model::dielectric) {
+            dielectric_ior[mi] = m.ior;
+        }
+    }
+
+    g_camera.mnee_has_sphere = false;
+
+    for (const auto& obj : g_scene.objects) {
+        if (obj.type != scene_object_type::sphere) continue;
+        if (obj.material_index < 0) continue;
+        auto it = dielectric_ior.find(obj.material_index);
+        if (it == dielectric_ior.end()) continue;
+
+        // World center = object translation + local center
+        point3 localC = obj.center;
+        vec3   worldC = obj.translation + vec3(localC.x(), localC.y(), localC.z());
+        // Approximate radius with average scale
+        double s = (std::abs(obj.scale.x()) + std::abs(obj.scale.y()) + std::abs(obj.scale.z())) / 3.0;
+        double worldR = obj.radius * s;
+
+        g_camera.mnee_sphere_center = point3(worldC.x(), worldC.y(), worldC.z());
+        g_camera.mnee_sphere_radius = worldR;
+        g_camera.mnee_sphere_ior    = it->second;
+        g_camera.mnee_has_sphere    = true;
+        break; // first match only
+    }
+}
+
 // Async render thread + result handoff
 static std::thread g_render_thread;
 static std::mutex  g_render_mutex;
@@ -110,6 +146,11 @@ static std::atomic<bool> g_render_final_image_ready{false};
 static GLFWwindow*            g_progress_window = nullptr;
 static std::thread            g_progress_window_thread;
 static std::atomic<bool>      g_progress_window_running{false};
+
+// Delayed progress popup control
+static int                                        g_progress_popup_delay_ms = 800; // delay before showing progress window
+static bool                                       g_progress_popup_pending  = false;
+static std::chrono::steady_clock::time_point      g_progress_request_time;
 
 // -----------------------------------------------------------------------------
 // Ray-traced image texture
@@ -2801,6 +2842,8 @@ int main()
                 }
                 // Stop the separate progress window now that render finished
                 stop_progress_window_thread();
+                // clear any pending popup
+                g_progress_popup_pending = false;
                 // Save final image to disk using existing helper
                 {
                     const std::string out_path = "Renders/LastRender.ppm";
@@ -2815,6 +2858,16 @@ int main()
                 g_render_in_progress = false;
                 g_cancel_flag.store(false);
                 g_render_final_image_ready.store(false);
+            }
+        }
+
+        // Start progress window after configured delay
+        if (g_render_in_progress && g_progress_popup_pending && !g_progress_window_running.load()) {
+            auto now = std::chrono::steady_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_progress_request_time).count();
+            if (ms >= g_progress_popup_delay_ms) {
+                start_progress_window_thread();
+                g_progress_popup_pending = false;
             }
         }
 
@@ -4260,8 +4313,9 @@ int main()
                 g_cancel_flag.store(false);
                 g_render_in_progress = true;
 
-                // open OS progress window to show progressive updates
-                start_progress_window_thread();
+                // schedule progress window popup after a short delay
+                g_progress_request_time = std::chrono::steady_clock::now();
+                g_progress_popup_pending = true;
 
                 // Kick off worker thread
                 auto world_copy = g_cached_world;
@@ -4301,7 +4355,7 @@ int main()
                             cfg.photon_count   = 2000000;
                             cfg.max_bounces    = 10;
                             cfg.deposit_radius = 0.2;
-                            cfg.intensity_scale= 85.0;
+                            cfg.intensity_scale= 100.0;
                             
                             std::fprintf(stderr, "[CAUSTICS] Config: photons=%d, bounces=%d, radius=%.3f, scale=%.1f\n",
                                 cfg.photon_count, (int)cfg.max_bounces, cfg.deposit_radius, cfg.intensity_scale);
@@ -4377,6 +4431,8 @@ int main()
                 g_cancel_flag.store(true);
                 // close the progress window immediately on cancel
                 stop_progress_window_thread();
+                // cancel any pending popup
+                g_progress_popup_pending = false;
             }
         } else {
             ImGui::TextDisabled("Move camera / edit objects / materials, then click Render.");
@@ -4402,6 +4458,42 @@ int main()
         }
 
         ImGui::Separator();
+
+        // Specular caustics via MNEE toggle
+        {
+            bool prev = g_camera.enable_mnee;
+            ImGui::Checkbox("Specular Caustics (MNEE)", &g_camera.enable_mnee);
+            if (g_camera.enable_mnee && !prev) {
+                UpdateMNEEFromScene();
+            }
+            if (!g_camera.enable_mnee) {
+                g_camera.mnee_has_sphere = false;
+            }
+            if (g_camera.enable_mnee) {
+                if (g_camera.mnee_has_sphere) {
+                    ImGui::Text("MNEE Sphere: C=(%.3f, %.3f, %.3f) R=%.3f IOR=%.3f",
+                        g_camera.mnee_sphere_center.x(), g_camera.mnee_sphere_center.y(), g_camera.mnee_sphere_center.z(),
+                        g_camera.mnee_sphere_radius, g_camera.mnee_sphere_ior);
+                    ImGui::SliderInt("MNEE Budget/thread", &g_camera.mnee_per_thread_budget, 64, 8192);
+                    ImGui::SliderInt("MNEE Sun samples", &g_camera.mnee_sun_samples, 1, 32);
+                    {
+                        float gain = (float)g_camera.mnee_gain_scale;
+                        if (ImGui::SliderFloat("MNEE Gain scale", &gain, 0.5f, 3.0f)) {
+                            g_camera.mnee_gain_scale = gain;
+                        }
+                    }
+                    {
+                        double ang = g_camera.sun_angular_radius;
+                        float angf = (float)ang;
+                        if (ImGui::SliderFloat("Sun angular radius (deg)", &angf, 0.0f, 2.0f)) {
+                            g_camera.sun_angular_radius = (double)angf;
+                        }
+                    }
+                } else {
+                    ImGui::TextDisabled("No dielectric sphere found in scene.");
+                }
+            }
+        }
 
         ImGui::Text("Viewport Mode:");
         ImGui::SameLine();
