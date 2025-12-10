@@ -4,6 +4,7 @@
 #include "dusk_image.h"
 #include "perlin.h"
 #include "dusk_image.h"
+#include <algorithm>
 
 class texture {
   public:
@@ -11,6 +12,11 @@ class texture {
     virtual colour value(double u, double v, const point3& p) const = 0;
     // Alpha sampling: return alpha in [0,1]. Default = 1 (opaque)
     virtual double alpha_at(double u, double v, const point3& p) const { return 1.0; }
+    // Mask-aware alpha sampling: when a texture is explicitly used as an
+    // opacity mask, `mask_alpha_at` should be used so implementations can
+    // interpret RGB images as luminance masks if desired. Default forwards
+    // to `alpha_at` for backwards compatibility.
+    virtual double mask_alpha_at(double u, double v, const point3& p) const { return alpha_at(u,v,p); }
 };
 
 class solid_colour : public texture {
@@ -97,9 +103,63 @@ class image_texture : public texture {
 
         auto i = int(u * image.width());
         auto j = int(v * image.height());
-        if (!image.has_alpha()) return 1.0;
-        auto a = image.pixel_alpha_byte(i, j);
-        return double(a) / 255.0;
+
+        // If the image has an explicit alpha channel, use it.
+        if (image.has_alpha()) {
+          auto a = image.pixel_alpha_byte(i, j);
+          return double(a) / 255.0;
+        }
+
+        // No explicit alpha channel: only treat true mask images as alpha.
+        // Behaviour:
+        //  - 1-channel image: use that channel as alpha (common for masks)
+        //  - 2-channel image: treat second channel as alpha (grey+alpha)
+        //  - 3-channel (RGB): do NOT derive alpha from luminance here because
+        //    RGB albedo textures should not be interpreted as opacity masks.
+        //    Return fully opaque so PBR fallback doesn't accidentally mask geometry.
+        const unsigned char* pix = image.pixel_data(i, j);
+        int ch = image.channels();
+        if (ch <= 0) return 1.0;
+        if (ch == 1) {
+          return double(pix[0]) / 255.0;
+        } else if (ch == 2) {
+          // gray + alpha (second channel is alpha)
+          return double(pix[1]) / 255.0;
+        } else {
+          // 3 or more channels but no explicit alpha -> treat as opaque
+          return 1.0;
+        }
+
+      }
+
+      // When this texture is being used specifically as an opacity mask,
+      // interpret RGB images as luminance masks so artists can supply RGB
+      // mask files. If the image contains an alpha channel, prefer that.
+      double mask_alpha_at(double u, double v, const point3& p) const override {
+        if (image.height() <= 0) return 1.0;
+
+        u = interval(0,1).clamp(u);
+        v = 1.0 - interval(0,1).clamp(v);
+
+        auto i = int(u * image.width());
+        auto j = int(v * image.height());
+
+        if (image.has_alpha()) {
+            auto a = image.pixel_alpha_byte(i, j);
+            return double(a) / 255.0;
+        }
+
+        const unsigned char* pix = image.pixel_data(i, j);
+        int ch = image.channels();
+        if (ch <= 0) return 1.0;
+        if (ch == 1) return double(pix[0]) / 255.0;
+        if (ch == 2) return double(pix[1]) / 255.0;
+
+        // RGB or larger: compute perceived luminance as mask value.
+        double r = double(pix[0]) / 255.0;
+        double g = double(pix[1]) / 255.0;
+        double b = double(pix[2]) / 255.0;
+        return std::clamp(0.2126 * r + 0.7152 * g + 0.0722 * b, 0.0, 1.0);
       }
 
   private:

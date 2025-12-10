@@ -98,6 +98,125 @@ static std::vector<std::string> g_dropped_files;
 static std::shared_ptr<hittable_list> g_cached_world;
 static bool g_world_dirty = true;
 
+// Small GL thumbnail cache for texture assets (path -> GL texture)
+static std::unordered_map<std::string, GLuint> g_texture_thumb_cache;
+static int g_thumb_budget_per_frame = 4;
+static int g_thumb_budget_default = 4;
+static int g_thumbs_created_this_frame = 0;
+
+// CPU-side preload cache for textures. Background thread will fill this with
+// decoded RGBA8 pixel data so the main thread can upload to GL without doing
+// slow file IO on the UI thread.
+struct CpuImage {
+    int w = 0, h = 0, comp = 4;
+    std::vector<unsigned char> pixels;
+};
+static std::unordered_map<std::string, CpuImage> g_texture_cpu_cache;
+static std::mutex g_texture_cpu_cache_mutex;
+static std::atomic<bool> g_asset_preloader_running{false};
+static std::thread g_asset_preloader_thread;
+
+static GLuint CreateTextureThumbnail(const std::string& path)
+{
+    int w = 0, h = 0, comp = 0;
+    stbi_uc* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
+    if (!pixels || w <= 0 || h <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return 0;
+    }
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    stbi_image_free(pixels);
+
+    g_texture_thumb_cache[path] = tex;
+    return tex;
+}
+
+static GLuint GetOrCreateTextureThumbnail(const std::string& path)
+{
+    // If GL texture already exists, return it
+    auto it = g_texture_thumb_cache.find(path);
+    if (it != g_texture_thumb_cache.end()) return it->second;
+
+    // If we have preloaded CPU pixels, upload them (respecting per-frame budget)
+    {
+        std::lock_guard<std::mutex> lk(g_texture_cpu_cache_mutex);
+        auto it2 = g_texture_cpu_cache.find(path);
+        if (it2 != g_texture_cpu_cache.end()) {
+            if (g_thumbs_created_this_frame >= g_thumb_budget_per_frame) return 0;
+            // create GL texture from CPU pixels
+            CpuImage img = std::move(it2->second);
+            g_texture_cpu_cache.erase(it2);
+            GLuint tex = 0;
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, img.w, img.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.pixels.data());
+            glBindTexture(GL_TEXTURE_2D, 0);
+            g_texture_thumb_cache[path] = tex;
+            ++g_thumbs_created_this_frame;
+            return tex;
+        }
+    }
+
+    // Fallback: load synchronously (rare path). Respect budget as well.
+    if (g_thumbs_created_this_frame >= g_thumb_budget_per_frame) return 0;
+    GLuint tex = CreateTextureThumbnail(path);
+    if (tex) ++g_thumbs_created_this_frame;
+    return tex;
+}
+
+// Background thread: preload texture files into CPU memory (RGBA8)
+static void AssetPreloaderThreadMain()
+{
+    g_asset_preloader_running.store(true);
+    // iterate over scene textures once
+    for (const auto& t : g_scene.textures) {
+        const std::string& path = t.path;
+        {
+            std::lock_guard<std::mutex> lk(g_texture_cpu_cache_mutex);
+            if (g_texture_thumb_cache.find(path) != g_texture_thumb_cache.end()) continue; // already uploaded
+            if (g_texture_cpu_cache.find(path) != g_texture_cpu_cache.end()) continue; // already preloaded
+        }
+
+        int w=0,h=0,comp=0;
+        stbi_uc* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
+        if (!pixels || w <= 0 || h <= 0) {
+            if (pixels) stbi_image_free(pixels);
+            continue;
+        }
+        CpuImage img;
+        img.w = w; img.h = h; img.comp = 4;
+        img.pixels.assign(pixels, pixels + (size_t)w * (size_t)h * 4);
+        stbi_image_free(pixels);
+
+        {
+            std::lock_guard<std::mutex> lk(g_texture_cpu_cache_mutex);
+            g_texture_cpu_cache[path] = std::move(img);
+        }
+
+        // small sleep to avoid saturating disk on very large lists
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+
+    g_asset_preloader_running.store(false);
+}
+
+// Model thumbnail cache: mesh_index -> GL texture
+
+
 // Update camera's MNEE sphere parameters by scanning the current scene for
 // the first dielectric sphere. Approximates world-space center and radius.
 static void UpdateMNEEFromScene()
@@ -201,6 +320,140 @@ static GLuint g_pickColorTex   = 0;
 static GLuint g_pickDepthRBO   = 0;
 static GLuint g_pickShader     = 0;
 
+// Model thumbnail cache: mesh_index -> GL texture
+static std::unordered_map<int, GLuint> g_model_thumb_cache;
+
+// Forward declarations for functions defined later in this file
+static void BuildRasterShader();
+static void make_lookat(const vec3& eye, const vec3& center, const vec3& up, float out[16]);
+static void make_perspective(float fov_deg, float aspect, float znear, float zfar, float out[16]);
+
+static GLuint GenerateModelThumbnail(int mesh_index)
+{
+    if (mesh_index < 0 || mesh_index >= (int)g_gpu_meshes.size()) return 0;
+    const gpu_mesh& gm = g_gpu_meshes[mesh_index];
+    if (gm.vao == 0 || gm.index_count == 0) return 0;
+
+    const int sz = 80;
+
+    // Create texture
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sz, sz, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    // Create FBO + depth RBO
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+
+    GLuint rbo = 0;
+    glGenRenderbuffers(1, &rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, sz, sz);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (rbo) glDeleteRenderbuffers(1, &rbo);
+        if (fbo) glDeleteFramebuffers(1, &fbo);
+        if (tex) { glDeleteTextures(1, &tex); tex = 0; }
+        return 0;
+    }
+
+    // Save previous viewport and FBO
+    GLint prevFBO = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
+    GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, sz, sz);
+    glEnable(GL_DEPTH_TEST);
+    glClearColor(0.12f, 0.12f, 0.12f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    if (g_rasterShader == 0) BuildRasterShader();
+    glUseProgram(g_rasterShader);
+
+    // Camera: compute distance from mesh approx radius so thumbnails are auto-framed
+    float view[16]; float proj[16]; float model[16];
+    for (int i = 0; i < 16; ++i) model[i] = (i % 5 == 0) ? 1.0f : 0.0f; // identity
+
+    // Fetch approximate bounding sphere radius from the scene asset (fallback to 1.0)
+    float r = 1.0f;
+    if (mesh_index >= 0 && mesh_index < (int)g_scene.meshes.size()) {
+        r = (float)g_scene.meshes[mesh_index].approx_radius;
+        if (r <= 0.0f) r = 1.0f;
+    }
+
+    // Preview FOV and framing. Use a small margin so the mesh isn't tightly cropped.
+    const float fov_deg = 45.0f;
+    const float fov_rad = fov_deg * (3.14159265358979323846f / 180.0f);
+    const float framing = 1.25f; // 1.0 = tight, >1 gives more padding
+
+    // Distance so that sphere of radius r fits within the vertical FOV: d = r / tan(fov/2)
+    float distance = (r / tanf(fov_rad * 0.5f)) * framing;
+    if (distance < 0.5f) distance = 0.5f;
+
+    // Place camera at a slight angle for a nicer preview (azimuth, elevation)
+    const float az_deg = 30.0f;
+    const float el_deg = 20.0f;
+    const float az = az_deg * (3.14159265358979323846f / 180.0f);
+    const float el = el_deg * (3.14159265358979323846f / 180.0f);
+
+    float cx = distance * cosf(el) * sinf(az);
+    float cy = distance * sinf(el);
+    float cz = distance * cosf(el) * cosf(az);
+
+    make_lookat(vec3(cx, cy, cz), vec3(0,0,0), vec3(0,1,0), view);
+    make_perspective(fov_deg, 1.0f, 0.01f, distance * 4.0f + r, proj);
+
+    GLint locModel    = glGetUniformLocation(g_rasterShader, "uModel");
+    GLint locView     = glGetUniformLocation(g_rasterShader, "uView");
+    GLint locProj     = glGetUniformLocation(g_rasterShader, "uProj");
+    GLint locColor    = glGetUniformLocation(g_rasterShader, "uColor");
+    GLint locLightDir = glGetUniformLocation(g_rasterShader, "uLightDir");
+
+    glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
+    glUniformMatrix4fv(locView, 1, GL_FALSE, view);
+    glUniformMatrix4fv(locProj, 1, GL_FALSE, proj);
+    glUniform3f(locColor, 0.8f, 0.8f, 0.8f);
+    glUniform3f(locLightDir, -0.5f, -1.0f, -0.3f);
+
+    // Draw the mesh
+    glBindVertexArray(gm.vao);
+    glDrawElements(GL_TRIANGLES, gm.index_count, GL_UNSIGNED_INT, 0);
+    glBindVertexArray(0);
+
+    // Restore
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+
+    // Cleanup FBO/RBO but keep texture
+    if (rbo) { glDeleteRenderbuffers(1, &rbo); }
+    if (fbo) { glDeleteFramebuffers(1, &fbo); }
+
+    return tex;
+}
+
+static GLuint GetOrCreateModelThumbnail(int mesh_index)
+{
+    auto it = g_model_thumb_cache.find(mesh_index);
+    if (it != g_model_thumb_cache.end()) return it->second;
+    if (g_thumbs_created_this_frame >= g_thumb_budget_per_frame) return 0;
+    GLuint t = GenerateModelThumbnail(mesh_index);
+    if (t) {
+        g_model_thumb_cache[mesh_index] = t;
+        ++g_thumbs_created_this_frame;
+    }
+    return t;
+}
+
 // Gizmo (lines) shader + buffers
 static GLuint g_lineShader     = 0;
 static GLuint g_gizmoVAO       = 0;
@@ -232,7 +485,7 @@ static vec3   g_gizmo_hit_point;       // world-space closest point on axis at m
 static vec3   g_gizmo_initial_obj_translation;
 
 // 0 = Ray Traced, 1 = Rasterised
-static int g_viewport_mode = 0;
+static int g_viewport_mode = 1;
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -1901,7 +2154,7 @@ static void init_engine_once()
 
     // Editor camera pose
     g_editor_cam.vfov = 40.0f;
-    g_editor_cam.set_from_lookat(point3(3, 3, 2),
+    g_editor_cam.set_from_lookat(point3(0.246, 0.560, 3.08),
                                  point3(0, 0, -1));
 
     // RT camera
@@ -1913,11 +2166,43 @@ static void init_engine_once()
     g_camera.background        = colour(0.0, 0.0, 0.0);
     to_shirley_camera(g_editor_cam, g_camera);
 
+    // Enable MNEE (specular caustics) by default and initialize its scene data
+    g_camera.enable_mnee = true;
+    UpdateMNEEFromScene();
+
+    // Add a default sun to the scene and mirror into the preview camera (nice default lighting)
+    {
+        scene_light sun;
+        sun.name = "Sun";
+        sun.type = scene_light_type::directional;
+        sun.radiance = vec3(20.0, 20.0, 20.0);
+        sun.direction = unit_vector(vec3(-0.3f, -1.0f, 0.2f));
+        sun.angular_radius_deg = 0.53; // approximate sun
+        g_scene.lights.push_back(sun);
+
+        // Mirror into camera preview defaults
+        g_camera.use_sun = true;
+        g_camera.sun_dir = -sun.direction; // camera expects scene->sun
+        g_camera.sun_radiance = colour(sun.radiance.x(), sun.radiance.y(), sun.radiance.z());
+        g_camera.sun_angular_radius = sun.angular_radius_deg;
+        g_camera.sun_shadow_samples = 16;
+    }
+
     BuildUnitSphereMesh();
     BuildUnitCubeMesh();
     BuildRasterShader();
     BuildPickShader();
     BuildLineShader();
+
+    // Start asset preloader (background CPU-side image decode)
+    if (!g_asset_preloader_running.load()) {
+        try {
+            g_asset_preloader_thread = std::thread(AssetPreloaderThreadMain);
+            g_asset_preloader_thread.detach();
+        } catch (...) {
+            // non-fatal if thread can't be started
+        }
+    }
 
     // Create gizmo VAO/VBO (6 verts: 3 axes, each a line of 2 verts)
     // Vertex format: pos.xyz, color.xyz
@@ -2629,6 +2914,25 @@ static void process_dropped_files()
     bool imported_any = false;
 
     for (const std::string& full_path : g_dropped_files) {
+        // Copy dropped files into project Assets folders (textures/ or models/)
+        auto ensure_dir = [](const std::string& dir){
+            try { std::filesystem::create_directories(dir); } catch(...) {}
+        };
+        auto base_name = [](const std::string& p)->std::pair<std::string,std::string>{
+            size_t slash = p.find_last_of("/\\");
+            std::string name = (slash==std::string::npos)? p : p.substr(slash+1);
+            size_t dot = name.find_last_of('.');
+            if (dot==std::string::npos) return {name, std::string{}};
+            return { name.substr(0,dot), name.substr(dot) };
+        };
+        auto unique_dest = [&](const std::string& dir, const std::string& stem, const std::string& ext){
+            std::string candidate = dir + "/" + stem + ext;
+            int idx = 1;
+            while (std::filesystem::exists(candidate)) {
+                candidate = dir + "/" + stem + "_" + std::to_string(idx++) + ext;
+            }
+            return candidate;
+        };
 
         // Textures
         if (has_extension_ci(full_path, ".png")  ||
@@ -2637,21 +2941,16 @@ static void process_dropped_files()
             has_extension_ci(full_path, ".tga")  ||
             has_extension_ci(full_path, ".bmp"))
         {
-            std::string name = full_path;
-
-            size_t slash = name.find_last_of("/\\");
-            if (slash != std::string::npos) {
-                name = name.substr(slash + 1);
-            }
-
-            size_t dot = name.find_last_of('.');
-            if (dot != std::string::npos) {
-                name = name.substr(0, dot);
-            }
+            // Copy into textures/
+            ensure_dir("textures");
+            auto [stem, ext] = base_name(full_path);
+            std::string dest = unique_dest("textures", stem, ext.empty()? std::string{}: ext);
+            try { std::filesystem::copy_file(full_path, dest, std::filesystem::copy_options::overwrite_existing); }
+            catch(...) { /* ignore copy failure; fallback to original path */ dest = full_path; }
 
             scene_texture tex;
-            tex.name = name;
-            tex.path = full_path;
+            tex.name = stem;
+            tex.path = dest;
 
             g_scene.textures.push_back(std::move(tex));
 
@@ -2665,12 +2964,19 @@ static void process_dropped_files()
         else if (has_extension_ci(full_path, ".fbx") ||
                  has_extension_ci(full_path, ".obj"))
         {
-            std::printf("Importing mesh (Assimp): %s\n", full_path.c_str());
+            // Copy into models/
+            ensure_dir("models");
+            auto [stem, ext] = base_name(full_path);
+            std::string dest = unique_dest("models", stem, ext.empty()? std::string{}: ext);
+            try { std::filesystem::copy_file(full_path, dest, std::filesystem::copy_options::overwrite_existing); }
+            catch(...) { dest = full_path; }
+
+            std::printf("Importing mesh (Assimp): %s\n", dest.c_str());
 
             // Match RT loader: FBX is Z-up, OBJ usually Y-up.
-            bool z_up = has_extension_ci(full_path, ".fbx");
+            bool z_up = has_extension_ci(dest, ".fbx");
             MeshLoadResult mlr = load_assimp_mesh_as_gpu_mesh(
-                full_path,
+                dest,
                 z_up,
                 /*normalise_unit=*/true,
                 /*user_scale=*/2.0
@@ -2682,20 +2988,13 @@ static void process_dropped_files()
                 continue;
             }
 
-            std::string name = full_path;
-            size_t slash = name.find_last_of("/\\");
-            if (slash != std::string::npos) {
-                name = name.substr(slash + 1);
-            }
-            size_t dot = name.find_last_of('.');
-            if (dot != std::string::npos) {
-                name = name.substr(0, dot);
-            }
+            std::string name = stem;
 
             // Prepare mesh asset (with material slots)
             scene_mesh_asset asset;
             asset.name      = name;
-            asset.file_path = full_path;
+            asset.file_path = dest;
+            asset.approx_radius = mlr.approx_radius;
             asset.mesh_bvh  = nullptr; // RT support via mesh_loader.h now built in scene.cpp
             asset.slot_names = mlr.material_slot_names;
             asset.slot_default_materials.assign(asset.slot_names.size(), -1);
@@ -2723,6 +3022,13 @@ static void process_dropped_files()
                 g_gpu_meshes.resize(mesh_index + 1);
             }
             g_gpu_meshes[mesh_index] = mlr.mesh;
+
+            // Invalidate any existing generated thumbnail for this mesh
+            auto it = g_model_thumb_cache.find(mesh_index);
+            if (it != g_model_thumb_cache.end()) {
+                if (it->second) glDeleteTextures(1, &it->second);
+                g_model_thumb_cache.erase(it);
+            }
 
             g_scene.objects.push_back(std::move(obj));
 
@@ -2983,16 +3289,20 @@ int main()
                     dock_main_id, ImGuiDir_Left, 0.20f, nullptr, &dock_main_id);
                 ImGuiID dock_right_id  = ImGui::DockBuilderSplitNode(
                     dock_main_id, ImGuiDir_Right, 0.25f, nullptr, &dock_main_id);
-                ImGuiID dock_left_bottom_id = ImGui::DockBuilderSplitNode(
-                    dock_left_id, ImGuiDir_Down, 0.40f, nullptr, &dock_left_id);
+                // Create a bottom strip under the main viewport for Assets
+                ImGuiID dock_bottom_id = ImGui::DockBuilderSplitNode(
+                    dock_main_id, ImGuiDir_Down, 0.28f, nullptr, &dock_main_id);
 
                 // Center: Viewport
                 ImGui::DockBuilderDockWindow("Viewport",       dock_main_id);
 
-                // Left: Scene Hierarchy (top), Textures + Debug Camera (bottom)
+                // Left: Scene Hierarchy and Lights
                 ImGui::DockBuilderDockWindow("Scene Hierarchy", dock_left_id);
-                ImGui::DockBuilderDockWindow("Textures",        dock_left_bottom_id);
-                ImGui::DockBuilderDockWindow("Debug Camera",    dock_left_bottom_id);
+                ImGui::DockBuilderDockWindow("Lights",          dock_left_id);
+
+                // Bottom: Assets and Debug Camera
+                ImGui::DockBuilderDockWindow("Assets",          dock_bottom_id);
+                ImGui::DockBuilderDockWindow("Debug Camera",    dock_bottom_id);
 
                 // Right: Inspector
                 ImGui::DockBuilderDockWindow("Inspector",      dock_right_id);
@@ -3217,26 +3527,239 @@ int main()
         ImGui::End();
 
         // ---------------------------------------------------------------------
-        // Textures window (drag textures into PBR slots)
+        // Assets window (textures + models), docked at bottom
         // ---------------------------------------------------------------------
-        ImGui::Begin("Textures");
-        ImGui::Text("Drag textures onto PBR slots.");
+        g_thumbs_created_this_frame = 0; // reset per-frame budget before rendering assets
+        ImGui::Begin("Assets");
+        bool assets_visible = ImGui::IsWindowAppearing() || ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) || ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+        if (!assets_visible) {
+            // If the Assets window isn't visible or in use, avoid generating thumbnails this frame
+            g_thumb_budget_per_frame = 0;
+        } else {
+            g_thumb_budget_per_frame = g_thumb_budget_default;
+        }
+        ImGui::TextDisabled("Drop images (.png/.jpg/.tga/.bmp) and models (.fbx/.obj) here to import. Double-click model to add to scene.");
         ImGui::Separator();
 
-        for (int i = 0; i < (int)g_scene.textures.size(); ++i) {
-            auto& tex = g_scene.textures[i];
+        // Assets search
+        static char s_assets_search[256] = {0};
+        ImGui::SetNextItemWidth(300.0f);
+        ImGui::InputTextWithHint("##asset_search", "Search assets...", s_assets_search, sizeof(s_assets_search));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear")) { s_assets_search[0] = '\0'; }
+        std::string assets_query = s_assets_search;
+        std::transform(assets_query.begin(), assets_query.end(), assets_query.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+        auto matches_query = [&](const std::string& name){
+            if (assets_query.empty()) return true;
+            std::string n = name;
+            std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+            return n.find(assets_query) != std::string::npos;
+        };
 
-            ImGui::Selectable(tex.name.c_str());
+            if (ImGui::CollapsingHeader("Textures", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const float cellPad = 18.0f;
+            const ImVec2 thumbSize(80, 80);
+            const float labelH = ImGui::GetTextLineHeightWithSpacing();
+            const float cellW = thumbSize.x + cellPad * 2;
+            const float cellH = thumbSize.y + labelH + cellPad * 2 + 4.0f;
+            float avail = ImGui::GetContentRegionAvail().x;
+            int cols = (int)std::max(1.0f, std::floor((avail + ImGui::GetStyle().ItemSpacing.x) / (cellW + ImGui::GetStyle().ItemSpacing.x)));
+            int col = 0;
 
-            if (ImGui::BeginDragDropSource()) {
-                ImGui::SetDragDropPayload("TEXTURE_ASSET_ID", &i, sizeof(int));
-                ImGui::Text("Texture: %s", tex.name.c_str());
-                ImGui::EndDragDropSource();
+            int matched = 0;
+            for (int i = 0; i < (int)g_scene.textures.size(); ++i) {
+                auto& tex = g_scene.textures[i];
+                if (!matches_query(tex.name)) continue;
+                GLuint thumb = GetOrCreateTextureThumbnail(tex.path);
+
+                ImGui::BeginGroup();
+                std::string cell_id = std::string("tex_cell_") + std::to_string(i);
+                ImGui::InvisibleButton(cell_id.c_str(), ImVec2(cellW, cellH));
+                ImVec2 p0 = ImGui::GetItemRectMin();
+                ImVec2 p1 = ImGui::GetItemRectMax();
+
+                bool cell_hovered = ImGui::IsItemHovered();
+                if (cell_hovered) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImU32 col = ImGui::GetColorU32(ImGuiCol_HeaderHovered);
+                    dl->AddRect(p0, p1, col, 4.0f);
+                }
+                if (ImGui::BeginDragDropSource()) {
+                    ImGui::SetDragDropPayload("TEXTURE_ASSET_ID", &i, sizeof(int));
+                    ImGui::Text("Texture: %s", tex.name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+
+                // Center image horizontally in the cell
+                float imgX = p0.x + (cellW - thumbSize.x) * 0.5f;
+                ImGui::SetCursorScreenPos(ImVec2(imgX, p0.y + cellPad));
+                if (thumb) {
+                    ImGui::Image((ImTextureID)(intptr_t)thumb, thumbSize, ImVec2(0,1), ImVec2(1,0));
+                } else {
+                    ImGui::Dummy(thumbSize);
+                }
+                // Center label beneath the image
+                const char* label = tex.name.c_str();
+                ImVec2 textSize = ImGui::CalcTextSize(label);
+                float textX = p0.x + (cellW - textSize.x) * 0.5f;
+                ImGui::SetCursorScreenPos(ImVec2(textX, p0.y + cellPad + thumbSize.y + 4));
+                ImGui::TextUnformatted(label);
+
+                ImGui::EndGroup();
+
+                // Next cell placement
+                col++;
+                if (col < cols) {
+                    ImGui::SameLine();
+                } else {
+                    col = 0;
+                }
+                matched++;
+            }
+            if (g_scene.textures.empty()) {
+                ImGui::TextDisabled("No textures imported yet.");
+            } else if (matched == 0 && !assets_query.empty()) {
+                ImGui::TextDisabled("No matching textures.");
+            }
+            // If the last row of texture cells wasn't filled, ensure we move to the next line
+            // so the following "Models" section cannot appear to the right of the textures.
+            if (col != 0) ImGui::NewLine();
+        }
+
+        if (ImGui::CollapsingHeader("Models", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const float cellPad = 18.0f;
+            const ImVec2 iconSize(80, 80); // placeholder size or thumbnail
+            const float labelH = ImGui::GetTextLineHeightWithSpacing();
+            const float cellW = iconSize.x + cellPad * 2;
+            const float cellH = iconSize.y + labelH + cellPad * 2 + 4.0f;
+            float avail = ImGui::GetContentRegionAvail().x;
+            int cols = (int)std::max(1.0f, std::floor((avail + ImGui::GetStyle().ItemSpacing.x) / (cellW + ImGui::GetStyle().ItemSpacing.x)));
+            int col = 0;
+
+            int matched = 0;
+            for (int m = 0; m < (int)g_scene.meshes.size(); ++m) {
+                auto& mesh = g_scene.meshes[m];
+                if (!matches_query(mesh.name)) continue;
+                ImGui::BeginGroup();
+                std::string cell_id = std::string("mesh_cell_") + std::to_string(m);
+                ImGui::InvisibleButton(cell_id.c_str(), ImVec2(cellW, cellH));
+                ImVec2 p0 = ImGui::GetItemRectMin();
+                ImVec2 p1 = ImGui::GetItemRectMax();
+
+                bool cell_hovered = ImGui::IsItemHovered();
+                bool cell_double_clicked = cell_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+                if (cell_hovered) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImU32 col = ImGui::GetColorU32(ImGuiCol_HeaderHovered);
+                    dl->AddRect(p0, p1, col, 4.0f);
+                }
+                // Drag from whole cell
+                if (ImGui::BeginDragDropSource()) {
+                    ImGui::SetDragDropPayload("MESH_ASSET_ID", &m, sizeof(int));
+                    ImGui::Text("Model: %s", mesh.name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+
+                // Double-click to create a mesh_instance in the scene
+                if (cell_double_clicked) {
+                    scene_object obj;
+                    obj.name = mesh.name + " Instance";
+                    obj.type = scene_object_type::mesh_instance;
+                    obj.material_index = -1; // use per-slot materials
+                    obj.center = point3(0,0,0);
+                    double radius = 1.0;
+                    for (const auto& o : g_scene.objects) {
+                        if (o.type == scene_object_type::mesh_instance && o.mesh_index == m) { radius = o.radius; break; }
+                    }
+                    obj.radius = radius;
+                    obj.mesh_index = m;
+                    obj.translation = vec3(0, 0, -1);
+                    obj.rotation_deg = vec3(0, 0, 0);
+                    obj.scale = vec3(1, 1, 1);
+                    obj.mesh_slot_materials = g_scene.meshes[m].slot_default_materials;
+
+                    g_scene.objects.push_back(obj);
+                    int new_idx = (int)g_scene.objects.size() - 1;
+                    scene_object snapshot = g_scene.objects[new_idx];
+                    UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                        [new_idx]() {
+                            if (new_idx >= 0 && new_idx < (int)g_scene.objects.size()) {
+                                g_scene.objects.erase(g_scene.objects.begin() + new_idx);
+                                if (g_scene.objects.empty()) g_selected_object = -1;
+                                else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
+                                g_world_dirty = true; g_cached_world.reset();
+                            }
+                        },
+                        [new_idx, snapshot]() {
+                            if (new_idx < 0) return;
+                            int insert_at = new_idx;
+                            if (insert_at > (int)g_scene.objects.size()) insert_at = (int)g_scene.objects.size();
+                            g_scene.objects.insert(g_scene.objects.begin() + insert_at, snapshot);
+                            g_selected_object = insert_at;
+                            g_world_dirty = true; g_cached_world.reset();
+                        },
+                        "Add Mesh Instance"
+                    ));
+
+                    g_selected_object = new_idx;
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                    std::printf("Created mesh_instance from asset '%s' (mesh_index=%d)\n", mesh.name.c_str(), m);
+                }
+
+                // Center icon or model thumbnail image
+                float iconX = p0.x + (cellW - iconSize.x) * 0.5f;
+                ImGui::SetCursorScreenPos(ImVec2(iconX, p0.y + cellPad));
+                GLuint meshThumb = 0;
+                if (!mesh.thumbnail_path.empty()) {
+                    meshThumb = GetOrCreateTextureThumbnail(mesh.thumbnail_path);
+                } else {
+                    meshThumb = GetOrCreateModelThumbnail(m);
+                }
+                if (meshThumb) {
+                    ImGui::Image((ImTextureID)(intptr_t)meshThumb, iconSize, ImVec2(0,1), ImVec2(1,0));
+                } else {
+                    ImGui::Dummy(iconSize);
+                }
+                // Center label
+                const char* label = mesh.name.c_str();
+                ImVec2 textSize = ImGui::CalcTextSize(label);
+                float textX = p0.x + (cellW - textSize.x) * 0.5f;
+                ImGui::SetCursorScreenPos(ImVec2(textX, p0.y + cellPad + iconSize.y + 4));
+                ImGui::TextUnformatted(label);
+                ImGui::EndGroup();
+
+                // Allow dropping a texture onto the model tile to set thumbnail
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("TEXTURE_ASSET_ID")) {
+                        int texIndex = *(const int*)payload->Data;
+                        if (texIndex >= 0 && texIndex < (int)g_scene.textures.size()) {
+                            g_scene.meshes[m].thumbnail_path = g_scene.textures[texIndex].path;
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+
+                col++;
+                if (col < cols) {
+                    ImGui::SameLine();
+                } else {
+                    col = 0;
+                }
+                matched++;
+            }
+            if (g_scene.meshes.empty()) {
+                ImGui::TextDisabled("No models imported yet.");
+            } else if (matched == 0 && !assets_query.empty()) {
+                ImGui::TextDisabled("No matching models.");
             }
         }
 
-        if (g_scene.textures.empty()) {
-            ImGui::TextDisabled("No textures in scene. Drag PNG/JPG/TGA/BMP into window.");
+        // Accept OS file-drops preferentially when hovering this window
+        if (ImGui::IsWindowHovered()) {
+            // Nothing to do here directly; files are delivered via GLFW drop callback
+            // and processed by process_dropped_files(). The hover check simply
+            // communicates intent to users (tooltip or visual effect could be added).
         }
 
         ImGui::End();
@@ -3400,6 +3923,43 @@ int main()
                 ImGui::TreePop();
             }
             ImGui::PopID();
+        }
+
+        ImGui::Separator();
+        // Moved here: Specular caustics (MNEE) controls live under the Lights tab
+        {
+            bool prev = g_camera.enable_mnee;
+            ImGui::Checkbox("Specular Caustics (MNEE)", &g_camera.enable_mnee);
+            if (g_camera.enable_mnee && !prev) {
+                UpdateMNEEFromScene();
+            }
+            if (!g_camera.enable_mnee) {
+                g_camera.mnee_has_sphere = false;
+            }
+            if (g_camera.enable_mnee) {
+                if (g_camera.mnee_has_sphere) {
+                    ImGui::Text("MNEE Sphere: C=(%.3f, %.3f, %.3f) R=%.3f IOR=%.3f",
+                        g_camera.mnee_sphere_center.x(), g_camera.mnee_sphere_center.y(), g_camera.mnee_sphere_center.z(),
+                        g_camera.mnee_sphere_radius, g_camera.mnee_sphere_ior);
+                    ImGui::SliderInt("MNEE Budget/thread", &g_camera.mnee_per_thread_budget, 64, 8192);
+                    ImGui::SliderInt("MNEE Sun samples", &g_camera.mnee_sun_samples, 1, 32);
+                    {
+                        float gain = (float)g_camera.mnee_gain_scale;
+                        if (ImGui::SliderFloat("MNEE Gain scale", &gain, 0.5f, 3.0f)) {
+                            g_camera.mnee_gain_scale = gain;
+                        }
+                    }
+                    {
+                        double ang = g_camera.sun_angular_radius;
+                        float angf = (float)ang;
+                        if (ImGui::SliderFloat("Sun angular radius (deg)", &angf, 0.0f, 2.0f)) {
+                            g_camera.sun_angular_radius = (double)angf;
+                        }
+                    }
+                } else {
+                    ImGui::TextDisabled("No dielectric sphere found in scene.");
+                }
+            }
         }
 
         ImGui::End();
@@ -4459,42 +5019,6 @@ int main()
 
         ImGui::Separator();
 
-        // Specular caustics via MNEE toggle
-        {
-            bool prev = g_camera.enable_mnee;
-            ImGui::Checkbox("Specular Caustics (MNEE)", &g_camera.enable_mnee);
-            if (g_camera.enable_mnee && !prev) {
-                UpdateMNEEFromScene();
-            }
-            if (!g_camera.enable_mnee) {
-                g_camera.mnee_has_sphere = false;
-            }
-            if (g_camera.enable_mnee) {
-                if (g_camera.mnee_has_sphere) {
-                    ImGui::Text("MNEE Sphere: C=(%.3f, %.3f, %.3f) R=%.3f IOR=%.3f",
-                        g_camera.mnee_sphere_center.x(), g_camera.mnee_sphere_center.y(), g_camera.mnee_sphere_center.z(),
-                        g_camera.mnee_sphere_radius, g_camera.mnee_sphere_ior);
-                    ImGui::SliderInt("MNEE Budget/thread", &g_camera.mnee_per_thread_budget, 64, 8192);
-                    ImGui::SliderInt("MNEE Sun samples", &g_camera.mnee_sun_samples, 1, 32);
-                    {
-                        float gain = (float)g_camera.mnee_gain_scale;
-                        if (ImGui::SliderFloat("MNEE Gain scale", &gain, 0.5f, 3.0f)) {
-                            g_camera.mnee_gain_scale = gain;
-                        }
-                    }
-                    {
-                        double ang = g_camera.sun_angular_radius;
-                        float angf = (float)ang;
-                        if (ImGui::SliderFloat("Sun angular radius (deg)", &angf, 0.0f, 2.0f)) {
-                            g_camera.sun_angular_radius = (double)angf;
-                        }
-                    }
-                } else {
-                    ImGui::TextDisabled("No dielectric sphere found in scene.");
-                }
-            }
-        }
-
         ImGui::Text("Viewport Mode:");
         ImGui::SameLine();
         ImGui::RadioButton("Ray Traced", &g_viewport_mode, 0);
@@ -4842,6 +5366,18 @@ int main()
     if (g_lineShader)     glDeleteProgram(g_lineShader);
     if (g_gizmoVBO)       glDeleteBuffers(1, &g_gizmoVBO);
     if (g_gizmoVAO)       glDeleteVertexArrays(1, &g_gizmoVAO);
+
+    // Cleanup texture thumbnail cache
+    for (auto& kv : g_texture_thumb_cache) {
+        if (kv.second) glDeleteTextures(1, &kv.second);
+    }
+    g_texture_thumb_cache.clear();
+
+    // Cleanup model thumbnail cache
+    for (auto& kv : g_model_thumb_cache) {
+        if (kv.second) glDeleteTextures(1, &kv.second);
+    }
+    g_model_thumb_cache.clear();
 
     g_cached_world.reset();
 

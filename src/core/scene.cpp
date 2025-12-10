@@ -351,6 +351,11 @@ hittable_list build_world_from_scene(const scene& scn)
 
         const bool z_up = has_extension_ci(asset.file_path, ".fbx");
 
+        // Diagnostic log: print mesh instance / asset info so we can debug
+        // cases where raster shows the mesh but the raytracer skips it.
+        std::printf("[scene] Loading mesh_instance '%s' -> mesh_index=%d, file='%s'\n",
+                    obj.name.c_str(), obj.mesh_index, asset.file_path.c_str());
+
         // Multi-material mesh load
         std::shared_ptr<hittable_list> tri_list =
             load_mesh_as_triangles(
@@ -361,6 +366,10 @@ hittable_list build_world_from_scene(const scene& scn)
                 /*normalise_to_unit=*/true,
                 /*user_scale=*/2.0
             );
+
+        if (!tri_list) {
+            std::fprintf(stderr, "[scene] load_mesh_as_triangles returned null for '%s'\n", asset.file_path.c_str());
+        }
 
         if (!tri_list || tri_list->objects.empty())
             continue;

@@ -534,7 +534,7 @@ public:
         // Resolve alpha: prefer explicit alpha map, otherwise fall back to
         // the base/albedo texture's alpha channel (if any).
         auto resolve_alpha = [&](const hit_record& hrec) {
-            if (alpha_tex) return alpha_tex->alpha_at(hrec.u, hrec.v, hrec.p);
+            if (alpha_tex) return alpha_tex->mask_alpha_at(hrec.u, hrec.v, hrec.p);
             if (base_tex) return base_tex->alpha_at(hrec.u, hrec.v, hrec.p);
             return 1.0;
         };
@@ -744,7 +744,7 @@ public:
         // Alpha mask: if present and transparent, contribute nothing
         // Alpha mask: skip contribution if transparent (alpha map or albedo alpha)
         double a_ds = 1.0;
-        if (alpha_tex) a_ds = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+        if (alpha_tex) a_ds = alpha_tex->mask_alpha_at(rec.u, rec.v, rec.p);
         else if (base_tex) a_ds = base_tex->alpha_at(rec.u, rec.v, rec.p);
         if (alpha_double_sided || rec.front_face) {
             if (a_ds <= 0.0 || a_ds < alpha_cutoff) return colour(0,0,0);
@@ -958,7 +958,7 @@ public:
         // Mask test for triangle-level discard
         virtual bool is_masked_transparent(const hit_record& rec) const override {
             double a = 1.0;
-            if (alpha_tex) a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+            if (alpha_tex) a = alpha_tex->mask_alpha_at(rec.u, rec.v, rec.p);
             else if (base_tex) a = base_tex->alpha_at(rec.u, rec.v, rec.p);
             if (alpha_double_sided || rec.front_face) {
                 // Fast discard when clearly below cutoff or fully transparent.
@@ -972,7 +972,7 @@ public:
         // Deterministic opacity query used for visibility/shadow calculations.
         virtual double opacity_at(const hit_record& rec) const override {
                 double a = 1.0;
-                if (alpha_tex) a = alpha_tex->alpha_at(rec.u, rec.v, rec.p);
+                if (alpha_tex) a = alpha_tex->mask_alpha_at(rec.u, rec.v, rec.p);
                 else if (base_tex) a = base_tex->alpha_at(rec.u, rec.v, rec.p);
                 return clamp01(a);
         }

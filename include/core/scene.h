@@ -142,11 +142,13 @@ struct scene_object {
 struct scene_mesh_asset {
     std::string name;
     std::string file_path;
+    std::string thumbnail_path; // optional preview image for Assets UI
 
     std::shared_ptr<hittable> mesh_bvh;  // optional: per-mesh BVH cache
 
     std::vector<std::string> slot_names;
     std::vector<int>         slot_default_materials;
+    double                   approx_radius = 1.0; // approximate bounding sphere radius (for thumbnails)
 };
 
 // ----------------------------------------

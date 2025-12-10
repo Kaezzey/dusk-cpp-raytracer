@@ -79,6 +79,9 @@ public:
     int width()  const { return image_width; }
     int height() const { return image_height; }
 
+    // Number of channels per pixel (1 = grey, 2 = grey+alpha, 3 = RGB, 4 = RGBA)
+    int channels() const { return bytes_per_pixel; }
+
     const unsigned char* pixel_data(int x, int y) const {
         static unsigned char magenta[] = { 255, 0, 255 };
         if (!bdata) return magenta;

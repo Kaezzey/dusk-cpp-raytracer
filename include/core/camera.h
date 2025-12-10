@@ -69,7 +69,7 @@ class camera {
     std::vector<point_light> point_lights;
 
     // MNEE single-sphere caustics toggle and parameters (populated by editor)
-    bool   enable_mnee = false;
+    bool   enable_mnee = true;
     bool   mnee_has_sphere = false;
     point3 mnee_sphere_center = point3(0,0,0);
     double mnee_sphere_radius = 0.0;
