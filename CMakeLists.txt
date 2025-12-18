@@ -251,6 +251,100 @@ target_link_libraries(Dusktracer
 )
 
 # ---------------------------------------------------------------------------
+# Optional ISPC kernels
+# ---------------------------------------------------------------------------
+option(USE_ISPC "Enable ISPC kernels" ON)
+if (USE_ISPC)
+    find_program(ISPC_EXECUTABLE NAMES ispc HINTS $ENV{PATH})
+    if (ISPC_EXECUTABLE)
+        message(STATUS "ISPC found: ${ISPC_EXECUTABLE}")
+        set(ISPC_OUT_DIR "${CMAKE_BINARY_DIR}/ispc")
+        file(MAKE_DIRECTORY ${ISPC_OUT_DIR})
+
+        set(ISPC_SRC "${CMAKE_SOURCE_DIR}/src/ispc/brdf.ispc")
+        if (WIN32)
+            set(ISPC_OBJ "${ISPC_OUT_DIR}/brdf_ispc.obj")
+        else()
+            set(ISPC_OBJ "${ISPC_OUT_DIR}/brdf_ispc.o")
+        endif()
+        set(ISPC_HEADER "${ISPC_OUT_DIR}/brdf_ispc.h")
+
+        # Allow users to override ISPC flags (empty by default). Use e.g.
+        # -DISPC_FLAGS="--target=x86-64" or -DISPC_FLAGS="--target=avx2" depending on your ispc version.
+        if (NOT DEFINED ISPC_FLAGS)
+            set(ISPC_FLAGS "")
+        endif()
+
+        add_custom_command(
+            OUTPUT ${ISPC_OBJ} ${ISPC_HEADER}
+            COMMAND ${ISPC_EXECUTABLE} ${ISPC_SRC} -o ${ISPC_OBJ} -h ${ISPC_HEADER} ${ISPC_FLAGS}
+            DEPENDS ${ISPC_SRC}
+            COMMENT "Compiling ISPC kernels: ${ISPC_SRC} -> ${ISPC_OBJ}"
+            VERBATIM
+        )
+
+        add_custom_target(ispc_kernels DEPENDS ${ISPC_OBJ} ${ISPC_HEADER})
+
+        # Ensure include dir for generated header and link the object into the final target
+        target_include_directories(Dusktracer PRIVATE ${ISPC_OUT_DIR})
+        target_sources(Dusktracer PRIVATE ${ISPC_OBJ})
+        add_dependencies(Dusktracer ispc_kernels)
+        target_compile_definitions(Dusktracer PRIVATE HAVE_ISPC=1)
+    else()
+        # If ispc wasn't found on PATH, try the common Program Files installation
+        if (WIN32)
+            # Try common Program Files locations and environment variables
+            if (EXISTS "$ENV{ProgramFiles}/ispc/ispc.exe")
+                set(ISPC_EXECUTABLE "$ENV{ProgramFiles}/ispc/ispc.exe")
+            elseif (EXISTS "$ENV{PROGRAMFILES}/ispc/ispc.exe")
+                set(ISPC_EXECUTABLE "$ENV{PROGRAMFILES}/ispc/ispc.exe")
+            elseif (EXISTS "C:/Program Files/ispc/ispc.exe")
+                set(ISPC_EXECUTABLE "C:/Program Files/ispc/ispc.exe")
+            elseif (EXISTS "C:/Program Files (x86)/ispc/ispc.exe")
+                set(ISPC_EXECUTABLE "C:/Program Files (x86)/ispc/ispc.exe")
+            endif()
+
+            if (ISPC_EXECUTABLE)
+                message(STATUS "ISPC found at: ${ISPC_EXECUTABLE}")
+                set(ISPC_OUT_DIR "${CMAKE_BINARY_DIR}/ispc")
+                file(MAKE_DIRECTORY ${ISPC_OUT_DIR})
+
+                set(ISPC_SRC "${CMAKE_SOURCE_DIR}/src/ispc/brdf.ispc")
+                if (WIN32)
+                    set(ISPC_OBJ "${ISPC_OUT_DIR}/brdf_ispc.obj")
+                else()
+                    set(ISPC_OBJ "${ISPC_OUT_DIR}/brdf_ispc.o")
+                endif()
+                set(ISPC_HEADER "${ISPC_OUT_DIR}/brdf_ispc.h")
+
+                if (NOT DEFINED ISPC_FLAGS)
+                    set(ISPC_FLAGS "")
+                endif()
+
+                add_custom_command(
+                    OUTPUT ${ISPC_OBJ} ${ISPC_HEADER}
+                    COMMAND ${ISPC_EXECUTABLE} ${ISPC_SRC} -o ${ISPC_OBJ} -h ${ISPC_HEADER} ${ISPC_FLAGS}
+                    DEPENDS ${ISPC_SRC}
+                    COMMENT "Compiling ISPC kernels: ${ISPC_SRC} -> ${ISPC_OBJ}"
+                    VERBATIM
+                )
+
+                add_custom_target(ispc_kernels DEPENDS ${ISPC_OBJ} ${ISPC_HEADER})
+
+                target_include_directories(Dusktracer PRIVATE ${ISPC_OUT_DIR})
+                target_sources(Dusktracer PRIVATE ${ISPC_OBJ})
+                add_dependencies(Dusktracer ispc_kernels)
+                target_compile_definitions(Dusktracer PRIVATE HAVE_ISPC=1)
+            else()
+                message(WARNING "ISPC requested (USE_ISPC=ON) but `ispc` not found in PATH or common Program Files locations. Building without ISPC kernels.")
+            endif()
+        else()
+            message(WARNING "ISPC requested (USE_ISPC=ON) but `ispc` not found in PATH. Building without ISPC kernels.")
+        endif()
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Post-build: copy DLL/models/textures for main renderer
 # ---------------------------------------------------------------------------
 # Post-build: copy DLL/models/textures next to the executable

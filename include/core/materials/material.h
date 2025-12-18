@@ -6,6 +6,15 @@
 #include "sss.h"
 #include <limits>
 
+// ISPC specular helper (defined in src/core). Forward declaration to avoid
+// pulling source headers into this public include.
+void ispc_compute_specular(const float* Nx, const float* Ny, const float* Nz,
+                           const float* Vx, const float* Vy, const float* Vz,
+                           const float* Lx, const float* Ly, const float* Lz,
+                           const float* F0r, const float* F0g, const float* F0b,
+                           const float* alpha, int count,
+                           float* out_r, float* out_g, float* out_b);
+
 inline vec3 refract(const vec3& uv, const vec3& n, double etai_over_etat) {
     double cos_theta = fmin(dot(-uv, n), 1.0);
     vec3 r_out_perp = etai_over_etat * (uv + cos_theta * n);
@@ -229,16 +238,21 @@ class dielectric : public material {
             }
         }
 
-        // Offset ray origin slightly to avoid self-intersections
-        const double eps = 1e-4;
+        // Offset ray origin slightly to avoid self-intersections.
+        // Use the same bias used elsewhere (0.001) to be consistent and
+        // avoid the reflected ray immediately re-hitting the same surface.
+        const double eps = 1e-3;
         vec3 n = rec.normal;
-        vec3 origin = rec.p + ((dot(direction, n) > 0.0) ? (eps * n) : (-eps * n));
+        // Ensure direction is unit-length for the dot test
+        vec3 dir_norm = unit_vector(direction);
+        vec3 origin = rec.p + ((dot(dir_norm, n) > 0.0) ? (eps * n) : (-eps * n));
 
         // Clear glass: do not tint reflections or transmissions by default.
         // This keeps glass looking crystal-clear irrespective of light intensity.
         attenuation = colour(1.0, 1.0, 1.0);
 
-        scattered = ray(origin, direction, r_in.time());
+        // normalize outgoing direction to avoid non-normalized rays later
+        scattered = ray(origin, dir_norm, r_in.time());
         return true;
     }
     
@@ -294,7 +308,22 @@ class dielectric : public material {
         colour F = schlick_fresnel(std::max(0.0, VdotH), colour((float)r0, (float)r0, (float)r0));
 
         // --- Specular reflection term (microfacet GGX) ---
-        colour spec = F * (float)((D * G) / std::max(1e-6, 4.0 * NdotL * NdotV));
+        // Try using ISPC/C++ batch helper when available; fall back to scalar
+        float out_r = 0.0f, out_g = 0.0f, out_b = 0.0f;
+        {
+            float Nx_f = (float)N.x(); float Ny_f = (float)N.y(); float Nz_f = (float)N.z();
+            float Vx_f = (float)Vn.x(); float Vy_f = (float)Vn.y(); float Vz_f = (float)Vn.z();
+            float Lx_f = (float)L.x(); float Ly_f = (float)L.y(); float Lz_f = (float)L.z();
+            float F0r = (float)F.x(); float F0g = (float)F.y(); float F0b = (float)F.z();
+            float a_f  = (float)alpha;
+            ispc_compute_specular(&Nx_f, &Ny_f, &Nz_f,
+                                  &Vx_f, &Vy_f, &Vz_f,
+                                  &Lx_f, &Ly_f, &Lz_f,
+                                  &F0r, &F0g, &F0b,
+                                  &a_f, 1,
+                                  &out_r, &out_g, &out_b);
+        }
+        colour spec((float)out_r, (float)out_g, (float)out_b);
         colour direct_reflect = spec * Li * (float)NdotL * (float)vis;
 
         // --- Transmission term (thin refraction toward light) ---
@@ -341,15 +370,6 @@ class dielectric : public material {
         }
 
         return direct_reflect + direct_transmit;
-
-        // Specular BRDF (microfacet). Convert to outgoing radiance contribution.
-        // brdf_spec = D * G * F / (4 * NdotV * NdotL)
-        // contribution = brdf_spec * Li * NdotL -> simplifies to (D*G*F)/(4*NdotV) * Li
-        colour spec_term = F * (float)((D * G) / (4.0 * NdotV + 1e-12));
-
-        // Final outgoing radiance: specular term * incoming radiance
-        // (No ad-hoc intensity boost; keep energy consistent.)
-        return spec_term * Li * (float)NdotL * (float)vis;
     }
 
     colour albedo(const hit_record& rec) const override {
@@ -616,7 +636,7 @@ public:
             n_tan = unit_vector(n_tan);
 
             // Transform into world space using T,B,Ngeom
-            N = unit_vector(
+            N = unit_vector_fast(
                 n_tan.x() * T +
                 n_tan.y() * B +
                 n_tan.z() * Ngeom
@@ -664,7 +684,7 @@ public:
             double xi1 = random_double();
             double xi2 = random_double();
             vec3 h_local = sample_ggx_half_vector(alpha, xi1, xi2);
-            vec3 h = unit_vector(h_local.x() * T + h_local.y() * B + h_local.z() * N);
+            vec3 h = unit_vector_fast(h_local.x() * T + h_local.y() * B + h_local.z() * N);
 
             // 2. Calculate Reflection Direction
             wi = reflect(-wo, h);
@@ -694,11 +714,11 @@ public:
             }
             // -------------------------------------------
 
-            // Safety Check (for the shading normal)
-            if (dot(wi, N) <= 0.0) {
-                 wi = reflect(-wo, N);
-                 if (dot(wi, N) <= 0.0) return false;
-            }
+              // Safety Check (for the shading normal)
+              if (dot(wi, N) <= 0.0) {
+                  wi = reflect(-wo, N);
+                  if (dot(wi, N) <= 0.0) return false;
+              }
 
             // Standard Fresnel & Weight
             double cosTheta = std::max(0.0, dot(wi, N));
@@ -789,7 +809,7 @@ public:
         double NdotV_geo = std::max(0.0, dot(Ngeom, view_dir));
         double strength = NdotV_geo * 5.0;
         strength = std::clamp(strength, 0.0, 1.0);
-        N = unit_vector(N * strength + Ngeom * (1.0 - strength));
+        N = unit_vector_fast(N * strength + Ngeom * (1.0 - strength));
         vec3 L = unit_vector(Ldir);
         vec3 Vn = unit_vector(V);
 

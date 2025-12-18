@@ -3,6 +3,8 @@
 
 #include "hittable.h"
 
+#include "packet.h"
+
 class sphere : public hittable {
 
     public:
@@ -79,6 +81,55 @@ class sphere : public hittable {
 
         aabb bounding_box() const override {
             return bbox;
+        }
+
+        // Packetized hit: test up to 4 rays in `pkt`. Fills `out_recs` and
+        // returns a bitmask of lanes that hit.
+        inline unsigned int hit_packet(const RayPacket4& pkt, hit_record out_recs[4]) const {
+            unsigned int mask = 0;
+            point3 current_centre = centre.at(0.0); // time-varying sphere not supported in packet version
+            for (int i = 0; i < 4; ++i) {
+                if (!(pkt.active_mask & (1u << i))) continue;
+                // Quick AABB test per lane
+                if (!bbox.hit(pkt.r[i], interval(pkt.tmin[i], pkt.tmax[i]))) continue;
+
+                vec3 oc = current_centre - pkt.r[i].origin();
+                double a = pkt.r[i].direction().length_squared();
+                double h = dot(pkt.r[i].direction(), oc);
+                double c = oc.length_squared() - radius * radius;
+                double disc = h*h - a*c;
+                if (disc < 0.0) continue;
+                double sqrtd = std::sqrt(disc);
+                double root = (h - sqrtd) / a;
+                if (!(interval(pkt.tmin[i], pkt.tmax[i]).surrounds(root))) {
+                    root = (h + sqrtd) / a;
+                    if (!(interval(pkt.tmin[i], pkt.tmax[i]).surrounds(root))) continue;
+                }
+
+                hit_record rec;
+                rec.t = root;
+                rec.p = pkt.r[i].at(root);
+                vec3 outward_normal = (rec.p - current_centre) / radius;
+                rec.set_face_normal(pkt.r[i], outward_normal);
+                get_sphere_uv(outward_normal, rec.u, rec.v);
+
+                // Tangent/bitangent similar to scalar path
+                vec3 n = rec.normal;
+                vec3 t = vec3(-n.z(), 0.0, n.x());
+                if (t.length_squared() < 1e-8) {
+                    vec3 up = (std::fabs(n.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+                    t = unit_vector(cross(up, n));
+                } else {
+                    t = unit_vector(t);
+                }
+                rec.tangent = t;
+                rec.bitangent = unit_vector(cross(rec.normal, rec.tangent));
+                rec.mat = mat;
+
+                out_recs[i] = rec;
+                mask |= (1u << i);
+            }
+            return mask;
         }
 
     private:

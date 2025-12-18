@@ -23,6 +23,9 @@ struct render_result {
 struct render_progress_state {
     int total_scanlines = 0;
     std::atomic<int>    completed_scanlines{0};
+    // Tile-based progress (preferred when renderer uses tiles)
+    int total_tiles = 0;
+    std::atomic<int>    completed_tiles{0};
     std::atomic<double> elapsed_seconds{0.0};
     std::atomic<double> eta_seconds{0.0};
 };
@@ -43,10 +46,10 @@ public:
     // variance and stop sampling a pixel early when its estimate of the
     // pixel mean has sufficiently low standard error.
     bool adaptive_sampling = false;
-    // Minimum samples before considering stopping (e.g. 4)
-    int adaptive_min_samples = 4;
-    // How often (in samples) to check convergence (e.g. every 4 samples)
-    int adaptive_check_interval = 4;
+    // Minimum samples before considering stopping (raised for fewer checks)
+    int adaptive_min_samples = 8;
+    // How often (in samples) to check convergence (raised to reduce overhead)
+    int adaptive_check_interval = 8;
     // Relative standard error threshold: stop when std_error/mean < threshold
     // Typical values: 0.01 .. 0.03
     double adaptive_rel_threshold = 0.02;

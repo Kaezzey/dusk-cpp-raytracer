@@ -311,4 +311,126 @@ inline colour mnee_single_sphere_estimate(
     return accum;
 }
 
+// Estimate caustic contribution for a single point light by searching for
+// a refracted path through a single sphere that exits toward the point light
+// position. This is a Monte-Carlo / budgeted search (cheap fallback to the
+// sun-directional Newton solver) and intentionally simple to keep runtime
+// bounded per shading point.
+inline colour mnee_single_pointlight_estimate(
+    const point3& recvP,
+    const vec3&   recvN,
+    const point3& lightPos,
+    const colour& light_radiance,
+    const point3& sphC,
+    double        sphR,
+    double        ior,
+    const hittable& world,
+    const mnee_config& cfg = {})
+{
+    // Cheap distance gate
+    {
+        vec3 dC = recvP - sphC;
+        double d2 = dot(dC, dC);
+        double maxR = sphR * 40.0;
+        if (d2 > maxR * maxR) return colour(0,0,0);
+    }
+
+    int budget = std::max(1, cfg.per_thread_budget);
+    colour accum(0,0,0);
+    int found = 0;
+
+    // Helper eval function mirrors the logic in the sun solver (intersect,
+    // refract in/out) and returns success with key points.
+    auto eval = [&](const vec3& d0) -> SolveResult {
+        SolveResult out;
+        double t1 = 0.0;
+        if (!intersect_sphere(recvP + d0 * 1e-4, d0, sphC, sphR, t1)) return out;
+        point3 p1 = recvP + d0 * t1;
+        vec3 n1 = unit_vector(p1 - sphC);
+        vec3 dir1; double cosI1 = 0.0;
+        if (!refract_dir(d0, n1, 1.0/ior, dir1, cosI1)) return out;
+        double F1 = fresnel_schlick_dielectric(cosI1, 1.0/ior);
+        double T1 = 1.0 - F1;
+
+        double t2 = 0.0;
+        if (!intersect_sphere(p1 + dir1 * 1e-4, dir1, sphC, sphR, t2)) return out;
+        point3 p2 = p1 + dir1 * t2;
+        vec3 n2 = unit_vector(p2 - sphC);
+        n2 = -n2;
+
+        vec3 dir2; double cosI2 = 0.0;
+        if (!refract_dir(dir1, n2, ior/1.0, dir2, cosI2)) return out;
+        double F2 = fresnel_schlick_dielectric(cosI2, ior/1.0);
+        double T2 = 1.0 - F2;
+
+        out.ok = true;
+        out.d0 = d0;
+        out.p1 = p1; out.p2 = p2; out.dir_out = unit_vector(dir2);
+        out.T1 = T1; out.T2 = T2;
+        return out;
+    };
+
+    // Sampling loop: importance sample directions toward sphere center
+    vec3 toCenter = unit_vector(sphC - recvP);
+    for (int i = 0; i < budget; ++i) {
+        // jittered direction around center: sample small cone
+        double u1 = random_double();
+        double u2 = random_double();
+        // map u1,u2 to a cosine-weighted perturbation around toCenter
+        double phi = 2.0 * M_PI * u2;
+        double cosTheta = 1.0 - 0.6 * u1; // bias toward center
+        double sinTheta = std::sqrt(std::max(0.0, 1.0 - cosTheta * cosTheta));
+        // build orthonormal basis
+        vec3 a = (std::fabs(toCenter.x()) > 0.1) ? vec3(0,1,0) : vec3(1,0,0);
+        vec3 u = unit_vector(cross(a, toCenter));
+        vec3 v = cross(toCenter, u);
+        vec3 d0 = unit_vector(u * (float)(sinTheta * std::cos(phi)) + v * (float)(sinTheta * std::sin(phi)) + toCenter * (float)cosTheta);
+
+        SolveResult sol = eval(d0);
+        if (!sol.ok) continue;
+
+        // Direction from exit point to light
+        vec3 dir_to_light = unit_vector(lightPos - sol.p2);
+        double ang = std::acos(std::max(-1.0, std::min(1.0, dot(sol.dir_out, dir_to_light))));
+        // Accept small angular error (tunable); allow wider for near lights
+        double accept_ang = 0.12; // ~7 degrees
+        if (ang > accept_ang) continue;
+
+        // Visibility checks: recv->p1 and p2->light
+        {
+            hit_record rc;
+            ray visR(recvP + sol.d0 * 1e-4, sol.d0, 0.0);
+            if (world.hit(visR, interval(1e-4, (sol.p1 - recvP).length() - 1e-4), rc)) continue;
+        }
+        {
+            hit_record rc;
+            ray visR(sol.p2 + sol.dir_out * 1e-4, sol.dir_out, 0.0);
+            double dist_to_light = (lightPos - sol.p2).length();
+            if (world.hit(visR, interval(1e-4, dist_to_light - 1e-4), rc)) continue;
+        }
+
+        // Ensure exit direction actually points toward light within tolerance of distance
+        double dist = (lightPos - sol.p2).length();
+        if (dist < 1e-6) continue;
+
+        // Compute contribution: light radiance attenuated by inverse-square and transmission
+        double eta12 = (1.0/ior);
+        double eta21 = (ior/1.0);
+        double eta_fac = (eta12*eta12) * (eta21*eta21);
+        double gain = sol.T1 * sol.T2 * eta_fac * cfg.gain_scale;
+        gain = std::max(0.0, std::min(10.0, gain));
+        // Attenuate by distance squared
+        colour contrib = light_radiance * (float)(gain / (dist * dist));
+        accum += contrib;
+        ++found;
+        // Optionally early exit when we have a hit
+        if (found >= 1) break;
+    }
+
+    if (found == 0) return colour(0,0,0);
+    // average over samples used (simple estimator)
+    accum *= (float)(1.0 / (double)found);
+    return accum;
+}
+
 #endif

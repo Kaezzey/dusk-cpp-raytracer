@@ -7,10 +7,19 @@
 #include <chrono>
 #include <algorithm>
 #include <cstring>
+#include <deque>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #ifdef HAVE_OIDN
 #include <OpenImageDenoise/oidn.hpp>
 #endif
 #include "../../include/core/image_io.h"
+#include "ispc_brdf.h"
+#include "ispc_brdf_spec.h"
+#include "../../include/core/BVH.h"
+#include "../../include/core/packet.h"
+#include "../../include/core/materials/material.h"
 
 // 1) Simple overload: forwards to the full version with progress = nullptr
 render_result renderer::render(
@@ -55,6 +64,8 @@ render_result renderer::render(
     const int chunk_size      = 4; // update ETA every N lines
     const int progress_min_interval_ms = 500; // throttle partial updates
 
+    // Rolling average per-tile time (seconds). Updated under critical section.
+    std::atomic<double> avg_tile_time{0.0};
     // Track which scanlines are fully written to HDR buffer
     std::vector<char> row_done(h, 0);
 
@@ -68,24 +79,459 @@ render_result renderer::render(
         progress->elapsed_seconds.store(0.0);
     }
 
+    auto render_start = clock::now();
+    // Chunk timing used by scanline progress updates (kept as fallback)
+    auto chunk_start = render_start;
     int    accumulated_lines = 0;
     double accumulated_time  = 0.0;
     double eta_longterm      = 0.0;
     double eta_shortterm     = 0.0;
 
-    auto render_start = clock::now();
-    auto chunk_start  = render_start;
-
     static const interval intensity(0.000, 0.999);
 
-    #pragma omp parallel for schedule(dynamic)
-    for (int j = 0; j < h; ++j)
-    {
-        if (cancel_flag && cancel_flag->load()) {
-            continue;
+    // Tile-based parallel rendering: reduces OpenMP scheduling overhead
+    const int tile_w = 32;
+    const int tile_h = 32;
+    const int num_tiles_x = (w + tile_w - 1) / tile_w;
+    const int num_tiles_y = (h + tile_h - 1) / tile_h;
+    const int num_tiles = num_tiles_x * num_tiles_y;
+    // Tile progress bookkeeping (used for ETA calculation)
+    std::atomic<int> completed_tiles{0};
+
+    // Recent per-tile timings (protected by the critical section below).
+    // We'll keep a short sliding window and use its median to compute ETA
+    // which avoids bias from slow startup tiles or occasional outliers.
+    std::deque<double> recent_tile_times;
+    const int RECENT_TILE_WINDOW = 64;
+
+    if (progress) {
+        progress->total_tiles = num_tiles;
+        progress->completed_tiles.store(0);
+    }
+
+    // Preallocate per-thread reusable buffers to avoid allocations inside the tile loop.
+    int max_tile_pixels = tile_w * tile_h;
+    int max_first_size = spp * max_tile_pixels;
+    int worker_count = 1;
+#ifdef _OPENMP
+    worker_count = std::max(1, omp_get_max_threads());
+#endif
+
+    // Per-thread storage
+    std::vector<std::vector<hit_record>> thread_first_rec(worker_count);
+    std::vector<std::vector<char>>       thread_first_hit(worker_count);
+    std::vector<std::vector<colour>>     thread_tile_direct(worker_count);
+    std::vector<std::vector<float>>      thread_tile_normals(worker_count);
+    std::vector<std::vector<int>>        thread_tile_idxf(worker_count);
+
+    for (int t = 0; t < worker_count; ++t) {
+        thread_first_rec[t].resize(max_first_size);
+        thread_first_hit[t].resize(max_first_size);
+        thread_tile_direct[t].resize(max_first_size, colour(0,0,0));
+        thread_tile_normals[t].reserve(max_tile_pixels * 3);
+        thread_tile_idxf[t].reserve(max_tile_pixels);
+    }
+
+    #pragma omp parallel for schedule(dynamic,1)
+    for (int ti = 0; ti < num_tiles; ++ti) {
+        if (cancel_flag && cancel_flag->load()) continue;
+
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+
+        int tx = ti % num_tiles_x;
+        int ty = ti / num_tiles_x;
+        int x0 = tx * tile_w;
+        int y0 = ty * tile_h;
+        int x1 = std::min(w, x0 + tile_w);
+        int y1 = std::min(h, y0 + tile_h);
+
+        // Reusable per-thread buffers for this tile (avoid allocations)
+        int tile_w_pixels = (x1 - x0) * (y1 - y0);
+        size_t needed_first = (size_t)spp * (size_t)tile_w_pixels;
+
+        auto& tile_normals = thread_tile_normals[tid];
+        auto& tile_idxf = thread_tile_idxf[tid];
+        tile_normals.clear();
+        tile_idxf.clear();
+        tile_normals.reserve((x1 - x0) * (y1 - y0) * 3);
+        tile_idxf.reserve((x1 - x0) * (y1 - y0));
+
+        auto& tile_first_rec = thread_first_rec[tid];
+        auto& tile_first_hit = thread_first_hit[tid];
+        if (tile_first_rec.size() < needed_first) {
+            tile_first_rec.resize(needed_first);
+            tile_first_hit.resize(needed_first);
+        }
+        // reset hit flags for the active range
+        std::fill_n(tile_first_hit.data(), (size_t)needed_first, (char)0);
+
+        // Try to obtain a pointer to a top-level BVH to use packet traversal.
+        const bvh_node* top_bvh = nullptr;
+        if (auto wl = dynamic_cast<const hittable_list*>(&world)) {
+            if (!wl->objects.empty()) {
+                // Object[0] is expected to be the top-level BVH node constructed in scene builder
+                top_bvh = dynamic_cast<const bvh_node*>(wl->objects[0].get());
+            }
         }
 
-        for (int i = 0; i < w; ++i) {
+        if (top_bvh) {
+            // For each primary sample index, packet-trace primary rays and store per-sample prehits.
+            for (int s = 0; s < spp; ++s) {
+                for (int j = y0; j < y1; ++j) {
+                    for (int i = x0; i < x1; i += 4) {
+                        RayPacket4 pk;
+                        pk.active_mask = 0;
+                        for (int l = 0; l < 4; ++l) {
+                            int px = i + l;
+                            if (px >= x1) continue;
+                            pk.r[l] = cam.get_ray(px, j, s);
+                            pk.active_mask |= (1u << l);
+                            pk.tmin[l] = 0.001;
+                            pk.tmax[l] = 1e30;
+                        }
+
+                        hit_record out_recs[4];
+                        unsigned int hitmask = top_bvh->hit_packet(pk, out_recs);
+
+                        for (int l = 0; l < 4; ++l) {
+                            int px = i + l;
+                            if (px >= x1) continue;
+                            int local_idx = (j - y0) * (x1 - x0) + (px - x0);
+                            int idx = s * tile_w_pixels + local_idx;
+                            if (hitmask & (1u << l)) {
+                                tile_first_hit[idx] = 1;
+                                tile_first_rec[idx] = out_recs[l];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prepare per-tile precomputed direct lighting (for first-hit only)
+        auto& tile_direct = thread_tile_direct[tid];
+        if (tile_direct.size() < needed_first) tile_direct.resize(needed_first);
+        std::fill_n(tile_direct.data(), needed_first, colour(0,0,0));
+
+        // Per-tile timer (start before any work)
+        auto tile_start = clock::now();
+
+        // If we have a top-level BVH, attempt to batch direct-lighting for
+        // the first-hit points using packetized shadow queries and ISPC
+        // specular evaluation. This precomputes a direct-light colour per
+        // (sample,pixel) which we later pass into `camera::ray_colour`.
+        if (top_bvh) {
+            // Precompute per-sample first-hit direct lighting
+            for (int s = 0; s < spp; ++s) {
+                for (int j = y0; j < y1; ++j) {
+                    for (int i = x0; i < x1; i += 4) {
+                        // Build a small 4-wide packet for up to 4 lanes
+                        RayPacket4 pk;
+                        pk.active_mask = 0;
+                        hit_record primary_recs[4];
+                        int lane_px[4];
+                        int lane_local_idx[4];
+                        int lane_idx_global[4];
+                        for (int l = 0; l < 4; ++l) {
+                            int px = i + l;
+                            lane_px[l] = px;
+                            if (px >= x1) continue;
+                            int local_idx = (j - y0) * (x1 - x0) + (px - x0);
+                            int idx = s * tile_w_pixels + local_idx;
+                            lane_local_idx[l] = local_idx;
+                            lane_idx_global[l] = idx;
+                            if (tile_first_hit[idx]) {
+                                primary_recs[l] = tile_first_rec[idx];
+                                pk.r[l] = cam.get_ray(px, j, s);
+                                pk.tmin[l] = 0.001;
+                                pk.tmax[l] = 1e30;
+                                pk.active_mask |= (1u << l);
+                            }
+                        }
+
+                        if (pk.active_mask == 0) continue;
+
+                        // For each directional sun (if enabled) and point lights,
+                        // perform a packet shadow query and accumulate direct light.
+                        // We'll use ISPC specular for the microfacet reflection term
+                        // for visible lanes and a scalar diffuse term.
+
+                        // Helper buffers (max 4 lanes) - expanded to include tangent-space and material params
+                        float Ngeomx[4], Ngeomy[4], Ngeomz[4];
+                        float Tx[4], Ty[4], Tz[4];
+                        float Bx[4], By[4], Bz[4];
+                        float ntr[4], ntg[4], ntb[4];
+                        float normal_strength_arr[4];
+                        float Vx[4], Vy[4], Vz[4];
+                        float Lx[4], Ly[4], Lz[4];
+                        float baser[4], baseg[4], baseb[4];
+                        float metallic_arr[4];
+                        float dielr[4], dielg[4], dielb[4];
+                        float alpha[4];
+                        float out_r[4], out_g[4], out_b[4];
+
+                        // Process sun (directional) first
+                        if (cam.use_sun && !cam.sun_dir.near_zero()) {
+                            RayPacket4 spk = pk; // copy base packet
+                            vec3 Ldir = unit_vector(cam.sun_dir);
+                            // Set packet ray directions toward sun
+                            for (int l = 0; l < 4; ++l) {
+                                if (!(spk.active_mask & (1u << l))) continue;
+                                hit_record& rec = primary_recs[l];
+                                vec3 origin = rec.p + rec.normal * 0.001f;
+                                spk.r[l] = ray(origin, Ldir, 0.0);
+                                spk.tmin[l] = 0.001;
+                                spk.tmax[l] = 1e30;
+                            }
+
+                            hit_record shadow_recs[4];
+                            unsigned int shadow_mask = top_bvh->hit_packet(spk, shadow_recs);
+
+                            // Build arrays for visible lanes and call ISPC specular
+                            int k = 0;
+                            int lane_map[4];
+                            for (int l = 0; l < 4; ++l) {
+                                if (!(spk.active_mask & (1u << l))) continue;
+                                bool occluded = (shadow_mask & (1u << l));
+                                double vis = 1.0;
+                                if (occluded) {
+                                    double op = 1.0;
+                                    if (shadow_recs[l].mat) op = shadow_recs[l].mat->opacity_at(shadow_recs[l]);
+                                    vis = 1.0 - std::clamp(op, 0.0, 1.0);
+                                }
+                                if (vis <= 0.0) continue;
+
+                                hit_record& rec = primary_recs[l];
+                                // include specular materials here so dielectrics receive
+                                // direct specular response from lights. For dielectric
+                                // materials we prefer to call their material-specific
+                                // `shade_direct` (which models thin transmission/refraction)
+                                // instead of the generic PBR ISPC kernel to avoid
+                                // introducing a diffuse term that makes glass look
+                                // opaque.
+                                // Gather shading inputs (defer normal-map transform to ISPC)
+                                vec3 Ngeom = rec.normal;
+                                vec3 N = Ngeom;
+                                ray view_ray = cam.get_ray(lane_px[l], j, s);
+                                vec3 V = -unit_vector(view_ray.direction());
+                                colour base = rec.mat ? rec.mat->albedo(rec) : colour(1,1,1);
+
+                                const material* mptr = rec.mat.get();
+                                // If this material is dielectric, compute direct using
+                                // its `shade_direct` implementation and skip ISPC.
+                                if (mptr && mptr->is_dielectric()) {
+                                    // deterministic visibility already applied via 'vis'
+                                    colour direct = mptr->shade_direct(rec, V, Ldir, cam.sun_radiance, world, vis);
+                                    int global_idx = lane_idx_global[l];
+                                    tile_direct[global_idx] += direct;
+                                    continue;
+                                }
+                                const pbr_material* pbr = dynamic_cast<const pbr_material*>(mptr);
+                                float metallic_v = 0.0f;
+                                float rough_v = 0.5f;
+                                colour dielectricF0 = colour(0.04f, 0.04f, 0.04f);
+                                // default tangent/bitangent/normal-texture values (may be overridden by pbr)
+                                vec3 T = rec.tangent;
+                                vec3 B = rec.bitangent;
+                                colour n_tex = colour(0.5f, 0.5f, 1.0f);
+                                float nstrength = 0.0f;
+                                if (pbr) {
+                                    if (pbr->metallic_tex) metallic_v = (float)pbr->metallic_tex->value(rec.u, rec.v, rec.p).x();
+                                    if (pbr->roughness_tex) rough_v = (float)pbr->roughness_tex->value(rec.u, rec.v, rec.p).x();
+                                    dielectricF0 = pbr->dielectric_F0;
+                                    base = pbr->albedo(rec);
+                                    if (pbr->normal_tex) {
+                                        n_tex = pbr->normal_tex->value(rec.u, rec.v, rec.p);
+                                        nstrength = pbr->normal_strength;
+                                    }
+                                }
+
+                                // populate arrays
+                                Ngeomx[k] = (float)Ngeom.x(); Ngeomy[k] = (float)Ngeom.y(); Ngeomz[k] = (float)Ngeom.z();
+                                Tx[k] = (float)T.x(); Ty[k] = (float)T.y(); Tz[k] = (float)T.z();
+                                Bx[k] = (float)B.x(); By[k] = (float)B.y(); Bz[k] = (float)B.z();
+                                ntr[k] = (float)n_tex.x(); ntg[k] = (float)n_tex.y(); ntb[k] = (float)n_tex.z();
+                                normal_strength_arr[k] = (float)nstrength;
+
+                                Vx[k] = (float)V.x(); Vy[k] = (float)V.y(); Vz[k] = (float)V.z();
+                                Lx[k] = (float)Ldir.x(); Ly[k] = (float)Ldir.y(); Lz[k] = (float)Ldir.z();
+
+                                baser[k] = (float)base.x(); baseg[k] = (float)base.y(); baseb[k] = (float)base.z();
+                                metallic_arr[k] = (float)metallic_v;
+                                dielr[k] = (float)dielectricF0.x(); dielg[k] = (float)dielectricF0.y(); dielb[k] = (float)dielectricF0.z();
+                                alpha[k] = (float)perceptual_to_alpha((double)rough_v);
+
+                                lane_map[k] = l;
+                                ++k;
+                            }
+
+                                if (k > 0) {
+                                // Compute full shaded BRDF per lane using ISPC helper
+                                ispc_compute_shade(Ngeomx, Ngeomy, Ngeomz,
+                                                   Tx, Ty, Tz,
+                                                   Bx, By, Bz,
+                                                   ntr, ntg, ntb,
+                                                   normal_strength_arr,
+                                                   Vx, Vy, Vz,
+                                                   Lx, Ly, Lz,
+                                                   baser, baseg, baseb,
+                                                   metallic_arr,
+                                                   dielr, dielg, dielb,
+                                                   alpha, k,
+                                                   out_r, out_g, out_b);
+                                // Scatter results back to tile_direct entries (sun radiance)
+                                for (int pk_i = 0; pk_i < k; ++pk_i) {
+                                    int l = lane_map[pk_i];
+                                    int global_idx = lane_idx_global[l];
+                                    colour Li = cam.sun_radiance;
+                                    tile_direct[global_idx] += colour(out_r[pk_i] * (float)Li.x(),
+                                                                      out_g[pk_i] * (float)Li.y(),
+                                                                      out_b[pk_i] * (float)Li.z());
+                                }
+                            }
+                        }
+
+                        // Process point lights similarly (packet shadow + ISPC specular)
+                        for (const auto& pl : cam.point_lights) {
+                            RayPacket4 spk = pk;
+                            // Setup each lane's shadow ray toward the point light
+                                for (int l = 0; l < 4; ++l) {
+                                if (!(spk.active_mask & (1u << l))) continue;
+                                hit_record& rec = primary_recs[l];
+                                vec3 origin = rec.p + rec.normal * 0.001f;
+                                vec3 Ldir = unit_vector(pl.position - rec.p);
+                                double dist = (pl.position - rec.p).length();
+                                spk.r[l] = ray(origin, Ldir, 0.0);
+                                spk.tmin[l] = 0.001;
+                                spk.tmax[l] = (float)(dist - 0.001);
+                            }
+
+                            hit_record shadow_recs[4];
+                            unsigned int shadow_mask = top_bvh->hit_packet(spk, shadow_recs);
+
+                            int k = 0;
+                            int lane_map[4];
+                            for (int l = 0; l < 4; ++l) {
+                                if (!(spk.active_mask & (1u << l))) continue;
+                                bool occluded = (shadow_mask & (1u << l));
+                                double vis = 1.0;
+                                if (occluded) {
+                                    double op = 1.0;
+                                    if (shadow_recs[l].mat) op = shadow_recs[l].mat->opacity_at(shadow_recs[l]);
+                                    vis = 1.0 - std::clamp(op, 0.0, 1.0);
+                                }
+                                if (vis <= 0.0) continue;
+
+                                hit_record& rec = primary_recs[l];
+                                // Precompute geometry, view and light directions used by both
+                                // dielectric and PBR branches.
+                                vec3 Ngeom = rec.normal;
+                                vec3 N = Ngeom;
+                                ray view_ray = cam.get_ray(lane_px[l], j, s);
+                                vec3 V = -unit_vector(view_ray.direction());
+                                vec3 Ldir = unit_vector(pl.position - rec.p);
+                                colour base = rec.mat ? rec.mat->albedo(rec) : colour(1,1,1);
+
+                                // For dielectrics, call material's shade_direct
+                                // (handles transmission/refraction) and skip ISPC.
+                                const material* mptr2 = rec.mat.get();
+                                if (mptr2 && mptr2->is_dielectric()) {
+                                    // compute attenuated radiance toward point light
+                                    double dist = (pl.position - rec.p).length();
+                                    double att = 1.0 / std::max(1e-4, dist * dist);
+                                    // visibility already folded into 'vis'
+                                    colour Li = pl.radiance * (float)att * (float)vis;
+                                    colour direct = mptr2->shade_direct(rec, V, Ldir, Li, world, vis);
+                                    int global_idx = lane_idx_global[l];
+                                    tile_direct[global_idx] += direct;
+                                    continue;
+                                }
+
+                                // Compute F0 and alpha using pbr_material when present
+                                const material* mptr = rec.mat.get();
+                                const pbr_material* pbr = dynamic_cast<const pbr_material*>(mptr);
+                                float metallic_v = 0.0f;
+                                float rough_v = 0.5f;
+                                colour dielectricF0 = colour(0.04f, 0.04f, 0.04f);
+                                // default tangent/bitangent/normal-texture values (may be overridden by pbr)
+                                vec3 T = rec.tangent;
+                                vec3 B = rec.bitangent;
+                                colour n_tex = colour(0.5f, 0.5f, 1.0f);
+                                float nstrength = 0.0f;
+                                if (pbr) {
+                                    if (pbr->metallic_tex) metallic_v = (float)pbr->metallic_tex->value(rec.u, rec.v, rec.p).x();
+                                    if (pbr->roughness_tex) rough_v = (float)pbr->roughness_tex->value(rec.u, rec.v, rec.p).x();
+                                    dielectricF0 = pbr->dielectric_F0;
+                                    base = pbr->albedo(rec);
+                                    
+                                    // Apply normal map if present
+                                    if (pbr->normal_tex) {
+                                        // override defaults with texture values
+                                        n_tex = pbr->normal_tex->value(rec.u, rec.v, rec.p);
+                                        vec3 n_tan_raw(2.0 * n_tex.x() - 1.0, 2.0 * n_tex.y() - 1.0, 2.0 * n_tex.z() - 1.0);
+                                        vec3 n_tan(n_tan_raw.x() * pbr->normal_strength, n_tan_raw.y() * pbr->normal_strength, n_tan_raw.z());
+                                        n_tan = unit_vector(n_tan);
+                                        N = unit_vector(n_tan.x() * T + n_tan.y() * B + n_tan.z() * Ngeom);
+                                        // Fade normal map at grazing angles
+                                        double NdotV_geo = dot(Ngeom, V);
+                                        if (NdotV_geo < 0.0) NdotV_geo = 0.0;
+                                        double strength = std::clamp(NdotV_geo * 5.0, 0.0, 1.0);
+                                        nstrength = pbr->normal_strength;
+                                        N = unit_vector(N * strength + Ngeom * (1.0 - strength));
+                                    }
+                                }
+                                // populate arrays for ISPC shaded compute
+                                Ngeomx[k] = (float)Ngeom.x(); Ngeomy[k] = (float)Ngeom.y(); Ngeomz[k] = (float)Ngeom.z();
+                                Tx[k] = (float)T.x(); Ty[k] = (float)T.y(); Tz[k] = (float)T.z();
+                                Bx[k] = (float)B.x(); By[k] = (float)B.y(); Bz[k] = (float)B.z();
+                                ntr[k] = (float)n_tex.x(); ntg[k] = (float)n_tex.y(); ntb[k] = (float)n_tex.z();
+                                normal_strength_arr[k] = (float)nstrength;
+
+                                Vx[k] = (float)V.x(); Vy[k] = (float)V.y(); Vz[k] = (float)V.z();
+                                Lx[k] = (float)Ldir.x(); Ly[k] = (float)Ldir.y(); Lz[k] = (float)Ldir.z();
+
+                                baser[k] = (float)base.x(); baseg[k] = (float)base.y(); baseb[k] = (float)base.z();
+                                metallic_arr[k] = (float)metallic_v;
+                                dielr[k] = (float)dielectricF0.x(); dielg[k] = (float)dielectricF0.y(); dielb[k] = (float)dielectricF0.z();
+                                alpha[k] = (float)perceptual_to_alpha((double)rough_v);
+                                lane_map[k] = l;
+                                ++k;
+                            }
+
+                            if (k > 0) {
+                                // Compute full shaded BRDF per lane using ISPC helper
+                                ispc_compute_shade(Ngeomx, Ngeomy, Ngeomz,
+                                                   Tx, Ty, Tz,
+                                                   Bx, By, Bz,
+                                                   ntr, ntg, ntb,
+                                                   normal_strength_arr,
+                                                   Vx, Vy, Vz,
+                                                   Lx, Ly, Lz,
+                                                   baser, baseg, baseb,
+                                                   metallic_arr,
+                                                   dielr, dielg, dielb,
+                                                   alpha, k,
+                                                   out_r, out_g, out_b);
+                                for (int pk_i = 0; pk_i < k; ++pk_i) {
+                                    int l = lane_map[pk_i];
+                                    int global_idx = lane_idx_global[l];
+                                    colour Li = pl.radiance * (float)(1.0 / std::max(1e-4, (pl.position - primary_recs[l].p).length_squared()));
+                                    tile_direct[global_idx] += colour(out_r[pk_i] * (float)Li.x(),
+                                                                      out_g[pk_i] * (float)Li.y(),
+                                                                      out_b[pk_i] * (float)Li.z());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int j = y0; j < y1; ++j) {
+            for (int i = x0; i < x1; ++i) {
             // We'll perform per-pixel sampling with optional adaptive stopping.
             // Welford accumulators for mean & M2 (per-channel radiance)
             double mean_r = 0.0, mean_g = 0.0, mean_b = 0.0;
@@ -110,21 +556,31 @@ render_result renderer::render(
             double rel_thresh = this->adaptive_rel_threshold;
             double abs_thresh = this->adaptive_abs_threshold;
 
+            // Per-sample sanitizer helper (moved outside the tight loop)
+            auto samp_sanitize = [](double v) -> double {
+                if (!std::isfinite(v) || v <= 0.0) return 0.0;
+                const double MAX_SAMPLE = 1e6; // cap per-component sample value
+                if (v > MAX_SAMPLE) v = MAX_SAMPLE;
+                return v;
+            };
+
             for (int s = 0; s < spp; ++s) {
                 ray r = cam.get_ray(i, j, s);
                 // Get one sample's contribution and the first-hit albedo/normal
                 colour samp;
                 colour samp_albedo(0,0,0);
                 vec3   samp_normal(0,0,0);
-                samp = cam.ray_colour(r, depth, world, &samp_albedo, &samp_normal);
-
-                // Per-sample sanitization: guard against NaN/Inf and negatives
-                auto samp_sanitize = [](double v) -> double {
-                    if (!std::isfinite(v) || v <= 0.0) return 0.0;
-                    const double MAX_SAMPLE = 1e6; // cap per-component sample value
-                    if (v > MAX_SAMPLE) v = MAX_SAMPLE;
-                    return v;
-                };
+                const hit_record* prehit_ptr = nullptr;
+                const colour* precomputed_direct_ptr = nullptr;
+                if (top_bvh) {
+                    int local_idx = (j - y0) * (x1 - x0) + (i - x0);
+                    int idx = s * tile_w_pixels + local_idx;
+                    if (local_idx >= 0 && idx >= 0 && idx < (int)tile_first_hit.size() && tile_first_hit[idx]) {
+                        prehit_ptr = &tile_first_rec[idx];
+                        precomputed_direct_ptr = &tile_direct[idx];
+                    }
+                }
+                samp = cam.ray_colour(r, depth, world, &samp_albedo, &samp_normal, prehit_ptr, precomputed_direct_ptr);
 
                 double sr = samp_sanitize(samp.x());
                 double sg = samp_sanitize(samp.y());
@@ -218,7 +674,12 @@ render_result renderer::render(
 
             // finalize normal (average and renormalize)
             vec3 avgN((float)(normal_sum_x * scale), (float)(normal_sum_y * scale), (float)(normal_sum_z * scale));
-            if (!avgN.near_zero()) avgN = unit_vector(avgN);
+            // Defer normalization: compute destination index and push raw vector into tile-local buffer
+            int idxf = 3 * (j * w + i);
+            tile_normals.push_back(avgN.x());
+            tile_normals.push_back(avgN.y());
+            tile_normals.push_back(avgN.z());
+            tile_idxf.push_back(idxf);
 
             // Sanitize components to avoid NaN/Inf and extremely large values
             auto sanitize = [](double v) -> double {
@@ -237,7 +698,6 @@ render_result renderer::render(
             r_lin *= exposure; g_lin *= exposure; b_lin *= exposure;
 
             // Store into HDR float buffer (float32)
-            int idxf = 3 * (j * w + i);
             hdr_buffer[idxf + 0] = (float)r_lin;
             hdr_buffer[idxf + 1] = (float)g_lin;
             hdr_buffer[idxf + 2] = (float)b_lin;
@@ -253,33 +713,9 @@ render_result renderer::render(
         }
 
         if (progress) {
-            int done = ++progress->completed_scanlines; // atomic
-
-            if (done % chunk_size == 0) {
-                #pragma omp critical
-                {
-                    auto   now           = clock::now();
-                    double chunk_seconds =
-                        std::chrono::duration<double>(now - chunk_start).count();
-                    chunk_start = now;
-
-                    double short_avg   = chunk_seconds / chunk_size;
-                    eta_shortterm      = short_avg * (total_scanlines - done);
-
-                    accumulated_time  += chunk_seconds;
-                    accumulated_lines += chunk_size;
-                    double long_avg    = accumulated_time /
-                                         std::max(1, accumulated_lines);
-                    eta_longterm       = long_avg * (total_scanlines - done);
-
-                    double eta     = 0.75 * eta_longterm + 0.25 * eta_shortterm;
-                    double elapsed =
-                        std::chrono::duration<double>(now - render_start).count();
-
-                    progress->eta_seconds.store(eta);
-                    progress->elapsed_seconds.store(elapsed);
-                }
-            }
+            // Keep scanline count for partial image display, but don't update ETA
+            // (ETA is now computed per-tile after the tile finishes)
+            ++progress->completed_scanlines; // atomic
         }
 
         // Mark this scanline as complete for safe partial display
@@ -337,6 +773,80 @@ render_result renderer::render(
                     } catch (...) {
                         // swallow any callback exceptions to avoid breaking render
                     }
+                }
+            }
+        }
+    }
+
+        // After finishing a tile, batch-normalize the collected normals (fast path)
+        int normals_count = (int)tile_idxf.size();
+        if (normals_count > 0) {
+            // normalize in-place (ISPC optimized when available)
+            ispc_normalize_batch(tile_normals.data(), normals_count);
+
+            // Write normalized normals back into the global normal AOV buffer
+            for (int k = 0; k < normals_count; ++k) {
+                int idf = tile_idxf[k];
+                normal_buffer[idf + 0] = tile_normals[3*k + 0];
+                normal_buffer[idf + 1] = tile_normals[3*k + 1];
+                normal_buffer[idf + 2] = tile_normals[3*k + 2];
+            }
+        }
+
+        // Update ETA using per-tile exponential moving average
+        if (progress) {
+            // Measure this tile's duration
+            auto now = clock::now();
+            double tile_seconds = std::chrono::duration<double>(now - tile_start).count();
+            
+            int tdone = ++completed_tiles; // atomic increment
+            progress->completed_tiles.store(tdone);
+
+            // Update EMA and ETA only every few tiles to reduce noise
+            const int eta_update_interval = 8; // update every N tiles
+            if (tdone % eta_update_interval == 0 || tdone >= num_tiles) {
+                #pragma omp critical
+                {
+                    // Keep the old EMA for compatibility but also record the tile time
+                    const double EMA_ALPHA = 0.05; // smooth long-term average
+                    double prev_avg = avg_tile_time.load();
+                    double new_avg = (prev_avg <= 0.0) ? tile_seconds : (EMA_ALPHA * tile_seconds + (1.0 - EMA_ALPHA) * prev_avg);
+                    if (!std::isfinite(new_avg) || new_avg <= 0.0) {
+                        new_avg = std::max(0.001, tile_seconds);
+                    }
+                    avg_tile_time.store(new_avg);
+
+                    // Push this tile time into the recent window and cap its size
+                    recent_tile_times.push_back(tile_seconds);
+                    if ((int)recent_tile_times.size() > RECENT_TILE_WINDOW) recent_tile_times.pop_front();
+
+                    // Compute median of recent tile times to avoid bias from startup/outliers
+                    double median_tile = new_avg;
+                    if (!recent_tile_times.empty()) {
+                        std::vector<double> tmp(recent_tile_times.begin(), recent_tile_times.end());
+                        std::sort(tmp.begin(), tmp.end());
+                        size_t m = tmp.size() / 2;
+                        if (tmp.size() % 2 == 1) median_tile = tmp[m];
+                        else median_tile = 0.5 * (tmp[m-1] + tmp[m]);
+                        // sanitize
+                        if (!std::isfinite(median_tile) || median_tile <= 0.0) median_tile = new_avg;
+                    }
+
+                    // Use the median (recent window) for ETA; this reduces overestimates caused
+                    // by a few slow startup tiles or occasional heavy tiles.
+                    int remaining = std::max(0, num_tiles - tdone);
+                    int workers = 1;
+#ifdef _OPENMP
+                    workers = std::max(1, omp_get_max_threads());
+#endif
+                    double eta = median_tile * remaining / (double)workers;
+                    if (eta < 0.0) eta = 0.0;
+
+                    // Update elapsed time from render start
+                    double elapsed = std::chrono::duration<double>(now - render_start).count();
+
+                    progress->eta_seconds.store(eta);
+                    progress->elapsed_seconds.store(elapsed);
                 }
             }
         }

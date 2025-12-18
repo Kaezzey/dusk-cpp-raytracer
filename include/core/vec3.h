@@ -1,7 +1,10 @@
 #ifndef VEC3_H
 #define VEC3_H
 
-#include <cmath>        
+#include <cmath>
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif       
 #include <iostream>   
 // Forward-declare RNG helpers to avoid pulling in `dusktracer.h` here
 // (including dusktracer.h from here caused a circular include with colour.h).
@@ -123,6 +126,29 @@ inline vec3 cross(const vec3& u, const vec3& v){
 //unit vector function
 inline vec3 unit_vector(const vec3& v){
     return v / v.length();
+}
+
+// Faster approximate normalization path using SSE on floats.
+// Converts to float, normalizes with SSE, converts back to double.
+inline vec3 unit_vector_fast(const vec3& v) {
+#if defined(__SSE__)
+    float fv[4];
+    fv[0] = (float)v.x(); fv[1] = (float)v.y(); fv[2] = (float)v.z(); fv[3] = 0.0f;
+    __m128 m = _mm_loadu_ps(fv);
+    __m128 sq = _mm_mul_ps(m, m);
+    // horizontal add to get sum of squares
+    __m128 t = _mm_hadd_ps(sq, sq);
+    t = _mm_hadd_ps(t, t);
+    float sum = _mm_cvtss_f32(t);
+    if (sum <= 0.0f) return v;
+    float invlen = 1.0f / sqrtf(sum);
+    __m128 inv = _mm_set1_ps(invlen);
+    __m128 n = _mm_mul_ps(m, inv);
+    _mm_storeu_ps(fv, n);
+    return vec3((double)fv[0], (double)fv[1], (double)fv[2]);
+#else
+    return unit_vector(v);
+#endif
 }
 
 inline vec3 random_in_unit_disk() {

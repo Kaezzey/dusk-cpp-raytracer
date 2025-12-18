@@ -46,6 +46,22 @@ static bool SetWindowIconFromPNG(GLFWwindow* w, const char* relpath)
     return true;
 }
 
+// Helper: try several likely locations for the icon filename (exe dir, resources/, parent resources/)
+static void SetWindowIconAuto(GLFWwindow* w, const char* filename)
+{
+    if (!w || !filename) return;
+    // Try exact filename first
+    if (SetWindowIconFromPNG(w, filename)) return;
+
+    // Try resources/ subfolder
+    std::string res1 = std::string("resources/") + filename;
+    if (SetWindowIconFromPNG(w, res1.c_str())) return;
+
+    // Try parent resources (when running from build subfolder)
+    std::string res2 = std::string("../resources/") + filename;
+    SetWindowIconFromPNG(w, res2.c_str());
+}
+
 #include "../../include/core/camera.h"
 #include "../../include/core/renderer.h"
 #include "../../include/core/scene.h"
@@ -2175,7 +2191,7 @@ static void init_engine_once()
         scene_light sun;
         sun.name = "Sun";
         sun.type = scene_light_type::directional;
-        sun.radiance = vec3(20.0, 20.0, 20.0);
+        sun.radiance = vec3(10.0, 10.0, 10.0);
         sun.direction = unit_vector(vec3(-0.3f, -1.0f, 0.2f));
         sun.angular_radius_deg = 0.53; // approximate sun
         g_scene.lights.push_back(sun);
@@ -2466,7 +2482,7 @@ static void start_progress_window_thread()
         }
 
         // Try to set the same app icon for the progress window
-        SetWindowIconFromPNG(pw, "resources/dusktracer.png");
+        SetWindowIconAuto(pw, "dusktracer.png");
 
         // Make its context current on this thread
         glfwMakeContextCurrent(pw);
@@ -3077,7 +3093,7 @@ int main()
     }
 
     // Try to set application icon from resources/dusktracer.png
-    SetWindowIconFromPNG(window, "dusktracer.png");
+    SetWindowIconAuto(window, "dusktracer.png");
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -4864,9 +4880,11 @@ int main()
                     g_world_dirty  = false;
                 }
 
-                // Reset progress struct
+                // Reset progress struct (renderer will set tile totals if used)
                 g_render_progress.total_scanlines = g_camera.image_height;
                 g_render_progress.completed_scanlines.store(0);
+                g_render_progress.total_tiles = 0;
+                g_render_progress.completed_tiles.store(0);
                 g_render_progress.eta_seconds.store(0.0);
                 g_render_progress.elapsed_seconds.store(0.0);
 
@@ -4903,8 +4921,10 @@ int main()
                         std::fprintf(stderr, "[RENDER] Camera image size: %dx%d\n", cam_copy.image_width, cam_copy.image_height);
                         std::fprintf(stderr, "[RENDER] Camera use_sun: %s\n", cam_copy.use_sun ? "YES" : "NO");
                         
-                        // Build caustics photon map once before render
-                        if (cam_copy.use_sun) {
+                        // Build caustics photon map once before render. Build when
+                        // we have either a sun or point lights so point-light
+                        // caustics are captured even if the sun is disabled.
+                        if (cam_copy.use_sun || !cam_copy.point_lights.empty()) {
                             std::fprintf(stderr, "[CAUSTICS] Starting photon map build...\n");
                             std::fprintf(stderr, "[CAUSTICS] Sun direction: (%.3f, %.3f, %.3f)\n", 
                                 cam_copy.sun_dir.x(), cam_copy.sun_dir.y(), cam_copy.sun_dir.z());
@@ -4922,12 +4942,67 @@ int main()
                             
                             photon_map pm;
                             std::fprintf(stderr, "[CAUSTICS] Photon map allocated\n");
-                            
-                            build_sun_caustics(cam_copy.sun_dir, cam_copy.sun_radiance,
-                                               *world_copy, cfg, pm);
-                            
-                            std::fprintf(stderr, "[CAUSTICS] Photon map built. Size: %zu photons\n", pm.size());
-                            
+
+                            // Build sun caustics if enabled
+                            if (cam_copy.use_sun) {
+                                build_sun_caustics(cam_copy.sun_dir, cam_copy.sun_radiance,
+                                                   *world_copy, cfg, pm);
+                                std::fprintf(stderr, "[CAUSTICS] Sun photon map built. Size: %zu photons\n", pm.size());
+                            }
+
+                            // Also emit photons from point lights so they contribute
+                            // to caustics (MNEE/photon capture). Share the budget
+                            // equally across point lights to keep it simple.
+                            if (!cam_copy.point_lights.empty()) {
+                                int npl = (int)cam_copy.point_lights.size();
+                                int photons_per_pl = std::max(1, cfg.photon_count / npl);
+                                std::fprintf(stderr, "[CAUSTICS] Emitting %d photons per point-light (%d lights)\n",
+                                    photons_per_pl, npl);
+
+                                for (const auto& pl : cam_copy.point_lights) {
+                                    for (int pi = 0; pi < photons_per_pl; ++pi) {
+                                        // Sample a random direction (uniform on sphere)
+                                        double z = 1.0 - 2.0 * random_double();
+                                        double r = std::sqrt(std::max(0.0, 1.0 - z*z));
+                                        double phi = 2.0 * M_PI * random_double();
+                                        double x = r * std::cos(phi);
+                                        double y = r * std::sin(phi);
+                                        vec3 dir = unit_vector(vec3((float)x, (float)y, (float)z));
+
+                                        ray r0(pl.position, dir, 0.0);
+                                        colour throughput = pl.radiance * (float)(1.0 / std::max(1, photons_per_pl));
+
+                                        bool saw_dielectric = false;
+                                        int spec_events = 0;
+                                        for (int b = 0; b < cfg.max_bounces; ++b) {
+                                            hit_record rec;
+                                            if (!world_copy->hit(r0, interval(0.001, infinity), rec)) break;
+
+                                            if (!rec.mat || (!rec.mat->is_specular())) {
+                                                if (saw_dielectric && spec_events >= cfg.min_specular_events) {
+                                                    photon ph;
+                                                    ph.pos = rec.p;
+                                                    ph.dir = unit_vector(r0.direction());
+                                                    ph.power = throughput;
+                                                    pm.insert(ph);
+                                                }
+                                                break; // terminate on diffuse
+                                            }
+
+                                            // specular event
+                                            ray scattered;
+                                            colour atten;
+                                            if (!rec.mat->scatter(r0, rec, atten, scattered)) break;
+                                            throughput = throughput * atten;
+                                            if (rec.mat && rec.mat->is_dielectric()) saw_dielectric = true;
+                                            ++spec_events;
+                                            r0 = scattered;
+                                        }
+                                    }
+                                }
+                                std::fprintf(stderr, "[CAUSTICS] Point-light photons added. Map size: %zu\n", pm.size());
+                            }
+
                             cam_copy.set_caustics(pm, cfg.deposit_radius);
                             std::fprintf(stderr, "[CAUSTICS] Photon map assigned to camera\n");
                         }
@@ -5001,13 +5076,26 @@ int main()
         // Progress bar / ETA
         if (g_render_in_progress) {
             ImGui::Separator();
-            int   done   = g_render_progress.completed_scanlines.load();
-            int   total  = g_render_progress.total_scanlines;
+            int   done;
+            int   total;
+            bool  using_tiles = (g_render_progress.total_tiles > 0);
+            if (using_tiles) {
+                done  = g_render_progress.completed_tiles.load();
+                total = g_render_progress.total_tiles;
+            } else {
+                done  = g_render_progress.completed_scanlines.load();
+                total = g_render_progress.total_scanlines;
+            }
+
             float pct    = (total > 0) ? (float)done / (float)total : 0.0f;
             double eta   = g_render_progress.eta_seconds.load();
             double el    = g_render_progress.elapsed_seconds.load();
 
-            ImGui::Text("Rendering: %d / %d scanlines", done, total);
+            if (using_tiles) {
+                ImGui::Text("Rendering: %d / %d tiles", done, total);
+            } else {
+                ImGui::Text("Rendering: %d / %d scanlines", done, total);
+            }
             ImGui::ProgressBar(pct, ImVec2(-FLT_MIN, 0.0f));
 
             int rem = (int)eta;

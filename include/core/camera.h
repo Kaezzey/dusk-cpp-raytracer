@@ -333,7 +333,7 @@ class camera {
     }
 
     // Optionally returns the first-hit surface albedo and normal via out parameters
-    colour ray_colour(const ray& r0, int max_depth, const hittable& world, colour* out_albedo = nullptr, vec3* out_normal = nullptr) const {
+    colour ray_colour(const ray& r0, int max_depth, const hittable& world, colour* out_albedo = nullptr, vec3* out_normal = nullptr, const hit_record* prehit = nullptr, const colour* precomputed_direct = nullptr) const {
         ray    current_ray = r0;
         colour throughput(1.0, 1.0, 1.0);
         colour result(0,0,0);
@@ -343,8 +343,22 @@ class camera {
 
             hit_record rec;
 
-            // Miss: accumulate environment background (optionally sun disc) and stop
-            if (!world.hit(current_ray, interval(0.001, infinity), rec)) {
+            // If caller supplied a precomputed first-hit record, use it for the first depth
+            bool have_prehit = (prehit != nullptr && depth == 0);
+            bool did_hit = false;
+            if (have_prehit) {
+                rec = *prehit;
+                did_hit = true;
+            } else {
+                // Miss: accumulate environment background (optionally sun disc) and stop
+                if (!world.hit(current_ray, interval(0.001, infinity), rec)) {
+                    did_hit = false;
+                } else {
+                    did_hit = true;
+                }
+            }
+
+            if (!did_hit) {
                 colour env = background;
 
                 // If sun is enabled, add environment sun radiance when ray
@@ -370,7 +384,7 @@ class camera {
             }
 
             // On the first surface hit, optionally return albedo and normal for AOVs
-            if (depth == 0) {
+            if (depth == 0 && did_hit) {
                 if (out_albedo) {
                     if (rec.mat) *out_albedo = rec.mat->albedo(rec);
                     else *out_albedo = colour(0,0,0);
@@ -392,7 +406,7 @@ class camera {
                 colour Lc = caustics.query(rec.p, caustics_radius);
                 result += throughput * Lc;
 
-                if (enable_mnee && mnee_has_sphere && use_sun) {
+                if (enable_mnee && mnee_has_sphere) {
                     mnee_config mc;
                     mc.newton_max_iters = mnee_newton_max_iters;
                     mc.newton_tol       = mnee_newton_tol;
@@ -401,13 +415,29 @@ class camera {
                     mc.sun_ang_radius   = sun_angular_radius * (pi / 180.0);
                     mc.sun_samples      = mnee_sun_samples;
                     mc.gain_scale       = mnee_gain_scale;
-                    colour Lm = mnee_single_sphere_estimate(
-                        rec.p, rec.normal,
-                        unit_vector(sun_dir), sun_radiance,
-                        mnee_sphere_center, mnee_sphere_radius, mnee_sphere_ior,
-                        world, mc
-                    );
-                    result += throughput * Lm;
+                    // Sun-directed MNEE (if sun enabled)
+                    if (use_sun) {
+                        colour Lm = mnee_single_sphere_estimate(
+                            rec.p, rec.normal,
+                            unit_vector(sun_dir), sun_radiance,
+                            mnee_sphere_center, mnee_sphere_radius, mnee_sphere_ior,
+                            world, mc
+                        );
+                        result += throughput * Lm;
+                    }
+
+                    // Point-light MNEE: attempt per-point-light estimate and add
+                    // their caustic contribution. This uses a budgeted search per
+                    // shading point and is intentionally limited by mc.per_thread_budget.
+                    for (const auto& pl : point_lights) {
+                        colour Lmp = mnee_single_pointlight_estimate(
+                            rec.p, rec.normal,
+                            pl.position, pl.radiance,
+                            mnee_sphere_center, mnee_sphere_radius, mnee_sphere_ior,
+                            world, mc
+                        );
+                        result += throughput * Lmp;
+                    }
                 }
             }
 
@@ -470,32 +500,37 @@ class camera {
             }
 
             // Point lights: simple single-sample point lights with inverse-square falloff
-            for (const auto& pl : point_lights) {
-                vec3 toLight = pl.position - rec.p;
-                double dist = toLight.length();
-                if (dist <= 1e-6) continue;
-                vec3 Ldir = unit_vector(toLight);
+            // If the caller supplied a precomputed direct contribution (for depth==0), use it instead of computing here.
+            if (depth == 0 && precomputed_direct) {
+                result += throughput * (*precomputed_direct);
+            } else {
+                for (const auto& pl : point_lights) {
+                    vec3 toLight = pl.position - rec.p;
+                    double dist = toLight.length();
+                    if (dist <= 1e-6) continue;
+                    vec3 Ldir = unit_vector(toLight);
 
-                double NdotL = dot(rec.normal, Ldir);
-                if (NdotL <= 0.0) continue;
+                    double NdotL = dot(rec.normal, Ldir);
+                    if (NdotL <= 0.0) continue;
 
-                // Range culling
-                if (pl.range > 0.0 && dist > pl.range) continue;
+                    // Range culling
+                    if (pl.range > 0.0 && dist > pl.range) continue;
 
-                // Shadow check: cast toward light, limit to distance. Use
-                // deterministic transmittance to allow partial transmission
-                // through opacity-masked surfaces.
-                ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
-                double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
-                if (tr <= 0.0) continue;
+                    // Shadow check: cast toward light, limit to distance. Use
+                    // deterministic transmittance to allow partial transmission
+                    // through opacity-masked surfaces.
+                    ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
+                    double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
+                    if (tr <= 0.0) continue;
 
-                // Attenuate by inverse-square (clamp to avoid huge values)
-                double att = 1.0 / std::max(1e-4, dist * dist);
-                colour Li = pl.radiance * (float)att * (float)tr;
+                    // Attenuate by inverse-square (clamp to avoid huge values)
+                    double att = 1.0 / std::max(1e-4, dist * dist);
+                    colour Li = pl.radiance * (float)att * (float)tr;
 
-                vec3 V = -unit_vector(current_ray.direction());
-                colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
-                result += throughput * direct;
+                    vec3 V = -unit_vector(current_ray.direction());
+                    colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
+                    result += throughput * direct;
+                }
             }
 
             // Update throughput & ray

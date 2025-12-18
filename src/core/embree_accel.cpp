@@ -3,6 +3,7 @@
 #include "../../include/core/dusktracer.h"
 
 #include <cstdio>
+#include <cstring>
 
 #ifdef HAVE_EMBREE
 
@@ -199,10 +200,99 @@ bool embree_triangle_accel::hit(const ray& r, interval ray_t, hit_record& rec) c
 
 bool embree_triangle_accel::hit_packet(const std::array<ray,4>& rays, const interval& ray_t, std::array<hit_record,4>& out_recs) const
 {
-    // Default implementation: loop over rays and call single-ray hit().
-    // This keeps behavior correct on all builds. Future optimization: replace
-    // this loop with Embree's rtcIntersect4/rtcIntersectN packet APIs for
-    // real SIMD traversal.
+    if (!scene) return false;
+
+#if defined(RTC_VERSION_MAJOR) && (RTC_VERSION_MAJOR >= 4)
+    // Embree4: use RTCRayHit4 and rtcIntersect4
+    RTCRayHit4 rh4;
+    std::memset(&rh4, 0, sizeof(rh4));
+
+    for (int i = 0; i < 4; ++i) {
+        rh4.ray.org_x[i] = (float)rays[i].origin().x();
+        rh4.ray.org_y[i] = (float)rays[i].origin().y();
+        rh4.ray.org_z[i] = (float)rays[i].origin().z();
+        rh4.ray.dir_x[i] = (float)rays[i].direction().x();
+        rh4.ray.dir_y[i] = (float)rays[i].direction().y();
+        rh4.ray.dir_z[i] = (float)rays[i].direction().z();
+        rh4.ray.tnear[i] = (float)ray_t.min;
+        rh4.ray.tfar[i]  = (float)ray_t.max;
+        rh4.ray.time[i]  = (float)rays[i].time();
+        rh4.ray.mask[i]  = -1;
+        rh4.hit.geomID[i] = RTC_INVALID_GEOMETRY_ID;
+        rh4.hit.primID[i] = RTC_INVALID_GEOMETRY_ID;
+    }
+
+    struct RTCIntersectArguments args;
+    rtcInitIntersectArguments(&args);
+
+    int valid = (1<<4) - 1; // all 4 lanes valid
+    rtcIntersect4(&valid, scene, &rh4, &args);
+
+    bool any_hit = false;
+    for (int i = 0; i < 4; ++i) {
+        if (rh4.hit.geomID[i] == RTC_INVALID_GEOMETRY_ID) continue;
+
+        double t = (double)rh4.ray.tfar[i];
+        if (!ray_t.surrounds(t)) continue;
+
+        double u = rh4.hit.u[i];
+        double v = rh4.hit.v[i];
+        double w = 1.0 - u - v;
+
+        hit_record rec;
+        rec.t = t;
+        rec.p = rays[i].at(t);
+
+        unsigned int prim = rh4.hit.primID[i];
+        if (prim < m_triangle_data.size()) {
+            const auto& td = m_triangle_data[prim];
+            double iu = w * td.u0 + u * td.u1 + v * td.u2;
+            double iv = w * td.v0_uv + u * td.v1_uv + v * td.v2_uv;
+            rec.u = iu; rec.v = iv;
+
+            vec3 interpN = (td.n0 * (float)w) + (td.n1 * (float)u) + (td.n2 * (float)v);
+            interpN = unit_vector(interpN);
+            rec.set_face_normal(rays[i], interpN);
+
+            vec3 interpT = (td.t0 * (float)w) + (td.t1 * (float)u) + (td.t2 * (float)v);
+            vec3 interpB = (td.b0 * (float)w) + (td.b1 * (float)u) + (td.b2 * (float)v);
+
+            if (!interpT.near_zero()) {
+                interpT = interpT - interpN * dot(interpT, interpN);
+                interpT = unit_vector(interpT);
+            } else {
+                vec3 up = (std::fabs(interpN.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
+                interpT = unit_vector(cross(up, interpN));
+            }
+
+            if (!interpB.near_zero()) {
+                interpB = interpB - interpN * dot(interpB, interpN);
+                interpB = unit_vector(interpB);
+            } else {
+                interpB = cross(interpN, interpT);
+            }
+
+            if (interpB.near_zero()) {
+                interpB = cross(interpN, interpT);
+            }
+
+            rec.tangent = interpT;
+            rec.bitangent = interpB;
+            rec.mat = td.mat;
+        } else {
+            vec3 Ng((double)rh4.hit.Ng_x[i], (double)rh4.hit.Ng_y[i], (double)rh4.hit.Ng_z[i]);
+            vec3 N = unit_vector(Ng);
+            rec.set_face_normal(rays[i], N);
+            rec.mat.reset();
+        }
+
+        out_recs[i] = rec;
+        any_hit = true;
+    }
+
+    return any_hit;
+#else
+    // Fallback: loop per-ray
     bool any_hit = false;
     for (int i = 0; i < 4; ++i) {
         hit_record rec;
@@ -211,6 +301,7 @@ bool embree_triangle_accel::hit_packet(const std::array<ray,4>& rays, const inte
         any_hit = any_hit || h;
     }
     return any_hit;
+#endif
 }
 
 aabb embree_triangle_accel::bounding_box() const
