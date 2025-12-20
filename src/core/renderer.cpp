@@ -394,7 +394,9 @@ render_result renderer::render(
                             }
                         }
 
-                        // Process point lights similarly (packet shadow + ISPC specular)
+                        // Process point lights: loop over all (precompute direct lighting is deterministic)
+                        // Note: Path tracer uses importance sampling, but precompute needs all lights
+                        // for consistent direct lighting. This is acceptable since it's only first-hit.
                         for (const auto& pl : cam.point_lights) {
                             RayPacket4 spk = pk;
                             // Setup each lane's shadow ray toward the point light

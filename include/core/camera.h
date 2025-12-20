@@ -75,13 +75,17 @@ class camera {
     double mnee_sphere_radius = 0.0;
     double mnee_sphere_ior    = 1.5;
     // MNEE solver tuning
-    int    mnee_per_thread_budget = 1024;
+    int    mnee_per_thread_budget = 16;  // Low default for point lights (1024 for sun caustics)
     int    mnee_newton_max_iters  = 8;
     double mnee_newton_tol        = 1e-5;
     double mnee_step_eps          = 1e-3;
     // Sun disc sampling and gain control for broader/brighter caustics
     int    mnee_sun_samples       = 4;
     double mnee_gain_scale        = 1.0;
+
+    // NEE + MIS for diffuse materials (reduces noise at low SPP)
+    int    direct_light_samples   = 1;  // samples per diffuse hit (1-4 recommended)
+    bool   enable_mis             = true; // Multiple Importance Sampling
 
     void render(const hittable& world, std::ostream& out = std::cout){
         
@@ -426,24 +430,18 @@ class camera {
                         result += throughput * Lm;
                     }
 
-                    // Point-light MNEE: attempt per-point-light estimate and add
-                    // their caustic contribution. This uses a budgeted search per
-                    // shading point and is intentionally limited by mc.per_thread_budget.
-                    for (const auto& pl : point_lights) {
-                        colour Lmp = mnee_single_pointlight_estimate(
-                            rec.p, rec.normal,
-                            pl.position, pl.radiance,
-                            mnee_sphere_center, mnee_sphere_radius, mnee_sphere_ior,
-                            world, mc
-                        );
-                        result += throughput * Lmp;
-                    }
+                    // Point-light MNEE: DISABLED - creates circular banding artifacts
+                    // with low budgets and is extremely expensive. Point light caustics
+                    // are better handled by regular path tracing with sufficient SPP.
+                    // Sun caustics use Newton solver which is much more accurate.
+                    // To re-enable: uncomment code and set mnee_per_thread_budget > 256
                 }
             }
 
             // Scatter
             ray    scattered;
             colour attenuation;
+            double pdf_bsdf = 1.0;
 
             if (!rec.mat->scatter(current_ray, rec, attenuation, scattered)) {
                 // No scattering (pure light or absorption) – we're done
@@ -453,8 +451,158 @@ class camera {
             // Track whether path went through glass (for future use/debug)
             if (!rec.front_face && rec.mat->is_dielectric()) passed_through_glass = true;
 
+            // For non-specular materials, do explicit light sampling (NEE) with MIS
+            bool did_nee = false;
+            if (!rec.mat->is_specular() && enable_mis) {
+                vec3 V = -unit_vector(current_ray.direction());
+                int num_direct_samples = std::max(1, direct_light_samples);
+                
+                // Sample sun with NEE+MIS
+                if (use_sun) {
+                    for (int ls = 0; ls < num_direct_samples; ++ls) {
+                        vec3 Lc = unit_vector(sun_dir);
+                        double ang_rad = degrees_to_radians(sun_angular_radius);
+                        double cos_theta_max = std::cos(ang_rad);
+                        
+                        // Sample direction within sun disc
+                        vec3 Ls = Lc;
+                        if (ang_rad > 0.0) {
+                            double u = random_double();
+                            double v = random_double();
+                            double cos_theta = (1.0 - u) + u * cos_theta_max;
+                            double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
+                            double phi = 2.0 * pi * v;
+                            
+                            double x = sin_theta * std::cos(phi);
+                            double y = sin_theta * std::sin(phi);
+                            double z = cos_theta;
+                            
+                            vec3 w_s = Lc;
+                            vec3 a = (std::fabs(w_s.x()) > 0.1) ? vec3(0,1,0) : vec3(1,0,0);
+                            vec3 u_s = unit_vector(cross(a, w_s));
+                            vec3 v_s = cross(w_s, u_s);
+                            Ls = unit_vector(u_s * (float)x + v_s * (float)y + w_s * (float)z);
+                        }
+                        
+                        double NdotL = dot(rec.normal, Ls);
+                        if (NdotL > 0.0) {
+                            ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
+                            double tr = compute_transmittance(shadow_ray, std::numeric_limits<double>::infinity(), world);
+                            
+                            if (tr > 0.0) {
+                                // Compute BRDF and PDFs for MIS
+                                colour f_brdf = rec.mat->albedo(rec) * (NdotL / pi);
+                                
+                                // PDF for light sampling (uniform on sun disc)
+                                double solid_angle = 2.0 * pi * (1.0 - cos_theta_max);
+                                double pdf_light = 1.0 / std::max(1e-10, solid_angle);
+                                
+                                // PDF for BSDF sampling (cosine-weighted hemisphere)
+                                double pdf_bsdf_light = NdotL / pi;
+                                
+                                // MIS balance heuristic weight
+                                double w_light = (pdf_light * pdf_light) / 
+                                                (pdf_light * pdf_light + pdf_bsdf_light * pdf_bsdf_light);
+                                
+                                colour Li = sun_radiance * (float)tr;
+                                result += throughput * f_brdf * Li * (float)(w_light / (pdf_light * num_direct_samples));
+                                did_nee = true;
+                            }
+                        }
+                    }
+                }
+                
+                // Sample point lights with NEE+MIS
+                // OPTIMIZATION: Sample ONE random light per bounce (weighted by contribution)
+                // and multiply by N to get unbiased result at O(1) cost instead of O(N)
+                if (!point_lights.empty()) {
+                    int num_lights = (int)point_lights.size();
+                    
+                    // Build importance weights (inverse-square + range culling)
+                    std::vector<double> weights;
+                    weights.reserve(num_lights);
+                    double total_weight = 0.0;
+                    
+                    for (const auto& pl : point_lights) {
+                        vec3 toLight = pl.position - rec.p;
+                        double dist = toLight.length();
+                        if (dist <= 1e-6) {
+                            weights.push_back(0.0);
+                            continue;
+                        }
+                        vec3 Ldir = unit_vector(toLight);
+                        double NdotL = dot(rec.normal, Ldir);
+                        if (NdotL <= 0.0) {
+                            weights.push_back(0.0);
+                            continue;
+                        }
+                        if (pl.range > 0.0 && dist > pl.range) {
+                            weights.push_back(0.0);
+                            continue;
+                        }
+                        
+                        // Weight by approximate contribution (inverse-square * NdotL * radiance luminance)
+                        double att = 1.0 / std::max(1e-4, dist * dist);
+                        double lum = 0.2126 * pl.radiance.x() + 0.7152 * pl.radiance.y() + 0.0722 * pl.radiance.z();
+                        double w = att * NdotL * lum;
+                        weights.push_back(w);
+                        total_weight += w;
+                    }
+                    
+                    // Sample one light proportional to weight
+                    if (total_weight > 1e-10) {
+                        for (int ls = 0; ls < num_direct_samples; ++ls) {
+                            double r = random_double() * total_weight;
+                            int sampled_idx = 0;
+                            double accum = 0.0;
+                            for (int li = 0; li < num_lights; ++li) {
+                                accum += weights[li];
+                                if (r <= accum) {
+                                    sampled_idx = li;
+                                    break;
+                                }
+                            }
+                            
+                            const auto& pl = point_lights[sampled_idx];
+                            double pick_prob = weights[sampled_idx] / total_weight;
+                            
+                            vec3 toLight = pl.position - rec.p;
+                            double dist = toLight.length();
+                            vec3 Ldir = unit_vector(toLight);
+                            double NdotL = dot(rec.normal, Ldir);
+                            
+                            ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
+                            double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
+                            if (tr <= 0.0) continue;
+                            
+                            // Compute BRDF
+                            colour f_brdf = rec.mat->albedo(rec) * (NdotL / pi);
+                            
+                            // PDF for light sampling (1 / solid angle)
+                            double solid_angle = (4.0 * pi * dist * dist) / std::max(1e-10, NdotL);
+                            double pdf_light = 1.0 / std::max(1e-10, solid_angle);
+                            
+                            // PDF for BSDF sampling
+                            double pdf_bsdf_light = NdotL / pi;
+                            
+                            // MIS weight
+                            double w_light = (pdf_light * pdf_light) / 
+                                            (pdf_light * pdf_light + pdf_bsdf_light * pdf_bsdf_light);
+                            
+                            double att = 1.0 / std::max(1e-4, dist * dist);
+                            colour Li = pl.radiance * (float)(att * tr);
+                            
+                            // Scale by 1/pick_prob to account for sampling only one light
+                            result += throughput * f_brdf * Li * (float)(w_light / (pdf_light * num_direct_samples * pick_prob));
+                            did_nee = true;
+                        }
+                    }
+                }
+            }
+
             // Directional sun (camera-mirrored) support: sample soft sun/shadows if enabled.
-            if (use_sun) {
+            // Only do this for specular materials or if MIS is disabled
+            if (use_sun && (rec.mat->is_specular() || !enable_mis)) {
                 // central sun direction (FROM scene toward sun)
                 vec3 Lc = unit_vector(sun_dir);
                 int samples = std::max(1, sun_shadow_samples);
@@ -501,35 +649,76 @@ class camera {
 
             // Point lights: simple single-sample point lights with inverse-square falloff
             // If the caller supplied a precomputed direct contribution (for depth==0), use it instead of computing here.
+            // Skip if we already did NEE+MIS above for non-specular materials
             if (depth == 0 && precomputed_direct) {
                 result += throughput * (*precomputed_direct);
-            } else {
+            } else if ((rec.mat->is_specular() || !enable_mis) && !point_lights.empty()) {
+                // OPTIMIZATION: Sample one random light (importance-weighted) instead of all N lights
+                int num_lights = (int)point_lights.size();
+                
+                // Build importance weights
+                std::vector<double> weights;
+                weights.reserve(num_lights);
+                double total_weight = 0.0;
+                
                 for (const auto& pl : point_lights) {
                     vec3 toLight = pl.position - rec.p;
                     double dist = toLight.length();
-                    if (dist <= 1e-6) continue;
+                    if (dist <= 1e-6) {
+                        weights.push_back(0.0);
+                        continue;
+                    }
+                    vec3 Ldir = unit_vector(toLight);
+                    double NdotL = dot(rec.normal, Ldir);
+                    if (NdotL <= 0.0) {
+                        weights.push_back(0.0);
+                        continue;
+                    }
+                    if (pl.range > 0.0 && dist > pl.range) {
+                        weights.push_back(0.0);
+                        continue;
+                    }
+                    
+                    // Weight by contribution (inverse-square * NdotL * luminance)
+                    double att = 1.0 / std::max(1e-4, dist * dist);
+                    double lum = 0.2126 * pl.radiance.x() + 0.7152 * pl.radiance.y() + 0.0722 * pl.radiance.z();
+                    double w = att * NdotL * lum;
+                    weights.push_back(w);
+                    total_weight += w;
+                }
+                
+                // Sample one light
+                if (total_weight > 1e-10) {
+                    double r = random_double() * total_weight;
+                    int sampled_idx = 0;
+                    double accum = 0.0;
+                    for (int li = 0; li < num_lights; ++li) {
+                        accum += weights[li];
+                        if (r <= accum) {
+                            sampled_idx = li;
+                            break;
+                        }
+                    }
+                    
+                    const auto& pl = point_lights[sampled_idx];
+                    double pick_prob = weights[sampled_idx] / total_weight;
+                    
+                    vec3 toLight = pl.position - rec.p;
+                    double dist = toLight.length();
                     vec3 Ldir = unit_vector(toLight);
 
-                    double NdotL = dot(rec.normal, Ldir);
-                    if (NdotL <= 0.0) continue;
-
-                    // Range culling
-                    if (pl.range > 0.0 && dist > pl.range) continue;
-
-                    // Shadow check: cast toward light, limit to distance. Use
-                    // deterministic transmittance to allow partial transmission
-                    // through opacity-masked surfaces.
                     ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
                     double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
-                    if (tr <= 0.0) continue;
+                    if (tr > 0.0) {
+                        double att = 1.0 / std::max(1e-4, dist * dist);
+                        colour Li = pl.radiance * (float)(att * tr);
 
-                    // Attenuate by inverse-square (clamp to avoid huge values)
-                    double att = 1.0 / std::max(1e-4, dist * dist);
-                    colour Li = pl.radiance * (float)att * (float)tr;
-
-                    vec3 V = -unit_vector(current_ray.direction());
-                    colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
-                    result += throughput * direct;
+                        vec3 V = -unit_vector(current_ray.direction());
+                        colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
+                        
+                        // Scale by 1/pick_prob to account for sampling only one light
+                        result += throughput * direct * (float)(1.0 / pick_prob);
+                    }
                 }
             }
 

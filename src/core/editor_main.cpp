@@ -106,6 +106,8 @@ static float g_camera_look_sens  = 0.002f;  // radians per pixel
 
 // Currently selected object in the Scene Hierarchy (-1 = none)
 static int g_selected_object = -1;
+static int g_selected_material = -1; // Selected material in the asset viewer for editing
+static int g_selected_mesh_asset = -1; // Selected mesh asset in the asset viewer for editing
 
 // Files dropped this frame
 static std::vector<std::string> g_dropped_files;
@@ -232,6 +234,232 @@ static void AssetPreloaderThreadMain()
 
 // Model thumbnail cache: mesh_index -> GL texture
 
+// Material thumbnail cache and rendering infrastructure
+static std::unordered_map<int, GLuint> g_material_thumb_cache;
+static GLuint g_material_preview_fbo = 0;
+static GLuint g_material_preview_tex = 0;
+static GLuint g_material_preview_depth = 0;
+static constexpr int MATERIAL_THUMB_SIZE = 128;
+
+// Simple sphere mesh for material preview (generated once)
+struct SphereMeshGL {
+    GLuint vao = 0, vbo = 0, ibo = 0;
+    int num_indices = 0;
+    bool initialized = false;
+};
+static SphereMeshGL g_preview_sphere;
+
+static void InitMaterialPreviewSphere() {
+    if (g_preview_sphere.initialized) return;
+
+    // Generate a UV sphere with 32 segments and 16 rings
+    const int segments = 32, rings = 16;
+    std::vector<float> vertices; // x,y,z,nx,ny,nz,u,v
+    std::vector<unsigned int> indices;
+
+    for (int r = 0; r <= rings; ++r) {
+        float v = (float)r / rings;
+        float phi = v * 3.14159265f;
+        for (int s = 0; s <= segments; ++s) {
+            float u = (float)s / segments;
+            float theta = u * 2.0f * 3.14159265f;
+            float x = std::sin(phi) * std::cos(theta);
+            float y = std::cos(phi);
+            float z = std::sin(phi) * std::sin(theta);
+            vertices.push_back(x); vertices.push_back(y); vertices.push_back(z);
+            vertices.push_back(x); vertices.push_back(y); vertices.push_back(z); // normal
+            vertices.push_back(u); vertices.push_back(v);
+        }
+    }
+
+    for (int r = 0; r < rings; ++r) {
+        for (int s = 0; s < segments; ++s) {
+            unsigned int i0 = r * (segments + 1) + s;
+            unsigned int i1 = i0 + 1;
+            unsigned int i2 = (r + 1) * (segments + 1) + s;
+            unsigned int i3 = i2 + 1;
+            indices.push_back(i0); indices.push_back(i2); indices.push_back(i1);
+            indices.push_back(i1); indices.push_back(i2); indices.push_back(i3);
+        }
+    }
+
+    glGenVertexArrays(1, &g_preview_sphere.vao);
+    glGenBuffers(1, &g_preview_sphere.vbo);
+    glGenBuffers(1, &g_preview_sphere.ibo);
+
+    glBindVertexArray(g_preview_sphere.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_preview_sphere.vbo);
+    glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
+
+    // Position (0)
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    // Normal (1)
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    // UV (2)
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_preview_sphere.ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
+
+    glBindVertexArray(0);
+
+    g_preview_sphere.num_indices = (int)indices.size();
+    g_preview_sphere.initialized = true;
+}
+
+static void InitMaterialPreviewFBO() {
+    if (g_material_preview_fbo) return;
+
+    glGenFramebuffers(1, &g_material_preview_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_material_preview_fbo);
+
+    glGenTextures(1, &g_material_preview_tex);
+    glBindTexture(GL_TEXTURE_2D, g_material_preview_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_material_preview_tex, 0);
+
+    glGenRenderbuffers(1, &g_material_preview_depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, g_material_preview_depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_material_preview_depth);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        std::printf("Material preview FBO incomplete: %d\n", status);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// Persist mesh -> default material slot assignments between launches.
+static const char* kMeshMatDefaultsFile = "mesh_material_defaults.txt";
+
+static void SaveMeshMaterialDefaults()
+{
+    std::ofstream out(kMeshMatDefaultsFile);
+    if (!out) return;
+    for (const auto& mesh : g_scene.meshes) {
+        // Format: mesh_name|idx,idx,idx\n   (use '|' as name/data separator)
+        out << mesh.name << "|";
+        for (size_t i = 0; i < mesh.slot_default_materials.size(); ++i) {
+            if (i) out << ',';
+            out << mesh.slot_default_materials[i];
+        }
+        out << '\n';
+    }
+}
+
+static void LoadMeshMaterialDefaults()
+{
+    std::ifstream in(kMeshMatDefaultsFile);
+    if (!in) return;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        size_t sep = line.find('|');
+        if (sep == std::string::npos) continue;
+        std::string name = line.substr(0, sep);
+        std::string rest = line.substr(sep + 1);
+        // find matching mesh by name
+        for (auto &mesh : g_scene.meshes) {
+            if (mesh.name != name) continue;
+            mesh.slot_default_materials.clear();
+            std::stringstream ss(rest);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                try {
+                    int v = std::stoi(tok);
+                    mesh.slot_default_materials.push_back(v);
+                } catch (...) {
+                    mesh.slot_default_materials.push_back(-1);
+                }
+            }
+            break;
+        }
+    }
+}
+
+static GLuint GetOrCreateMaterialThumbnail(int material_idx) {
+    // Check cache
+    auto it = g_material_thumb_cache.find(material_idx);
+    if (it != g_material_thumb_cache.end()) return it->second;
+
+    if (material_idx < 0 || material_idx >= (int)g_scene.materials.size()) return 0;
+
+    InitMaterialPreviewSphere();
+    InitMaterialPreviewFBO();
+
+    const auto& mat = g_scene.materials[material_idx];
+    colour base = mat.base_color;
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // If material has an albedo texture, use it for the preview
+    if (mat.albedo_tex >= 0 && mat.albedo_tex < (int)g_scene.textures.size()) {
+        const std::string& tex_path = g_scene.textures[mat.albedo_tex].path;
+        int w = 0, h = 0, comp = 0;
+        stbi_uc* pixels = stbi_load(tex_path.c_str(), &w, &h, &comp, 4);
+        if (pixels && w > 0 && h > 0) {
+            // Resize to thumbnail size if needed
+            std::vector<unsigned char> resized_pixels;
+            if (w != MATERIAL_THUMB_SIZE || h != MATERIAL_THUMB_SIZE) {
+                resized_pixels.resize(MATERIAL_THUMB_SIZE * MATERIAL_THUMB_SIZE * 4);
+                // Simple nearest-neighbor resize
+                for (int y = 0; y < MATERIAL_THUMB_SIZE; ++y) {
+                    for (int x = 0; x < MATERIAL_THUMB_SIZE; ++x) {
+                        int src_x = (x * w) / MATERIAL_THUMB_SIZE;
+                        int src_y = (y * h) / MATERIAL_THUMB_SIZE;
+                        int src_idx = (src_y * w + src_x) * 4;
+                        int dst_idx = (y * MATERIAL_THUMB_SIZE + x) * 4;
+                        resized_pixels[dst_idx+0] = pixels[src_idx+0];
+                        resized_pixels[dst_idx+1] = pixels[src_idx+1];
+                        resized_pixels[dst_idx+2] = pixels[src_idx+2];
+                        resized_pixels[dst_idx+3] = pixels[src_idx+3];
+                    }
+                }
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, resized_pixels.data());
+            } else {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+            }
+            stbi_image_free(pixels);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            g_material_thumb_cache[material_idx] = tex;
+            return tex;
+        }
+        if (pixels) stbi_image_free(pixels);
+        // Fall through to solid color if texture failed to load
+    }
+
+    // Fall back to solid color preview based on base_color
+    std::vector<unsigned char> pixels(MATERIAL_THUMB_SIZE * MATERIAL_THUMB_SIZE * 4);
+    unsigned char r = (unsigned char)(std::min(1.0, base.x()) * 255.0);
+    unsigned char g = (unsigned char)(std::min(1.0, base.y()) * 255.0);
+    unsigned char b = (unsigned char)(std::min(1.0, base.z()) * 255.0);
+    for (int i = 0; i < MATERIAL_THUMB_SIZE * MATERIAL_THUMB_SIZE; ++i) {
+        pixels[i*4+0] = r;
+        pixels[i*4+1] = g;
+        pixels[i*4+2] = b;
+        pixels[i*4+3] = 255;
+    }
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    g_material_thumb_cache[material_idx] = tex;
+    return tex;
+}
 
 // Update camera's MNEE sphere parameters by scanning the current scene for
 // the first dielectric sphere. Approximates world-space center and radius.
@@ -2167,6 +2395,8 @@ static void init_engine_once()
         return;
 
     build_default_scene(g_scene);
+    // Load persisted mesh default material assignments (if present)
+    LoadMeshMaterialDefaults();
 
     // Editor camera pose
     g_editor_cam.vfov = 40.0f;
@@ -2177,8 +2407,8 @@ static void init_engine_once()
     g_camera.aspect_ratio      = 16.0 / 9.0;
     g_camera.image_width       = 800;
     g_camera.image_height      = 450;
-    g_camera.samples_per_pixel = 20;
-    g_camera.max_depth         = 20;
+    g_camera.samples_per_pixel = 4;  // Low default for interactive preview
+    g_camera.max_depth         = 8;   // Reduced from 20 for faster renders
     g_camera.background        = colour(0.0, 0.0, 0.0);
     to_shirley_camera(g_editor_cam, g_camera);
 
@@ -3663,11 +3893,26 @@ int main()
                 ImVec2 p1 = ImGui::GetItemRectMax();
 
                 bool cell_hovered = ImGui::IsItemHovered();
+                bool cell_clicked = cell_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
                 bool cell_double_clicked = cell_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+                
+                // Highlight if selected
+                if (g_selected_mesh_asset == m) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImU32 col = ImGui::GetColorU32(ImGuiCol_Header);
+                    dl->AddRectFilled(p0, p1, col, 4.0f);
+                }
+                
                 if (cell_hovered) {
                     ImDrawList* dl = ImGui::GetWindowDrawList();
                     ImU32 col = ImGui::GetColorU32(ImGuiCol_HeaderHovered);
-                    dl->AddRect(p0, p1, col, 4.0f);
+                    dl->AddRect(p0, p1, col, 4.0f, 0, 2.0f);
+                }
+                
+                // Single-click to select for Inspector
+                if (cell_clicked && !cell_double_clicked) {
+                    g_selected_mesh_asset = m;
+                    g_selected_object = -1; // Deselect scene objects
                 }
                 // Drag from whole cell
                 if (ImGui::BeginDragDropSource()) {
@@ -3769,6 +4014,151 @@ int main()
             } else if (matched == 0 && !assets_query.empty()) {
                 ImGui::TextDisabled("No matching models.");
             }
+            if (col != 0) ImGui::NewLine();
+            
+            // Click in empty space to deselect
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsAnyItemHovered()) {
+                g_selected_mesh_asset = -1;
+            }
+        }
+
+        // Materials tab
+        if (ImGui::CollapsingHeader("Materials", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const float cellPad = 18.0f;
+            const ImVec2 thumbSize(80, 80);
+            const float labelH = ImGui::GetTextLineHeightWithSpacing();
+            const float cellW = thumbSize.x + cellPad * 2;
+            const float cellH = thumbSize.y + labelH + cellPad * 2 + 4.0f;
+            float avail = ImGui::GetContentRegionAvail().x;
+            int cols = (int)std::max(1.0f, std::floor((avail + ImGui::GetStyle().ItemSpacing.x) / (cellW + ImGui::GetStyle().ItemSpacing.x)));
+            int col = 0;
+
+            // Right-click context menu for creating new materials
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !ImGui::IsAnyItemHovered()) {
+                ImGui::OpenPopup("MaterialsContextMenu");
+            }
+            if (ImGui::BeginPopup("MaterialsContextMenu")) {
+                if (ImGui::MenuItem("Create Material")) {
+                    scene_material new_mat;
+                    new_mat.name = "New Material";
+                    new_mat.model = scene_material_model::pbr;
+                    new_mat.base_color = colour(0.8, 0.8, 0.8);
+                    new_mat.metallic = 0.0;
+                    new_mat.roughness = 0.5;
+                    new_mat.ior = 1.5;
+                    new_mat.emission = colour(0, 0, 0);
+                    new_mat.albedo_tex = -1;
+                    new_mat.metallic_tex = -1;
+                    new_mat.roughness_tex = -1;
+                    new_mat.normal_tex = -1;
+                    new_mat.alpha_tex = -1;
+                    
+                    g_scene.materials.push_back(new_mat);
+                    int new_idx = (int)g_scene.materials.size() - 1;
+                    g_selected_material = new_idx;
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                    
+                    // Undo support
+                    UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                        [new_idx]() {
+                            if (new_idx >= 0 && new_idx < (int)g_scene.materials.size()) {
+                                g_scene.materials.erase(g_scene.materials.begin() + new_idx);
+                                if (g_selected_material == new_idx) g_selected_material = -1;
+                                g_world_dirty = true; g_cached_world.reset();
+                            }
+                        },
+                        [new_idx, new_mat]() {
+                            if (new_idx < 0) return;
+                            int insert_at = new_idx;
+                            if (insert_at > (int)g_scene.materials.size()) insert_at = (int)g_scene.materials.size();
+                            g_scene.materials.insert(g_scene.materials.begin() + insert_at, new_mat);
+                            g_selected_material = insert_at;
+                            g_world_dirty = true; g_cached_world.reset();
+                        },
+                        "Create Material"
+                    ));
+                    
+                    std::printf("Created new material '%s'\n", new_mat.name.c_str());
+                }
+                ImGui::EndPopup();
+            }
+
+            int matched = 0;
+            for (int mat_idx = 0; mat_idx < (int)g_scene.materials.size(); ++mat_idx) {
+                auto& mat = g_scene.materials[mat_idx];
+                if (!matches_query(mat.name)) continue;
+
+                GLuint thumb = GetOrCreateMaterialThumbnail(mat_idx);
+
+                ImGui::BeginGroup();
+                std::string cell_id = std::string("mat_cell_") + std::to_string(mat_idx);
+                ImGui::InvisibleButton(cell_id.c_str(), ImVec2(cellW, cellH));
+                ImVec2 p0 = ImGui::GetItemRectMin();
+                ImVec2 p1 = ImGui::GetItemRectMax();
+
+                bool cell_hovered = ImGui::IsItemHovered();
+                bool cell_clicked = cell_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+                
+                // Highlight if selected
+                if (g_selected_material == mat_idx) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImU32 col = ImGui::GetColorU32(ImGuiCol_Header);
+                    dl->AddRectFilled(p0, p1, col, 4.0f);
+                }
+                
+                if (cell_hovered) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImU32 col = ImGui::GetColorU32(ImGuiCol_HeaderHovered);
+                    dl->AddRect(p0, p1, col, 4.0f, 0, 2.0f);
+                }
+                
+                // Click to select for editing
+                if (cell_clicked) {
+                    g_selected_material = mat_idx;
+                }
+                
+                // Drag-and-drop source
+                if (ImGui::BeginDragDropSource()) {
+                    ImGui::SetDragDropPayload("MATERIAL_ASSET_ID", &mat_idx, sizeof(int));
+                    ImGui::Text("Material: %s", mat.name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+
+                // Center image horizontally in the cell
+                float imgX = p0.x + (cellW - thumbSize.x) * 0.5f;
+                ImGui::SetCursorScreenPos(ImVec2(imgX, p0.y + cellPad));
+                if (thumb) {
+                    ImGui::Image((ImTextureID)(intptr_t)thumb, thumbSize, ImVec2(0,1), ImVec2(1,0));
+                } else {
+                    ImGui::Dummy(thumbSize);
+                }
+                
+                // Center label beneath the image
+                const char* label = mat.name.c_str();
+                ImVec2 textSize = ImGui::CalcTextSize(label);
+                float textX = p0.x + (cellW - textSize.x) * 0.5f;
+                ImGui::SetCursorScreenPos(ImVec2(textX, p0.y + cellPad + thumbSize.y + 4));
+                ImGui::TextUnformatted(label);
+
+                ImGui::EndGroup();
+
+                // Next cell placement
+                col++;
+                if (col < cols) {
+                    ImGui::SameLine();
+                } else {
+                    col = 0;
+                }
+                matched++;
+            }
+            
+            if (g_scene.materials.empty()) {
+                ImGui::TextDisabled("No materials created yet. Right-click to create one.");
+            } else if (matched == 0 && !assets_query.empty()) {
+                ImGui::TextDisabled("No matching materials.");
+            }
+            if (col != 0) ImGui::NewLine();
         }
 
         // Accept OS file-drops preferentially when hovering this window
@@ -3957,7 +4347,10 @@ int main()
                     ImGui::Text("MNEE Sphere: C=(%.3f, %.3f, %.3f) R=%.3f IOR=%.3f",
                         g_camera.mnee_sphere_center.x(), g_camera.mnee_sphere_center.y(), g_camera.mnee_sphere_center.z(),
                         g_camera.mnee_sphere_radius, g_camera.mnee_sphere_ior);
-                    ImGui::SliderInt("MNEE Budget/thread", &g_camera.mnee_per_thread_budget, 64, 8192);
+                    ImGui::SliderInt("MNEE Budget/thread", &g_camera.mnee_per_thread_budget, 1, 256);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Point light caustics budget. 1-16 = fast preview, 64-256 = final quality.\nWARNING: High values cause EXTREME slowdown!");
+                    }
                     ImGui::SliderInt("MNEE Sun samples", &g_camera.mnee_sun_samples, 1, 32);
                     {
                         float gain = (float)g_camera.mnee_gain_scale;
@@ -4025,6 +4418,59 @@ int main()
             g_camera.max_depth = max_depth;
         }
 
+        // Quality presets
+        ImGui::Separator();
+        ImGui::Text("Quality Presets:");
+        if (ImGui::Button("Fast Preview")) {
+            g_camera.samples_per_pixel = 4;
+            g_camera.max_depth = 6;
+            g_camera.mnee_per_thread_budget = 8;
+            g_camera.direct_light_samples = 1;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("SPP=4, Depth=6, MNEE=8 - fast interactive preview");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Medium Quality")) {
+            g_camera.samples_per_pixel = 32;
+            g_camera.max_depth = 12;
+            g_camera.mnee_per_thread_budget = 32;
+            g_camera.direct_light_samples = 2;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("SPP=32, Depth=12, MNEE=32 - balanced quality/speed");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Final Quality")) {
+            g_camera.samples_per_pixel = 256;
+            g_camera.max_depth = 20;
+            g_camera.mnee_per_thread_budget = 128;
+            g_camera.direct_light_samples = 4;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("SPP=256, Depth=20, MNEE=128 - production quality");
+        }
+        ImGui::Separator();
+
+        // NEE + MIS settings for diffuse materials (reduces noise)
+        ImGui::Separator();
+        ImGui::Text("Direct Lighting (NEE + MIS)");
+        {
+            bool mis = g_camera.enable_mis;
+            if (ImGui::Checkbox("Enable MIS for diffuse", &mis)) {
+                g_camera.enable_mis = mis;
+            }
+            ImGui::TextDisabled("Multiple Importance Sampling reduces noise\nby combining BSDF and light sampling.");
+            
+            int dls = g_camera.direct_light_samples;
+            if (ImGui::DragInt("Direct light samples", &dls, 1, 1, 8)) {
+                if (dls < 1) dls = 1;
+                g_camera.direct_light_samples = dls;
+            }
+            ImGui::TextDisabled("Samples per diffuse hit (1-4 recommended).\nHigher = less noise, slower render.");
+        }
+
+        ImGui::Separator();
         // Exposure control (linear multiplier applied in renderer)
         {
             float exp_f = (float)g_renderer.exposure;
@@ -4124,7 +4570,110 @@ int main()
         ImGui::Separator();
         ImGui::Text("Selection");
 
-        if (g_selected_object >= 0 &&
+        // Show mesh asset inspector if a mesh asset is selected
+        if (g_selected_mesh_asset >= 0 && g_selected_mesh_asset < (int)g_scene.meshes.size()) {
+            auto& mesh = g_scene.meshes[g_selected_mesh_asset];
+            ImGui::Text("Mesh Asset: %s", mesh.name.c_str());
+            ImGui::Separator();
+            
+            ImGui::TextWrapped("Configure default materials for this mesh. New instances will spawn with these materials.");
+            ImGui::Spacing();
+            
+            ImGui::Text("Default Material Slots:");
+            ImGui::Spacing();
+            
+            for (int slot = 0; slot < (int)mesh.slot_default_materials.size(); ++slot) {
+                ImGui::PushID(slot);
+                ImGui::Text("Slot %d:", slot);
+                ImGui::SameLine();
+                
+                int& mat_idx = mesh.slot_default_materials[slot];
+                std::string preview = (mat_idx >= 0 && mat_idx < (int)g_scene.materials.size()) 
+                    ? g_scene.materials[mat_idx].name 
+                    : "(none)";
+                
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::BeginCombo("##slot_mat", preview.c_str())) {
+                        if (ImGui::Selectable("(none)", mat_idx == -1)) {
+                            int old_idx = mat_idx;
+                            mat_idx = -1;
+                            g_world_dirty = true;
+                            g_cached_world.reset();
+                            g_material_thumb_cache.erase(old_idx);
+                            SaveMeshMaterialDefaults();
+                        }
+                    for (int i = 0; i < (int)g_scene.materials.size(); ++i) {
+                        bool is_selected = (i == mat_idx);
+                        if (ImGui::Selectable(g_scene.materials[i].name.c_str(), is_selected)) {
+                            int old_idx = mat_idx;
+                            mat_idx = i;
+                            g_world_dirty = true;
+                            g_cached_world.reset();
+                            g_material_thumb_cache.erase(old_idx);
+                            g_material_thumb_cache.erase(i);
+                            SaveMeshMaterialDefaults();
+                        }
+                        if (is_selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                
+                // Drag-drop target for materials
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("MATERIAL_ASSET_ID")) {
+                        int dropped_mat = *(const int*)payload->Data;
+                        if (dropped_mat >= 0 && dropped_mat < (int)g_scene.materials.size()) {
+                            int old_idx = mat_idx;
+                            int mesh_idx = g_selected_mesh_asset;
+                            
+                            // Undo support
+                            UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                                [mesh_idx, slot, old_idx]() {
+                                    if (mesh_idx >= 0 && mesh_idx < (int)g_scene.meshes.size()) {
+                                        auto& m = g_scene.meshes[mesh_idx];
+                                        if (slot < (int)m.slot_default_materials.size()) {
+                                            m.slot_default_materials[slot] = old_idx;
+                                            g_world_dirty = true;
+                                            g_cached_world.reset();
+                                            g_material_thumb_cache.erase(old_idx);
+                                            SaveMeshMaterialDefaults();
+                                        }
+                                    }
+                                },
+                                [mesh_idx, slot, dropped_mat]() {
+                                    if (mesh_idx >= 0 && mesh_idx < (int)g_scene.meshes.size()) {
+                                        auto& m = g_scene.meshes[mesh_idx];
+                                        if (slot < (int)m.slot_default_materials.size()) {
+                                            m.slot_default_materials[slot] = dropped_mat;
+                                            g_world_dirty = true;
+                                            g_cached_world.reset();
+                                            g_material_thumb_cache.erase(dropped_mat);
+                                            SaveMeshMaterialDefaults();
+                                        }
+                                    }
+                                },
+                                "Assign Mesh Default Material"
+                            ));
+                            
+                            mat_idx = dropped_mat;
+                            g_world_dirty = true;
+                            g_cached_world.reset();
+                            g_material_thumb_cache.erase(old_idx);
+                            g_material_thumb_cache.erase(dropped_mat);
+                            SaveMeshMaterialDefaults();
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+                
+                ImGui::PopID();
+            }
+            
+            if (ImGui::Button("Deselect Mesh")) {
+                g_selected_mesh_asset = -1;
+            }
+        }
+        else if (g_selected_object >= 0 &&
             g_selected_object < (int)g_scene.objects.size())
         {
             auto& obj = g_scene.objects[g_selected_object];
@@ -4735,6 +5284,43 @@ int main()
 
                         ImGui::EndCombo();
                     }
+                    
+                    // Drag-and-drop target for materials from asset viewer
+                    if (ImGui::BeginDragDropTarget()) {
+                        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("MATERIAL_ASSET_ID")) {
+                            int dropped_mat_idx = *(const int*)payload->Data;
+                            if (dropped_mat_idx >= 0 && dropped_mat_idx < (int)g_scene.materials.size()) {
+                                int old_mat_idx = mat_idx;
+                                mat_idx = dropped_mat_idx;
+                                
+                                // Undo support
+                                size_t slot_copy = s;
+                                int obj_idx = g_selected_object;
+                                UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                                    [obj_idx, slot_copy, old_mat_idx]() {
+                                        if (obj_idx >= 0 && obj_idx < (int)g_scene.objects.size()) {
+                                            auto& o = g_scene.objects[obj_idx];
+                                            if (slot_copy < o.mesh_slot_materials.size()) {
+                                                o.mesh_slot_materials[slot_copy] = old_mat_idx;
+                                                g_world_dirty = true; g_cached_world.reset();
+                                            }
+                                        }
+                                    },
+                                    [obj_idx, slot_copy, dropped_mat_idx]() {
+                                        if (obj_idx >= 0 && obj_idx < (int)g_scene.objects.size()) {
+                                            auto& o = g_scene.objects[obj_idx];
+                                            if (slot_copy < o.mesh_slot_materials.size()) {
+                                                o.mesh_slot_materials[slot_copy] = dropped_mat_idx;
+                                                g_world_dirty = true; g_cached_world.reset();
+                                            }
+                                        }
+                                    },
+                                    "Assign Material to Slot"
+                                ));
+                            }
+                        }
+                        ImGui::EndDragDropTarget();
+                    }
 
                     if (s < obj.mesh_slot_materials.size()) {
                         if (obj.mesh_slot_materials[s] != mat_idx) {
@@ -4831,6 +5417,79 @@ int main()
         }
 
         ImGui::End();
+
+        // ---------------------------------------------------------------------
+        // Material Editor (for materials selected in Assets window)
+        // ---------------------------------------------------------------------
+        if (g_selected_material >= 0 && g_selected_material < (int)g_scene.materials.size()) {
+            ImGui::Begin("Material Editor");
+            auto& mat = g_scene.materials[g_selected_material];
+            
+            ImGui::Text("Editing Material: %s", mat.name.c_str());
+            ImGui::Separator();
+            
+            // Show material name editor with deselect button
+            ImGui::PushItemWidth(-80);
+            char name_buf[256];
+            strncpy(name_buf, mat.name.c_str(), sizeof(name_buf) - 1);
+            name_buf[sizeof(name_buf) - 1] = '\0';
+            if (ImGui::InputText("##mat_name", name_buf, sizeof(name_buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+                mat.name = name_buf;
+                g_world_dirty = true;
+                g_cached_world.reset();
+            }
+            ImGui::PopItemWidth();
+            ImGui::SameLine();
+            if (ImGui::Button("Deselect")) {
+                g_selected_material = -1;
+            }
+            
+            ImGui::Separator();
+            
+            // Draw full material inspector
+            DrawMaterialInspector(mat, g_scene, g_selected_material);
+            
+            ImGui::Separator();
+            
+            // Button to delete this material
+            if (ImGui::Button("Delete Material")) {
+                int del_idx = g_selected_material;
+                scene_material snapshot = mat;
+                
+                UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                    [del_idx]() {
+                        if (del_idx >= 0 && del_idx < (int)g_scene.materials.size()) {
+                            g_scene.materials.erase(g_scene.materials.begin() + del_idx);
+                            if (g_selected_material == del_idx) g_selected_material = -1;
+                            g_world_dirty = true; g_cached_world.reset();
+                        }
+                    },
+                    [del_idx, snapshot]() {
+                        if (del_idx < 0) return;
+                        int insert_at = del_idx;
+                        if (insert_at > (int)g_scene.materials.size()) insert_at = (int)g_scene.materials.size();
+                        g_scene.materials.insert(g_scene.materials.begin() + insert_at, snapshot);
+                        g_selected_material = insert_at;
+                        g_world_dirty = true; g_cached_world.reset();
+                    },
+                    "Delete Material"
+                ));
+                
+                g_scene.materials.erase(g_scene.materials.begin() + del_idx);
+                g_selected_material = -1;
+                g_world_dirty = true;
+                g_cached_world.reset();
+                
+                // Invalidate thumbnail cache for this material
+                if (g_material_thumb_cache.find(del_idx) != g_material_thumb_cache.end()) {
+                    GLuint tex = g_material_thumb_cache[del_idx];
+                    if (tex) glDeleteTextures(1, &tex);
+                    g_material_thumb_cache.erase(del_idx);
+                }
+            }
+            
+            ImGui::End();
+        }
 
         // ---------------------------------------------------------------------
         // Debug Camera
