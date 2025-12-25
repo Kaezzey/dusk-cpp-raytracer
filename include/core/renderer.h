@@ -36,9 +36,11 @@ public:
     // Exposure (stops-like linear multiplier); editable from the editor UI
     double exposure = 1.0;
     // Denoiser flags (controlled from editor)
-    bool use_denoiser = false;
+    bool use_denoiser = true;
     // 0.0 = off (stronger = smoother, typical 0.2-0.5), interpreted by OIDN when enabled
-    double denoiser_strength = 0.0;
+    double denoiser_strength = 0.1;
+    // Progressive denoising: apply OIDN to partial results during render (like Cycles)
+    bool progressive_denoise = true;
 
     // Photon mapping removed: no-op (was used for caustic photon pre-pass)
 

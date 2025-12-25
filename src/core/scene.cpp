@@ -4,6 +4,7 @@
 
 #include "../../include/core/dusktracer.h"          // colour, texture, materials, point3, etc.
 #include "../../include/core/scene.h"
+#include "../../include/core/camera.h"              // for camera::emissive_surface
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/sphere.h"
 #include "../../include/core/materials/material.h"
@@ -408,3 +409,86 @@ hittable_list build_world_from_scene(const scene& scn)
     hittable_list wrapped(top_bvh);
     return wrapped;
 }
+
+// ------------------------------------------------------------
+// Collect emissive surfaces from the scene
+// ------------------------------------------------------------
+void build_emissive_surfaces(const scene& scn, camera& cam)
+{
+    std::vector<camera::emissive_surface> surfaces;
+
+    for (const auto& obj : scn.objects) {
+        int mat_idx = obj.material_index;
+        if (mat_idx < 0 || mat_idx >= (int)scn.materials.size())
+            continue;
+
+        const auto& mat = scn.materials[mat_idx];
+        if (mat.model != scene_material_model::diffuse_light)
+            continue;
+
+        // Compute emission (use emission field or base_color as fallback)
+        vec3 base_emit = (mat.emission.x() != 0.0 ||
+                          mat.emission.y() != 0.0 ||
+                          mat.emission.z() != 0.0)
+                         ? mat.emission
+                         : mat.base_color;
+
+        vec3 emit_col = base_emit * (float)mat.emission_intensity;
+        colour emission(emit_col.x(), emit_col.y(), emit_col.z());
+
+        // Skip if emission is essentially zero
+        double lum = 0.2126 * emission.x() + 0.7152 * emission.y() + 0.0722 * emission.z();
+        if (lum < 1e-6) continue;
+
+        // Collect geometry data based on object type
+        if (obj.type == scene_object_type::sphere) {
+            // Sphere: use center + transformed radius for area
+            double s = obj.scale.x();
+            if (s <= 0.0) s = 1.0;
+            double radius = obj.radius * s;
+            double area = 4.0 * pi * radius * radius;
+
+            vec3 translation = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+            point3 center = point3(translation.x(), translation.y(), translation.z());
+            
+            // For sphere, normal points outward from center (we'll use average normal = up)
+            vec3 normal(0, 1, 0);
+
+            camera::emissive_surface surf;
+            surf.position = center;
+            surf.normal = normal;
+            surf.area = area;
+            surf.emission = emission;
+            surfaces.push_back(surf);
+        }
+        else if (obj.type == scene_object_type::cube) {
+            // Cube: 6 faces, each face has area = side^2
+            vec3 scl = obj.scale;
+            if (scl.x() <= 0.0) scl = vec3(1.0, scl.y(), scl.z());
+            if (scl.y() <= 0.0) scl = vec3(scl.x(), 1.0, scl.z());
+            if (scl.z() <= 0.0) scl = vec3(scl.x(), scl.y(), 1.0);
+
+            double side_x = scl.x();
+            double side_y = scl.y();
+            double side_z = scl.z();
+
+            // Total surface area = 2*(xy + yz + xz)
+            double total_area = 2.0 * (side_x * side_y + side_y * side_z + side_x * side_z);
+
+            vec3 translation = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
+            point3 center = point3(translation.x(), translation.y(), translation.z());
+            vec3 normal(0, 1, 0); // approximate
+
+            camera::emissive_surface surf;
+            surf.position = center;
+            surf.normal = normal;
+            surf.area = total_area;
+            surf.emission = emission;
+            surfaces.push_back(surf);
+        }
+        // TODO: mesh instances with emissive materials (requires triangle extraction)
+    }
+
+    cam.set_emissive_surfaces(surfaces);
+}
+

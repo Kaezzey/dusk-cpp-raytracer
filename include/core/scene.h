@@ -192,4 +192,10 @@ struct scene {
 // Convert editor scene into runtime hittables for the renderer.
 hittable_list build_world_from_scene(const scene& scn);
 
+// Forward-declare camera to access emissive_surface type
+class camera;
+
+// Collect emissive surfaces from the scene and populate camera's emissive light database
+void build_emissive_surfaces(const scene& scn, camera& cam);
+
 #endif // DUSK_SCENE_H

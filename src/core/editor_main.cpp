@@ -107,6 +107,7 @@ static float g_camera_look_sens  = 0.002f;  // radians per pixel
 // Currently selected object in the Scene Hierarchy (-1 = none)
 static int g_selected_object = -1;
 static int g_selected_material = -1; // Selected material in the asset viewer for editing
+static bool g_materials_dirty = false;
 static int g_selected_mesh_asset = -1; // Selected mesh asset in the asset viewer for editing
 
 // Files dropped this frame
@@ -340,6 +341,9 @@ static void InitMaterialPreviewFBO() {
 
 // Persist mesh -> default material slot assignments between launches.
 static const char* kMeshMatDefaultsFile = "mesh_material_defaults.txt";
+static const char* kAssetsManifestFile = "assets_manifest.txt";
+static void SaveAssetsManifest();
+static void LoadAssetsManifest();
 
 static void SaveMeshMaterialDefaults()
 {
@@ -459,6 +463,16 @@ static GLuint GetOrCreateMaterialThumbnail(int material_idx) {
 
     g_material_thumb_cache[material_idx] = tex;
     return tex;
+}
+
+// Invalidate (delete) a cached material thumbnail so it will be regenerated
+static void InvalidateMaterialThumbnail(int material_idx)
+{
+    auto it = g_material_thumb_cache.find(material_idx);
+    if (it == g_material_thumb_cache.end()) return;
+    GLuint tex = it->second;
+    if (tex) glDeleteTextures(1, &tex);
+    g_material_thumb_cache.erase(it);
 }
 
 // Update camera's MNEE sphere parameters by scanning the current scene for
@@ -1022,11 +1036,13 @@ static void build_default_scene(scene& scn)
     scn.materials.push_back({});
     scn.materials.back().name = "Material 6";
     scn.materials.back().model = scene_material_model::diffuse_light;
-    scn.materials.back().base_color = colour(3.92157, 3.92157, 3.92157);
+    scn.materials.back().base_color = colour(1, 1, 1);
     scn.materials.back().metallic = 0;
     scn.materials.back().roughness = 0.5;
     scn.materials.back().ior = 1.5;
-    scn.materials.back().emission = vec3(13.7255, 13.7255, 13.7255);
+    // Emission color and strength for Cube 3 (Material 6)
+    scn.materials.back().emission = vec3(1, 1, 1);
+    scn.materials.back().emission_intensity = 45.0;
 
     scn.materials.push_back({});
     scn.materials.back().name = "Material 7";
@@ -1952,6 +1968,156 @@ static bool try_load_assimp_mesh(const std::string& full_path,
     return true;
 }
 
+// Persist imported textures and meshes between launches.
+static void SaveAssetsManifest()
+{
+    std::ofstream out(kAssetsManifestFile);
+    if (!out) return;
+    // Textures
+    for (const auto &tex : g_scene.textures) {
+        out << "T|" << tex.name << "|" << tex.path << "\n";
+    }
+    // Meshes
+    for (const auto &mesh : g_scene.meshes) {
+        out << "M|" << mesh.name << "|" << mesh.file_path << "|" << mesh.approx_radius << "\n";
+    }
+}
+
+static void LoadAssetsManifest()
+{
+    std::ifstream in(kAssetsManifestFile);
+    if (!in) return;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line.size() < 2 || line[1] != '|') continue;
+        char type = line[0];
+        std::string rest = line.substr(2);
+        if (type == 'T') {
+            size_t sep = rest.find('|');
+            if (sep == std::string::npos) continue;
+            std::string name = rest.substr(0, sep);
+            std::string path = rest.substr(sep + 1);
+            // Avoid duplicates
+            bool found = false;
+            for (const auto &t : g_scene.textures) if (t.path == path) { found = true; break; }
+            if (found) continue;
+            if (!std::filesystem::exists(path)) continue;
+            scene_texture tex; tex.name = name; tex.path = path;
+            g_scene.textures.push_back(std::move(tex));
+        } else if (type == 'M') {
+            // M|name|path|approx_radius
+            std::stringstream ss(rest);
+            std::string name, path, approx_s;
+            if (!std::getline(ss, name, '|')) continue;
+            if (!std::getline(ss, path, '|')) continue;
+            if (!std::getline(ss, approx_s, '|')) approx_s = "1.0";
+            // Avoid duplicates
+            bool found = false;
+            for (const auto &m : g_scene.meshes) if (m.file_path == path) { found = true; break; }
+            if (found) continue;
+            if (!std::filesystem::exists(path)) continue;
+            // Attempt to load mesh via Assimp loader
+            gpu_mesh gm{}; float approx_r = 1.0f; std::vector<std::string> slot_names;
+            if (try_load_assimp_mesh(path, gm, approx_r, slot_names)) {
+                scene_mesh_asset asset;
+                asset.name = name;
+                asset.file_path = path;
+                asset.approx_radius = approx_r;
+                asset.mesh_bvh = nullptr;
+                asset.slot_names = slot_names;
+                asset.slot_default_materials.assign(asset.slot_names.size(), -1);
+
+                int mesh_index = (int)g_scene.meshes.size();
+                g_scene.meshes.push_back(std::move(asset));
+                if ((int)g_gpu_meshes.size() < mesh_index + 1) g_gpu_meshes.resize(mesh_index + 1);
+                g_gpu_meshes[mesh_index] = gm;
+            }
+        }
+    }
+}
+
+// Persist editor materials between launches.
+static void SaveMaterialsManifest()
+{
+    const char* fname = "materials.txt";
+    std::ofstream out(fname);
+    if (!out) return;
+    for (const auto &m : g_scene.materials) {
+        // Serialize as: name|model|base_r,base_g,base_b|metallic|roughness|fuzz|ior|em_r,em_g,em_b|sss_strength|sss_scale|sss_model|sss_samples|sss_radius|sss_eta|sss_color_override_enabled|sss_cr,sss_cg,sss_cb|emission_intensity|dielectricF0_r,dielectricF0_g,dielectricF0_b|normal_strength|albedo_tex|metallic_tex|roughness_tex|normal_tex|alpha_tex|alpha_double_sided|alpha_cutoff
+        out << m.name << "|" << (int)m.model << "|";
+        out << m.base_color.x() << "," << m.base_color.y() << "," << m.base_color.z() << "|";
+        out << m.metallic << "|" << m.roughness << "|" << m.fuzz << "|" << m.ior << "|";
+        out << m.emission.x() << "," << m.emission.y() << "," << m.emission.z() << "|";
+        out << m.sss_strength << "|" << m.sss_scale << "|" << m.sss_model << "|" << m.sss_samples << "|" << m.sss_radius << "|" << m.sss_eta << "|";
+        out << (m.sss_color_override_enabled ? 1 : 0) << "|";
+        out << m.sss_color_override_color.x() << "," << m.sss_color_override_color.y() << "," << m.sss_color_override_color.z() << "|";
+        out << m.emission_intensity << "|";
+        out << m.dielectric_F0.x() << "," << m.dielectric_F0.y() << "," << m.dielectric_F0.z() << "|";
+        out << m.normal_strength << "|";
+        out << m.albedo_tex << "|" << m.metallic_tex << "|" << m.roughness_tex << "|" << m.normal_tex << "|" << m.alpha_tex << "|" << (m.alpha_double_sided?1:0) << "|" << m.alpha_cutoff << "\n";
+    }
+}
+
+static void LoadMaterialsManifest()
+{
+    const char* fname = "materials.txt";
+    std::ifstream in(fname);
+    if (!in) return;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::vector<std::string> toks;
+        std::stringstream ss(line);
+        std::string tok;
+        while (std::getline(ss, tok, '|')) toks.push_back(tok);
+        if (toks.size() < 3) continue;
+        scene_material m;
+        m.name = toks[0];
+        try {
+            int model_i = std::stoi(toks[1]);
+            m.model = (scene_material_model)model_i;
+        } catch(...) { m.model = scene_material_model::pbr; }
+        // base color
+        try {
+            std::stringstream sb(toks[2]); double r,g,b; char c;
+            sb >> r >> c >> g >> c >> b; m.base_color = vec3(r,g,b);
+        } catch(...) {}
+        size_t idx = 3;
+        if (idx < toks.size()) m.metallic = std::stod(toks[idx++]);
+        if (idx < toks.size()) m.roughness = std::stod(toks[idx++]);
+        if (idx < toks.size()) m.fuzz = std::stod(toks[idx++]);
+        if (idx < toks.size()) m.ior = std::stod(toks[idx++]);
+        if (idx < toks.size()) {
+            try { std::stringstream se(toks[idx++]); double er,eg,eb; char c; se >> er >> c >> eg >> c >> eb; m.emission = vec3(er,eg,eb); } catch(...) {}
+        }
+        if (idx < toks.size()) m.sss_strength = std::stod(toks[idx++]);
+        if (idx < toks.size()) m.sss_scale = std::stod(toks[idx++]);
+        if (idx < toks.size()) m.sss_model = std::stoi(toks[idx++]);
+        if (idx < toks.size()) m.sss_samples = std::stoi(toks[idx++]);
+        if (idx < toks.size()) m.sss_radius = std::stod(toks[idx++]);
+        if (idx < toks.size()) m.sss_eta = std::stod(toks[idx++]);
+        if (idx < toks.size()) m.sss_color_override_enabled = (std::stoi(toks[idx++]) != 0);
+        if (idx < toks.size()) {
+            try { std::stringstream sc(toks[idx++]); double cr,cg,cb; char c; sc >> cr >> c >> cg >> c >> cb; m.sss_color_override_color = vec3(cr,cg,cb); } catch(...) {}
+        }
+        if (idx < toks.size()) m.emission_intensity = std::stod(toks[idx++]);
+        if (idx < toks.size()) {
+            try { std::stringstream sf(toks[idx++]); double fr,fg,fb; char c; sf >> fr >> c >> fg >> c >> fb; m.dielectric_F0 = vec3(fr,fg,fb); } catch(...) {}
+        }
+        if (idx < toks.size()) m.normal_strength = std::stod(toks[idx++]);
+        if (idx < toks.size()) m.albedo_tex = std::stoi(toks[idx++]);
+        if (idx < toks.size()) m.metallic_tex = std::stoi(toks[idx++]);
+        if (idx < toks.size()) m.roughness_tex = std::stoi(toks[idx++]);
+        if (idx < toks.size()) m.normal_tex = std::stoi(toks[idx++]);
+        if (idx < toks.size()) m.alpha_tex = std::stoi(toks[idx++]);
+        if (idx < toks.size()) m.alpha_double_sided = (std::stoi(toks[idx++]) != 0);
+        if (idx < toks.size()) m.alpha_cutoff = std::stod(toks[idx++]);
+
+        g_scene.materials.push_back(std::move(m));
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Raster FBO
 // -----------------------------------------------------------------------------
@@ -2397,6 +2563,8 @@ static void init_engine_once()
     build_default_scene(g_scene);
     // Load persisted mesh default material assignments (if present)
     LoadMeshMaterialDefaults();
+    // Load persisted imported assets (textures / meshes)
+    LoadAssetsManifest();
 
     // Editor camera pose
     g_editor_cam.vfov = 40.0f;
@@ -2405,15 +2573,16 @@ static void init_engine_once()
 
     // RT camera
     g_camera.aspect_ratio      = 16.0 / 9.0;
-    g_camera.image_width       = 800;
-    g_camera.image_height      = 450;
+    g_camera.image_width       = 1920;
+    g_camera.image_height      = 1080;
     g_camera.samples_per_pixel = 4;  // Low default for interactive preview
     g_camera.max_depth         = 8;   // Reduced from 20 for faster renders
     g_camera.background        = colour(0.0, 0.0, 0.0);
     to_shirley_camera(g_editor_cam, g_camera);
 
-    // Enable MNEE (specular caustics) by default and initialize its scene data
-    g_camera.enable_mnee = true;
+    // MNEE (specular caustics) will be auto-enabled when sun is present
+    g_camera.enable_mnee = false;
+    g_camera.enable_mis = false;  // Disable MIS / NEE (removed)
     UpdateMNEEFromScene();
 
     // Add a default sun to the scene and mirror into the preview camera (nice default lighting)
@@ -2426,8 +2595,9 @@ static void init_engine_once()
         sun.angular_radius_deg = 0.53; // approximate sun
         g_scene.lights.push_back(sun);
 
-        // Mirror into camera preview defaults
+        // Mirror into camera preview defaults and enable MNEE for sun caustics
         g_camera.use_sun = true;
+        g_camera.enable_mnee = true;
         g_camera.sun_dir = -sun.direction; // camera expects scene->sun
         g_camera.sun_radiance = colour(sun.radiance.x(), sun.radiance.y(), sun.radiance.z());
         g_camera.sun_angular_radius = sun.angular_radius_deg;
@@ -2572,9 +2742,11 @@ static void sync_camera_from_editor(float viewport_width, float viewport_height)
     // Mirror scene lights into the RT camera for preview rendering.
     g_camera.point_lights.clear();
     g_camera.use_sun = false;
+    g_camera.enable_mnee = false;  // Disable MNEE, re-enable if sun present
     for (const auto& L : g_scene.lights) {
         if (L.type == scene_light_type::directional) {
             g_camera.use_sun = true;
+            g_camera.enable_mnee = true;  // Auto-enable MNEE when sun is present
             // In UI 'Add Sun' we set sun_dir = -sl.direction, so mirror that here.
             g_camera.sun_dir = -L.direction;
             g_camera.sun_radiance = colour((float)L.radiance.x(), (float)L.radiance.y(), (float)L.radiance.z());
@@ -2879,6 +3051,8 @@ static void stop_progress_window_thread()
 
 static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index)
 {
+    // Snapshot original material so we can detect changes and invalidate thumbnails
+    scene_material orig = mat;
     // editable material name buffer (persist across frames keyed by material index)
     static std::unordered_map<int, std::string> s_mat_name_bufs;
     auto& name_buf = s_mat_name_bufs[mat_index];
@@ -3135,6 +3309,40 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         break;
     }
 
+    // Detect material edits by comparing important fields to the snapshot
+    bool material_changed = false;
+    if (orig.name != mat.name) material_changed = true;
+    if (orig.model != mat.model) material_changed = true;
+    if (fabs(orig.base_color.x() - mat.base_color.x()) > 1e-6) material_changed = true;
+    if (fabs(orig.base_color.y() - mat.base_color.y()) > 1e-6) material_changed = true;
+    if (fabs(orig.base_color.z() - mat.base_color.z()) > 1e-6) material_changed = true;
+    if (fabs(orig.emission.x() - mat.emission.x()) > 1e-6) material_changed = true;
+    if (fabs(orig.emission.y() - mat.emission.y()) > 1e-6) material_changed = true;
+    if (fabs(orig.emission.z() - mat.emission.z()) > 1e-6) material_changed = true;
+    if (fabs(orig.emission_intensity - mat.emission_intensity) > 1e-6) material_changed = true;
+    if (fabs(orig.metallic - mat.metallic) > 1e-6) material_changed = true;
+    if (fabs(orig.roughness - mat.roughness) > 1e-6) material_changed = true;
+    if (fabs(orig.normal_strength - mat.normal_strength) > 1e-6) material_changed = true;
+    if (fabs(orig.ior - mat.ior) > 1e-6) material_changed = true;
+    if (fabs(orig.dielectric_F0.x() - mat.dielectric_F0.x()) > 1e-6) material_changed = true;
+    if (fabs(orig.dielectric_F0.y() - mat.dielectric_F0.y()) > 1e-6) material_changed = true;
+    if (fabs(orig.dielectric_F0.z() - mat.dielectric_F0.z()) > 1e-6) material_changed = true;
+    if (orig.sss_model != mat.sss_model) material_changed = true;
+    if (orig.sss_samples != mat.sss_samples) material_changed = true;
+    if (fabs(orig.sss_strength - mat.sss_strength) > 1e-6) material_changed = true;
+    if (fabs(orig.sss_radius - mat.sss_radius) > 1e-6) material_changed = true;
+    if (orig.albedo_tex != mat.albedo_tex) material_changed = true;
+    if (orig.metallic_tex != mat.metallic_tex) material_changed = true;
+    if (orig.roughness_tex != mat.roughness_tex) material_changed = true;
+    if (orig.normal_tex != mat.normal_tex) material_changed = true;
+    if (orig.alpha_tex != mat.alpha_tex) material_changed = true;
+
+    if (material_changed) {
+        InvalidateMaterialThumbnail(mat_index);
+        g_materials_dirty = true;
+        g_world_dirty = true;
+    }
+
     ImGui::Separator();
     ImGui::TextDisabled("Edit transform/material/textures, then re-render.");
 }
@@ -3295,6 +3503,8 @@ static void process_dropped_files()
     if (imported_any) {
         g_world_dirty = true;
         g_cached_world.reset();
+        // Persist imported assets for next launch
+        SaveAssetsManifest();
     }
 }
 
@@ -3392,6 +3602,13 @@ int main()
                 if (g_render_thread.joinable()) {
                     g_render_thread.join();
                 }
+                
+                // CRITICAL: Explicitly release the cached world after render completes
+                // to ensure Embree/BVH resources are freed before the next render starts.
+                // This prevents crashes when rebuilding the world with modified scenes.
+                g_cached_world.reset();
+                g_world_dirty = true;
+                
                 // Stop the separate progress window now that render finished
                 stop_progress_window_thread();
                 // clear any pending popup
@@ -4058,6 +4275,7 @@ int main()
                     g_selected_material = new_idx;
                     g_world_dirty = true;
                     g_cached_world.reset();
+                    g_materials_dirty = true;
                     
                     // Undo support
                     UndoManager::Instance().push(std::make_unique<LambdaAction>(
@@ -4202,8 +4420,9 @@ int main()
             sl.angular_radius_deg = 0.53; // approximate real sun radius in degrees
             g_scene.lights.push_back(sl);
 
-            // Mirror into camera preview defaults
+            // Mirror into camera preview defaults and enable MNEE
             g_camera.use_sun = true;
+            g_camera.enable_mnee = true;
             g_camera.sun_dir = -sl.direction;
             g_camera.sun_radiance = colour(sl.radiance.x(), sl.radiance.y(), sl.radiance.z());
             g_camera.sun_angular_radius = sl.angular_radius_deg;
@@ -4215,7 +4434,26 @@ int main()
 
         ImGui::SameLine();
         if (ImGui::Button("Remove Last Light") && !g_scene.lights.empty()) {
+            auto& removed_light = g_scene.lights.back();
+            bool was_sun = (removed_light.type == scene_light_type::directional);
             g_scene.lights.pop_back();
+            
+            // If we removed a sun, check if any other suns remain
+            if (was_sun) {
+                bool has_sun = false;
+                for (const auto& L : g_scene.lights) {
+                    if (L.type == scene_light_type::directional) {
+                        has_sun = true;
+                        break;
+                    }
+                }
+                // Disable MNEE if no sun remains
+                if (!has_sun) {
+                    g_camera.use_sun = false;
+                    g_camera.enable_mnee = false;
+                }
+            }
+            
             g_world_dirty = true;
             g_cached_world.reset();
         }
@@ -4287,8 +4525,9 @@ int main()
                         L.direction = -new_sun_dir; // store as light -> scene
                         g_world_dirty = true; g_cached_world.reset();
 
-                        // Mirror into camera sun parameters for preview and renderer
+                        // Mirror into camera sun parameters and ensure MNEE is enabled
                         g_camera.use_sun = true;
+                        g_camera.enable_mnee = true;
                         g_camera.sun_dir = new_sun_dir; // scene -> sun
                         g_camera.sun_radiance = colour(L.radiance.x(), L.radiance.y(), L.radiance.z());
                     }
@@ -4422,54 +4661,37 @@ int main()
         ImGui::Separator();
         ImGui::Text("Quality Presets:");
         if (ImGui::Button("Fast Preview")) {
-            g_camera.samples_per_pixel = 4;
-            g_camera.max_depth = 6;
-            g_camera.mnee_per_thread_budget = 8;
-            g_camera.direct_light_samples = 1;
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("SPP=4, Depth=6, MNEE=8 - fast interactive preview");
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Medium Quality")) {
-            g_camera.samples_per_pixel = 32;
-            g_camera.max_depth = 12;
+            g_camera.samples_per_pixel = 256;
+            g_camera.max_depth = 20;
             g_camera.mnee_per_thread_budget = 32;
             g_camera.direct_light_samples = 2;
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("SPP=32, Depth=12, MNEE=32 - balanced quality/speed");
+            ImGui::SetTooltip("SPP=256, Depth=20, MNEE=32 - preview settings");
         }
         ImGui::SameLine();
-        if (ImGui::Button("Final Quality")) {
-            g_camera.samples_per_pixel = 256;
-            g_camera.max_depth = 20;
-            g_camera.mnee_per_thread_budget = 128;
+        if (ImGui::Button("Medium Quality")) {
+            g_camera.samples_per_pixel = 512;
+            g_camera.max_depth = 35;
+            g_camera.mnee_per_thread_budget = 64;
             g_camera.direct_light_samples = 4;
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("SPP=256, Depth=20, MNEE=128 - production quality");
+            ImGui::SetTooltip("SPP=512, Depth=35, MNEE=64 - medium quality");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Final Quality")) {
+            g_camera.samples_per_pixel = 2048;
+            g_camera.max_depth = 50;
+            g_camera.mnee_per_thread_budget = 256;
+            g_camera.direct_light_samples = 6;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("SPP=2048, Depth=50, MNEE=256 - final production quality");
         }
         ImGui::Separator();
 
-        // NEE + MIS settings for diffuse materials (reduces noise)
-        ImGui::Separator();
-        ImGui::Text("Direct Lighting (NEE + MIS)");
-        {
-            bool mis = g_camera.enable_mis;
-            if (ImGui::Checkbox("Enable MIS for diffuse", &mis)) {
-                g_camera.enable_mis = mis;
-            }
-            ImGui::TextDisabled("Multiple Importance Sampling reduces noise\nby combining BSDF and light sampling.");
-            
-            int dls = g_camera.direct_light_samples;
-            if (ImGui::DragInt("Direct light samples", &dls, 1, 1, 8)) {
-                if (dls < 1) dls = 1;
-                g_camera.direct_light_samples = dls;
-            }
-            ImGui::TextDisabled("Samples per diffuse hit (1-4 recommended).\nHigher = less noise, slower render.");
-        }
-
+        // Direct lighting sampling (NEE/MIS) removed
         ImGui::Separator();
         // Exposure control (linear multiplier applied in renderer)
         {
@@ -4488,6 +4710,14 @@ int main()
                 g_renderer.use_denoiser = use_dn;
             }
 #ifdef HAVE_OIDN
+            bool prog_dn = g_renderer.progressive_denoise;
+            if (ImGui::Checkbox("Progressive Denoise (like Cycles)", &prog_dn)) {
+                g_renderer.progressive_denoise = prog_dn;
+            }
+            if (g_renderer.progressive_denoise) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(applies OIDN during render)");
+            }
             float ds = (float)g_renderer.denoiser_strength;
             if (ImGui::DragFloat("Denoiser Strength", &ds, 0.01f, 0.0f, 1.0f, "%.3f")) {
                 if (ds < 0.0f) ds = 0.0f;
@@ -4537,16 +4767,42 @@ int main()
         static int res_w = g_camera.image_width;
         static int res_h = g_camera.image_height;
 
+        // Common 16:9 presets + custom
+        static const char* res_names[] = {
+            "640 x 360",
+            "854 x 480",
+            "1280 x 720",
+            "1600 x 900",
+            "1920 x 1080",
+            "2560 x 1440",
+            "3840 x 2160",
+            "Custom"
+        };
+        static const int res_vals[][2] = {
+            {640,360}, {854,480}, {1280,720}, {1600,900}, {1920,1080}, {2560,1440}, {3840,2160}, {0,0}
+        };
+        // Default to 1920 x 1080 preset (index 4)
+        static int res_preset = 4;
+
+        if (ImGui::Combo("Resolution Preset", &res_preset, res_names, IM_ARRAYSIZE(res_names))) {
+            if (res_preset >= 0 && res_preset < (int)(IM_ARRAYSIZE(res_names) - 1)) {
+                res_w = res_vals[res_preset][0];
+                res_h = res_vals[res_preset][1];
+                // Apply immediately when user selects a preset
+                g_camera.image_width  = res_w;
+                g_camera.image_height = res_h;
+            }
+        }
+
         if (ImGui::InputInt("Width", &res_w)) {
             if (res_w < 16) res_w = 16;
+            res_preset = -1;
+            g_camera.image_width = res_w; // apply immediately for custom edits
         }
         if (ImGui::InputInt("Height", &res_h)) {
             if (res_h < 16) res_h = 16;
-        }
-
-        if (ImGui::Button("Apply Resolution")) {
-            g_camera.image_width  = res_w;
-            g_camera.image_height = res_h;
+            res_preset = -1;
+            g_camera.image_height = res_h; // apply immediately for custom edits
         }
         if (ImGui::Checkbox("Viewport matches Render Resolution", &s_viewport_match_render)) {
             // no immediate action; viewport will pick this up next frame
@@ -5435,8 +5691,9 @@ int main()
             name_buf[sizeof(name_buf) - 1] = '\0';
             if (ImGui::InputText("##mat_name", name_buf, sizeof(name_buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
                 mat.name = name_buf;
-                g_world_dirty = true;
-                g_cached_world.reset();
+                        g_world_dirty = true;
+                        g_cached_world.reset();
+                        g_materials_dirty = true;
             }
             ImGui::PopItemWidth();
             ImGui::SameLine();
@@ -5479,6 +5736,7 @@ int main()
                 g_selected_material = -1;
                 g_world_dirty = true;
                 g_cached_world.reset();
+                g_materials_dirty = true;
                 
                 // Invalidate thumbnail cache for this material
                 if (g_material_thumb_cache.find(del_idx) != g_material_thumb_cache.end()) {
@@ -5527,8 +5785,15 @@ int main()
         // Render button + progress bar
         if (!g_render_in_progress) {
             if (ImGui::Button("Render Current View")) {
-                // Sync RT camera from editor view
-                sync_camera_from_editor(vp_size.x, vp_size.y);
+                // Sync RT camera from editor view. If the user requested the
+                // viewport to match the configured render resolution, sync
+                // using the camera's image size so the ray tracer uses that
+                // resolution instead of the current ImGui viewport size.
+                if (s_viewport_match_render) {
+                    sync_camera_from_editor((float)g_camera.image_width, (float)g_camera.image_height);
+                } else {
+                    sync_camera_from_editor(vp_size.x, vp_size.y);
+                }
 
                 // Build world only if needed
                 if (!g_cached_world || g_world_dirty) {
@@ -5537,6 +5802,9 @@ int main()
                     );
                     g_cached_world = new_world;
                     g_world_dirty  = false;
+                    
+                    // Populate emissive surfaces for area-light sampling
+                    build_emissive_surfaces(g_scene, g_camera);
                 }
 
                 // Reset progress struct (renderer will set tile totals if used)
@@ -5559,24 +5827,36 @@ int main()
                 camera cam_copy = g_camera;
                 g_render_final_image_ready.store(false);
 
-                // Defensive: if the global thread object still holds a joinable thread
-                // (shouldn't normally happen while g_render_in_progress is true), join
-                // it here to avoid std::terminate from assigning a new std::thread to a
-                // joinable thread object.
-                if (g_render_thread.joinable()) {
-                    std::fprintf(stderr, "Warning: joining previous render thread before starting new one\n");
-                    try {
-                        g_render_thread.join();
-                    } catch (...) {
-                        std::fprintf(stderr, "Exception while joining previous render thread\n");
+                // Safety check: ensure world is valid before starting render
+                if (!world_copy) {
+                    std::fprintf(stderr, "ERROR: Cannot start render - world is null!\n");
+                    g_render_in_progress = false;
+                    g_cancel_flag.store(false);
+                    g_progress_popup_pending = false;
+                } else {
+                    // Defensive: join any previous thread before starting new one
+                    if (g_render_thread.joinable()) {
+                        std::fprintf(stderr, "Warning: joining previous render thread before starting new one\n");
+                        try {
+                            g_render_thread.join();
+                        } catch (...) {
+                            std::fprintf(stderr, "Exception while joining previous render thread\n");
+                        }
                     }
-                }
 
-                g_render_thread = std::thread([world_copy, cam_copy]() mutable {
+                    g_render_thread = std::thread([world_copy, cam_copy]() mutable {
                     try {
                         std::fprintf(stderr, "\n=== RENDER THREAD START ===\n");
                         std::fprintf(stderr, "[RENDER] Thread ID: %zu\n", std::hash<std::thread::id>{}(std::this_thread::get_id()));
-                        std::fprintf(stderr, "[RENDER] World copy valid: %s\n", world_copy ? "YES" : "NO");
+                        std::fprintf(stderr, "[RENDER] World copy shared_ptr valid: %s\n", world_copy ? "YES" : "NO");
+                        std::fprintf(stderr, "[RENDER] World copy use_count: %ld\n", world_copy.use_count());
+                        
+                        // Additional safety check inside thread
+                        if (!world_copy) {
+                            std::fprintf(stderr, "[ERROR] World copy is NULL inside render thread! Aborting.\n");
+                            return;
+                        }
+                        
                         std::fprintf(stderr, "[RENDER] Camera image size: %dx%d\n", cam_copy.image_width, cam_copy.image_height);
                         std::fprintf(stderr, "[RENDER] Camera use_sun: %s\n", cam_copy.use_sun ? "YES" : "NO");
                         
@@ -5711,7 +5991,8 @@ int main()
                         std::fprintf(stderr, "\n!!! FATAL: Unknown exception in render thread !!!\n");
                         std::fprintf(stderr, "[CRASH] Caught non-standard exception (possible access violation or segfault)\n");
                     }
-                });
+                    });
+                }
             }
         } else {
             ImGui::BeginDisabled();
@@ -6068,6 +6349,12 @@ int main()
             ImGui::UpdatePlatformWindows();
             ImGui::RenderPlatformWindowsDefault();
             glfwMakeContextCurrent(backup_current_context);
+        }
+
+        // Auto-save materials if modified
+        if (g_materials_dirty) {
+            SaveMaterialsManifest();
+            g_materials_dirty = false;
         }
 
         glfwSwapBuffers(window);

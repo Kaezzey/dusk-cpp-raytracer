@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -63,6 +64,8 @@ render_result renderer::render(
     const int total_scanlines = h;
     const int chunk_size      = 4; // update ETA every N lines
     const int progress_min_interval_ms = 500; // throttle partial updates
+    const int progress_denoise_interval_ms = 10000; // denoise less frequently (every 10 seconds)
+    const int progress_denoise_hold_ms = 9000; // hold cached denoised result for this many ms to avoid flicker
 
     // Rolling average per-tile time (seconds). Updated under critical section.
     std::atomic<double> avg_tile_time{0.0};
@@ -71,6 +74,11 @@ render_result renderer::render(
 
     // Throttle progress callbacks across all OMP workers
     static std::atomic<long long> s_last_progress_ms{0};
+    static std::atomic<long long> s_last_denoise_ms{0};
+    // Cached denoised HDR result + timestamp to provide a stable denoised display
+    static std::atomic<long long> s_cached_denoised_ts{0};
+    static std::vector<float> s_cached_denoised_hdr; // resized on first use to match render size
+    static std::mutex s_cached_denoised_mutex;
 
     if (progress) {
         progress->total_scanlines           = total_scanlines;
@@ -725,11 +733,108 @@ render_result renderer::render(
 
         // Outside critical section: throttled partial image callback
         if (progress_callback) {
+            // Check cancel flag first - don't waste time on callbacks if cancelled
+            if (cancel_flag && cancel_flag->load()) continue;
+            
             auto now = clock::now();
             long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
             long long last_ms = s_last_progress_ms.load();
             if (now_ms - last_ms >= progress_min_interval_ms) {
                 if (s_last_progress_ms.compare_exchange_strong(last_ms, now_ms)) {
+                    // Apply progressive denoising if enabled (with separate, less frequent throttle)
+                    std::vector<float> display_hdr = hdr_buffer;
+                    bool denoised = false;
+#ifdef HAVE_OIDN
+                    if (this->progressive_denoise && this->use_denoiser && this->denoiser_strength > 0.0) {
+                        long long last_denoise_ms = s_last_denoise_ms.load();
+                        // Only denoise if enough time has passed AND we're not cancelled
+                        if (now_ms - last_denoise_ms >= progress_denoise_interval_ms && 
+                            (!cancel_flag || !cancel_flag->load())) {
+                            if (s_last_denoise_ms.compare_exchange_strong(last_denoise_ms, now_ms)) {
+                                // OIDN is not thread-safe - use a static mutex, but try_lock to avoid blocking
+                                static std::mutex s_oidn_mutex;
+                                std::unique_lock<std::mutex> oidn_lock(s_oidn_mutex, std::try_to_lock);
+                                
+                                if (oidn_lock.owns_lock()) {
+                                    try {
+                                        // Double-check cancel flag before expensive OIDN operation
+                                        if (cancel_flag && cancel_flag->load()) continue;
+                                        
+                                        oidn::DeviceRef device = oidn::newDevice();
+                                        if (device) {
+                                            device.commit();
+                                            
+                                            const char* errorMessage = nullptr;
+                                            if (device.getError(errorMessage) == oidn::Error::None) {
+                                                oidn::FilterRef filter = device.newFilter("RT");
+                                                if (filter) {
+                                                    size_t bufBytes = (size_t)w * (size_t)h * 3 * sizeof(float);
+                                                    oidn::BufferRef colorBuf = device.newBuffer(bufBytes);
+                                                    oidn::BufferRef outBuf = device.newBuffer(bufBytes);
+                                                    oidn::BufferRef albedoBuf = device.newBuffer(bufBytes);
+                                                    oidn::BufferRef normalBuf = device.newBuffer(bufBytes);
+                                                    
+                                                    void* colorPtr = colorBuf.getData();
+                                                    if (colorPtr) std::memcpy(colorPtr, hdr_buffer.data(), bufBytes);
+                                                    void* albPtr = albedoBuf.getData();
+                                                    if (albPtr) std::memcpy(albPtr, albedo_buffer.data(), bufBytes);
+                                                    void* nrmPtr = normalBuf.getData();
+                                                    if (nrmPtr) std::memcpy(nrmPtr, normal_buffer.data(), bufBytes);
+                                                    
+                                                    filter.setImage("color", colorBuf, oidn::Format::Float3, w, h);
+                                                    filter.setImage("albedo", albedoBuf, oidn::Format::Float3, w, h);
+                                                    filter.setImage("normal", normalBuf, oidn::Format::Float3, w, h);
+                                                    filter.setImage("output", outBuf, oidn::Format::Float3, w, h);
+                                                    filter.set("hdr", true);
+                                                    filter.set("srgb", false);
+                                                    filter.set("strength", (float)this->denoiser_strength);
+                                                    filter.commit();
+                                                    
+                                                    // Final cancel check before expensive execute
+                                                    if (!cancel_flag || !cancel_flag->load()) {
+                                                        filter.execute();
+                                                        
+                                                        void* outPtr = outBuf.getData();
+                                                        if (outPtr) {
+                                                            // Copy denoised result into a shared cache so the UI can
+                                                            // display a stable denoised image while rendering continues.
+                                                            {
+                                                                std::lock_guard<std::mutex> cache_lock(s_cached_denoised_mutex);
+                                                                if (s_cached_denoised_hdr.size() != hdr_buffer.size()) {
+                                                                    s_cached_denoised_hdr.resize(hdr_buffer.size());
+                                                                }
+                                                                std::memcpy(s_cached_denoised_hdr.data(), outPtr, bufBytes);
+                                                            }
+                                                            s_cached_denoised_ts.store(now_ms);
+                                                            denoised = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } catch (const std::exception& e) {
+                                        std::fprintf(stderr, "[OIDN ERROR] Progressive denoise exception: %s\n", e.what());
+                                    } catch (...) {
+                                        std::fprintf(stderr, "[OIDN ERROR] Progressive denoise unknown exception\n");
+                                    }
+                                }
+                                // else: mutex was locked, skip denoising this frame (no blocking)
+                            }
+                        }
+                    }
+#endif
+                    // If we have a recently cached denoised result, use it for a
+                    // stable partial display to avoid flicker between noisy/denoised.
+                    {
+                        long long cached_ts = s_cached_denoised_ts.load();
+                        if (cached_ts != 0 && (now_ms - cached_ts) <= progress_denoise_hold_ms) {
+                            std::lock_guard<std::mutex> cache_lock(s_cached_denoised_mutex);
+                            if (s_cached_denoised_hdr.size() == display_hdr.size()) {
+                                std::memcpy(display_hdr.data(), s_cached_denoised_hdr.data(), display_hdr.size() * sizeof(float));
+                            }
+                        }
+                    }
+
                     // Build partial 8-bit image from completed scanlines only
                     render_result partial;
                     partial.width = w;
@@ -750,9 +855,9 @@ render_result renderer::render(
                             int idx = 3 * (yy * w + xx);
                             if (done_line) {
                                 int hidx = idx;
-                                double r_lin = (double)hdr_buffer[hidx + 0];
-                                double g_lin = (double)hdr_buffer[hidx + 1];
-                                double b_lin = (double)hdr_buffer[hidx + 2];
+                                double r_lin = (double)display_hdr[hidx + 0];
+                                double g_lin = (double)display_hdr[hidx + 1];
+                                double b_lin = (double)display_hdr[hidx + 2];
                                 double r_t = aces_film_small(r_lin);
                                 double g_t = aces_film_small(g_lin);
                                 double b_t = aces_film_small(b_lin);

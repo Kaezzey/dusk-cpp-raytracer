@@ -68,6 +68,17 @@ class camera {
 
     std::vector<point_light> point_lights;
 
+    // Emissive area lights (surfaces with emissive materials)
+    struct emissive_surface {
+        point3 position;     // sample point (center for spheres/quads)
+        vec3   normal;       // surface normal
+        double area;         // surface area
+        colour emission;     // emitted radiance
+        // For advanced sampling: could add triangle vertices, quad corners, etc.
+    };
+    std::vector<emissive_surface> emissive_surfaces;
+    std::vector<double> emissive_cdf; // Importance sampling CDF (by power = emission*area)
+
     // MNEE single-sphere caustics toggle and parameters (populated by editor)
     bool   enable_mnee = true;
     bool   mnee_has_sphere = false;
@@ -84,7 +95,7 @@ class camera {
     double mnee_gain_scale        = 1.0;
 
     // NEE + MIS for diffuse materials (reduces noise at low SPP)
-    int    direct_light_samples   = 1;  // samples per diffuse hit (1-4 recommended)
+    int    direct_light_samples   = 0;  // samples per diffuse hit (0 = disabled)
     bool   enable_mis             = true; // Multiple Importance Sampling
 
     void render(const hittable& world, std::ostream& out = std::cout){
@@ -328,6 +339,33 @@ class camera {
         caustics_radius = radius;
     }
 
+    // Public setter for emissive area lights
+    void set_emissive_surfaces(const std::vector<emissive_surface>& surfaces) {
+        emissive_surfaces = surfaces;
+        
+        // Build importance sampling CDF by power (emission * area)
+        emissive_cdf.clear();
+        if (surfaces.empty()) return;
+        
+        emissive_cdf.resize(surfaces.size());
+        double total_power = 0.0;
+        
+        for (size_t i = 0; i < surfaces.size(); ++i) {
+            const auto& surf = surfaces[i];
+            double lum = 0.2126 * surf.emission.x() + 0.7152 * surf.emission.y() + 0.0722 * surf.emission.z();
+            double power = lum * surf.area;
+            total_power += power;
+            emissive_cdf[i] = total_power;
+        }
+        
+        // Normalize CDF
+        if (total_power > 1e-10) {
+            for (auto& val : emissive_cdf) {
+                val /= total_power;
+            }
+        }
+    }
+
     // simple integer hash -> double in [0,1)
     static double pixel_hash_double(int a, int b) {
         unsigned int n = (unsigned int)(a * 73856093u ^ b * 19349663u);
@@ -455,10 +493,10 @@ class camera {
             bool did_nee = false;
             if (!rec.mat->is_specular() && enable_mis) {
                 vec3 V = -unit_vector(current_ray.direction());
-                int num_direct_samples = std::max(1, direct_light_samples);
-                
-                // Sample sun with NEE+MIS
-                if (use_sun) {
+                int num_direct_samples = std::max(0, direct_light_samples);
+
+                // Sample sun with NEE+MIS (only if sampling enabled)
+                if (num_direct_samples > 0 && use_sun) {
                     for (int ls = 0; ls < num_direct_samples; ++ls) {
                         vec3 Lc = unit_vector(sun_dir);
                         double ang_rad = degrees_to_radians(sun_angular_radius);
@@ -515,7 +553,7 @@ class camera {
                 // Sample point lights with NEE+MIS
                 // OPTIMIZATION: Sample ONE random light per bounce (weighted by contribution)
                 // and multiply by N to get unbiased result at O(1) cost instead of O(N)
-                if (!point_lights.empty()) {
+                if (num_direct_samples > 0 && !point_lights.empty()) {
                     int num_lights = (int)point_lights.size();
                     
                     // Build importance weights (inverse-square + range culling)
@@ -596,6 +634,74 @@ class camera {
                             result += throughput * f_brdf * Li * (float)(w_light / (pdf_light * num_direct_samples * pick_prob));
                             did_nee = true;
                         }
+                    }
+                }
+                
+                // Sample emissive area lights with NEE+MIS
+                if (num_direct_samples > 0 && !emissive_surfaces.empty() && !emissive_cdf.empty()) {
+                    for (int ls = 0; ls < num_direct_samples; ++ls) {
+                        // Importance sample one emissive surface by power
+                        double r = random_double();
+                        int sampled_idx = 0;
+                        for (size_t i = 0; i < emissive_cdf.size(); ++i) {
+                            if (r <= emissive_cdf[i]) {
+                                sampled_idx = (int)i;
+                                break;
+                            }
+                        }
+                        
+                        const auto& surf = emissive_surfaces[sampled_idx];
+                        double pick_prob = (sampled_idx == 0) 
+                            ? emissive_cdf[0] 
+                            : (emissive_cdf[sampled_idx] - emissive_cdf[sampled_idx - 1]);
+                        
+                        if (pick_prob <= 1e-10) continue;
+                        
+                        // Sample a point on the emissive surface (for now use center; improve with random sampling later)
+                        point3 light_pos = surf.position;
+                        vec3 light_normal = surf.normal;
+                        
+                        vec3 toLight = light_pos - rec.p;
+                        double dist = toLight.length();
+                        if (dist <= 1e-6) continue;
+                        
+                        vec3 Ldir = unit_vector(toLight);
+                        double NdotL = dot(rec.normal, Ldir);
+                        if (NdotL <= 0.0) continue;
+                        
+                        double NdotL_light = dot(light_normal, -Ldir);
+                        if (NdotL_light <= 0.0) continue; // backfacing
+                        
+                        // Visibility test
+                        ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
+                        double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
+                        if (tr <= 0.0) continue;
+                        
+                        // Geometry term: G = (N·L * N_light·-L) / r^2
+                        double G = (NdotL * NdotL_light) / std::max(1e-4, dist * dist);
+                        
+                        // BRDF evaluation
+                        colour f_brdf = rec.mat->albedo(rec) * (NdotL / pi);
+                        
+                        // PDF for light sampling: 1 / area (uniform sampling on surface)
+                        double pdf_light = 1.0 / std::max(1e-10, surf.area);
+                        
+                        // Convert to solid angle PDF: pdf_omega = pdf_area * r^2 / (N_light · -L)
+                        double pdf_light_omega = pdf_light * dist * dist / std::max(1e-10, NdotL_light);
+                        
+                        // PDF for BSDF sampling (cosine-weighted)
+                        double pdf_bsdf_light = NdotL / pi;
+                        
+                        // MIS balance heuristic weight
+                        double w_light = (pdf_light_omega * pdf_light_omega) / 
+                                        (pdf_light_omega * pdf_light_omega + pdf_bsdf_light * pdf_bsdf_light);
+                        
+                        // Emitted radiance with geometry term and transmittance
+                        colour Li = surf.emission * (float)(G * tr);
+                        
+                        // Scale by 1/pick_prob to account for importance sampling and MIS weight
+                        result += throughput * f_brdf * Li * (float)(w_light / (pdf_light * num_direct_samples * pick_prob));
+                        did_nee = true;
                     }
                 }
             }
