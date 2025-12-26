@@ -198,7 +198,8 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
         );
 
         // Propagate subsurface scattering (SSS) settings from editor material
-        mat->sss_strength = m.sss_strength;
+        // Only apply SSS if use_sss is enabled
+        mat->sss_strength = m.use_sss ? m.sss_strength : 0.0;
         mat->sss_scale = m.sss_scale;
         // Extended dipole/diffusion params
         mat->sss_model = static_cast<SSSModel>(m.sss_model);

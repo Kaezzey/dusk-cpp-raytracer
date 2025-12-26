@@ -2044,11 +2044,12 @@ static void SaveMaterialsManifest()
     std::ofstream out(fname);
     if (!out) return;
     for (const auto &m : g_scene.materials) {
-        // Serialize as: name|model|base_r,base_g,base_b|metallic|roughness|fuzz|ior|em_r,em_g,em_b|sss_strength|sss_scale|sss_model|sss_samples|sss_radius|sss_eta|sss_color_override_enabled|sss_cr,sss_cg,sss_cb|emission_intensity|dielectricF0_r,dielectricF0_g,dielectricF0_b|normal_strength|albedo_tex|metallic_tex|roughness_tex|normal_tex|alpha_tex|alpha_double_sided|alpha_cutoff
+        // Serialize as: name|model|base_r,base_g,base_b|metallic|roughness|fuzz|ior|em_r,em_g,em_b|use_sss|sss_strength|sss_scale|sss_model|sss_samples|sss_radius|sss_eta|sss_color_override_enabled|sss_cr,sss_cg,sss_cb|emission_intensity|dielectricF0_r,dielectricF0_g,dielectricF0_b|normal_strength|albedo_tex|metallic_tex|roughness_tex|normal_tex|alpha_tex|alpha_double_sided|alpha_cutoff
         out << m.name << "|" << (int)m.model << "|";
         out << m.base_color.x() << "," << m.base_color.y() << "," << m.base_color.z() << "|";
         out << m.metallic << "|" << m.roughness << "|" << m.fuzz << "|" << m.ior << "|";
         out << m.emission.x() << "," << m.emission.y() << "," << m.emission.z() << "|";
+        out << (m.use_sss ? 1 : 0) << "|";
         out << m.sss_strength << "|" << m.sss_scale << "|" << m.sss_model << "|" << m.sss_samples << "|" << m.sss_radius << "|" << m.sss_eta << "|";
         out << (m.sss_color_override_enabled ? 1 : 0) << "|";
         out << m.sss_color_override_color.x() << "," << m.sss_color_override_color.y() << "," << m.sss_color_override_color.z() << "|";
@@ -2091,6 +2092,7 @@ static void LoadMaterialsManifest()
         if (idx < toks.size()) {
             try { std::stringstream se(toks[idx++]); double er,eg,eb; char c; se >> er >> c >> eg >> c >> eb; m.emission = vec3(er,eg,eb); } catch(...) {}
         }
+        if (idx < toks.size()) m.use_sss = (std::stoi(toks[idx++]) != 0);
         if (idx < toks.size()) m.sss_strength = std::stod(toks[idx++]);
         if (idx < toks.size()) m.sss_scale = std::stod(toks[idx++]);
         if (idx < toks.size()) m.sss_model = std::stoi(toks[idx++]);
@@ -2590,7 +2592,7 @@ static void init_engine_once()
         scene_light sun;
         sun.name = "Sun";
         sun.type = scene_light_type::directional;
-        sun.radiance = vec3(10.0, 10.0, 10.0);
+        sun.radiance = vec3(6.0, 6.0, 6.0);
         sun.direction = unit_vector(vec3(-0.3f, -1.0f, 0.2f));
         sun.angular_radius_deg = 0.53; // approximate sun
         g_scene.lights.push_back(sun);
@@ -2742,7 +2744,7 @@ static void sync_camera_from_editor(float viewport_width, float viewport_height)
     // Mirror scene lights into the RT camera for preview rendering.
     g_camera.point_lights.clear();
     g_camera.use_sun = false;
-    g_camera.enable_mnee = false;  // Disable MNEE, re-enable if sun present
+    g_camera.enable_mnee = false;  // Disable MNEE, re-enable if sun or point light present
     for (const auto& L : g_scene.lights) {
         if (L.type == scene_light_type::directional) {
             g_camera.use_sun = true;
@@ -2757,6 +2759,8 @@ static void sync_camera_from_editor(float viewport_width, float viewport_height)
             pl.radiance = colour((float)L.radiance.x(), (float)L.radiance.y(), (float)L.radiance.z());
             pl.range = L.range;
             g_camera.point_lights.push_back(pl);
+            // Auto-enable MNEE when point lights are present (MNEE works for point lights too)
+            g_camera.enable_mnee = true;
         }
     }
 }
@@ -3132,7 +3136,8 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
             (float)mat.base_color.y(),
             (float)mat.base_color.z()
         };
-        if (ImGui::ColorEdit3("Base Color", base)) {
+        // Use HDR and Float flags for linear color space (matches renderer's expectations)
+        if (ImGui::ColorEdit3("Base Color", base, ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float)) {
             mat.base_color = colour(base[0], base[1], base[2]);
             g_world_dirty  = true;
         }
@@ -3218,42 +3223,68 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         }
 
         // Subsurface scattering (simplified controls)
-        float sss_f = (float)mat.sss_strength;
-        if (ImGui::SliderFloat("SSS Strength", &sss_f, 0.0f, 1.0f)) {
-            mat.sss_strength = (double)sss_f;
+        if (ImGui::Checkbox("Use Subsurface Scattering (SSS)", &mat.use_sss)) {
             g_world_dirty = true;
         }
-
-        float sss_radius_f = (float)mat.sss_radius;
-        if (ImGui::SliderFloat("SSS Radius", &sss_radius_f, 0.01f, 10.0f)) {
-            mat.sss_radius = (double)sss_radius_f;
-            // Keep legacy sss_scale in sync for the single-scatter fallback
-            mat.sss_scale = mat.sss_radius;
-            g_world_dirty = true;
-        }
-
-        // Compact model selector: None / Single / Dipole
-        const char* sss_items_simple[] = { "None", "Single", "Dipole (Burley)" };
-        int sss_model_idx = 0;
-        // Map runtime enum values to combo index
-        if (mat.sss_model == SSS_NONE) sss_model_idx = 0;
-        else if (mat.sss_model == SSS_SINGLE_SCATTER) sss_model_idx = 1;
-        else if (mat.sss_model == SSS_DIPOLE_BURLEY) sss_model_idx = 2;
-
-        if (ImGui::Combo("SSS Model", &sss_model_idx, sss_items_simple, IM_ARRAYSIZE(sss_items_simple))) {
-            if (sss_model_idx == 0) mat.sss_model = SSS_NONE;
-            else if (sss_model_idx == 1) mat.sss_model = SSS_SINGLE_SCATTER;
-            else mat.sss_model = SSS_DIPOLE_BURLEY;
-            g_world_dirty = true;
-        }
-
-        // Only expose sample count when Dipole is selected (advanced)
-        if (mat.sss_model == SSS_DIPOLE_BURLEY) {
-            int sss_samples_i = mat.sss_samples;
-            if (ImGui::SliderInt("SSS Samples (advanced)", &sss_samples_i, 1, 32)) {
-                mat.sss_samples = sss_samples_i;
+        
+        if (mat.use_sss) {
+            ImGui::Indent();
+            
+            float sss_f = (float)mat.sss_strength;
+            if (ImGui::SliderFloat("SSS Strength", &sss_f, 0.0f, 1.0f)) {
+                mat.sss_strength = (double)sss_f;
                 g_world_dirty = true;
             }
+
+            float sss_radius_f = (float)mat.sss_radius;
+            if (ImGui::SliderFloat("SSS Radius", &sss_radius_f, 0.01f, 10.0f)) {
+                mat.sss_radius = (double)sss_radius_f;
+                // Keep legacy sss_scale in sync for the single-scatter fallback
+                mat.sss_scale = mat.sss_radius;
+                g_world_dirty = true;
+            }
+
+            // Compact model selector: None / Single / Dipole
+            const char* sss_items_simple[] = { "None", "Single", "Dipole (Burley)" };
+            int sss_model_idx = 0;
+            // Map runtime enum values to combo index
+            if (mat.sss_model == SSS_NONE) sss_model_idx = 0;
+            else if (mat.sss_model == SSS_SINGLE_SCATTER) sss_model_idx = 1;
+            else if (mat.sss_model == SSS_DIPOLE_BURLEY) sss_model_idx = 2;
+
+            if (ImGui::Combo("SSS Model", &sss_model_idx, sss_items_simple, IM_ARRAYSIZE(sss_items_simple))) {
+                if (sss_model_idx == 0) mat.sss_model = SSS_NONE;
+                else if (sss_model_idx == 1) mat.sss_model = SSS_SINGLE_SCATTER;
+                else mat.sss_model = SSS_DIPOLE_BURLEY;
+                g_world_dirty = true;
+            }
+
+            // Only expose sample count when Dipole is selected (advanced)
+            if (mat.sss_model == SSS_DIPOLE_BURLEY) {
+                int sss_samples_i = mat.sss_samples;
+                if (ImGui::SliderInt("SSS Samples (advanced)", &sss_samples_i, 1, 32)) {
+                    mat.sss_samples = sss_samples_i;
+                    g_world_dirty = true;
+                }
+            }
+            
+            // SSS Color Override (only when SSS is enabled)
+            if (ImGui::Checkbox("Override SSS Color", &mat.sss_color_override_enabled)) {
+                g_world_dirty = true;
+            }
+            if (mat.sss_color_override_enabled) {
+                float sss_col[3] = {
+                    (float)mat.sss_color_override_color.x(),
+                    (float)mat.sss_color_override_color.y(),
+                    (float)mat.sss_color_override_color.z()
+                };
+                if (ImGui::ColorEdit3("SSS Scatter Color", sss_col)) {
+                    mat.sss_color_override_color = vec3(sss_col[0], sss_col[1], sss_col[2]);
+                    g_world_dirty = true;
+                }
+            }
+            
+            ImGui::Unindent();
         }
 
         ImGui::Separator();
@@ -5894,12 +5925,23 @@ int main()
                             // equally across point lights to keep it simple.
                             if (!cam_copy.point_lights.empty()) {
                                 int npl = (int)cam_copy.point_lights.size();
-                                int photons_per_pl = std::max(1, cfg.photon_count / npl);
+                                // Limit photons per point light to prevent memory issues
+                                int photons_per_pl = std::min(200000, std::max(1, cfg.photon_count / npl));
                                 std::fprintf(stderr, "[CAUSTICS] Emitting %d photons per point-light (%d lights)\n",
                                     photons_per_pl, npl);
 
+                                int light_idx = 0;
                                 for (const auto& pl : cam_copy.point_lights) {
+                                    int deposited = 0;
+                                    int progress_interval = photons_per_pl / 10;
+                                    
                                     for (int pi = 0; pi < photons_per_pl; ++pi) {
+                                        // Progress indication
+                                        if (progress_interval > 0 && pi % progress_interval == 0) {
+                                            std::fprintf(stderr, "[CAUSTICS] Light %d: %d/%d photons (%.0f%%), deposited=%d\n",
+                                                light_idx, pi, photons_per_pl, 100.0 * pi / photons_per_pl, deposited);
+                                        }
+                                        
                                         // Sample a random direction (uniform on sphere)
                                         double z = 1.0 - 2.0 * random_double();
                                         double r = std::sqrt(std::max(0.0, 1.0 - z*z));
@@ -5924,6 +5966,7 @@ int main()
                                                     ph.dir = unit_vector(r0.direction());
                                                     ph.power = throughput;
                                                     pm.insert(ph);
+                                                    deposited++;
                                                 }
                                                 break; // terminate on diffuse
                                             }
@@ -5938,6 +5981,8 @@ int main()
                                             r0 = scattered;
                                         }
                                     }
+                                    std::fprintf(stderr, "[CAUSTICS] Light %d complete: deposited %d photons\n", light_idx, deposited);
+                                    light_idx++;
                                 }
                                 std::fprintf(stderr, "[CAUSTICS] Point-light photons added. Map size: %zu\n", pm.size());
                             }
@@ -5945,6 +5990,30 @@ int main()
                             cam_copy.set_caustics(pm, cfg.deposit_radius);
                             std::fprintf(stderr, "[CAUSTICS] Photon map assigned to camera\n");
                         }
+                        
+                        std::fprintf(stderr, "[RENDER] Pre-flight checks...\n");
+                        std::fprintf(stderr, "[RENDER] - World valid: %s\n", world_copy ? "YES" : "NO");
+                        std::fprintf(stderr, "[RENDER] - Camera res: %dx%d\n", cam_copy.image_width, cam_copy.image_height);
+                        std::fprintf(stderr, "[RENDER] - SPP: %d, Depth: %d\n", cam_copy.samples_per_pixel, cam_copy.max_depth);
+                        std::fprintf(stderr, "[RENDER] - MNEE enabled: %s\n", cam_copy.enable_mnee ? "YES" : "NO");
+                        std::fprintf(stderr, "[RENDER] - Point lights: %zu\n", cam_copy.point_lights.size());
+                        
+                        // Sanity check render dimensions to avoid massive allocations
+                        if (cam_copy.image_width <= 0 || cam_copy.image_height <= 0) {
+                            std::fprintf(stderr, "[ERROR] Invalid image dimensions: %dx%d\n", 
+                                cam_copy.image_width, cam_copy.image_height);
+                            throw std::runtime_error("Invalid render dimensions");
+                        }
+                        if (cam_copy.image_width > 8192 || cam_copy.image_height > 8192) {
+                            std::fprintf(stderr, "[ERROR] Image dimensions too large: %dx%d (max 8192x8192)\n",
+                                cam_copy.image_width, cam_copy.image_height);
+                            throw std::runtime_error("Render dimensions exceed maximum");
+                        }
+                        
+                        // Estimate memory usage (rough)
+                        size_t pixel_count = (size_t)cam_copy.image_width * (size_t)cam_copy.image_height;
+                        size_t buffer_bytes = pixel_count * 3 * sizeof(float) * 3; // HDR + albedo + normal
+                        std::fprintf(stderr, "[RENDER] Estimated buffer memory: %.1f MB\n", buffer_bytes / (1024.0 * 1024.0));
                         
                         std::fprintf(stderr, "[RENDER] Starting renderer.render()...\n");
                         render_result img =

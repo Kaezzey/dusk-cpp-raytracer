@@ -4,6 +4,7 @@
 #include "../hittable.h"
 #include "texture.h"
 #include "sss.h"
+#include <cstdio>
 #include <limits>
 
 // ISPC specular helper (defined in src/core). Forward declaration to avoid
@@ -34,12 +35,13 @@ inline vec3 schlick_fresnel(double cosTheta, const vec3& F0) {
     return F0 + (vec3(1.0,1.0,1.0) - F0) * x5;
 }
 
-// Map perceptual roughness in [0,1] to GGX alpha with floor
+// Map perceptual roughness in [0,1] to GGX alpha
 inline double perceptual_to_alpha(double roughness) {
     roughness = clamp01(roughness);
     roughness = roughness * roughness;  // square for a more perceptual curve
-    const double min_alpha = 0.02;
-    return std::max(roughness, min_alpha);
+    // No floor - allow roughness=1 to be truly diffuse (alpha=1.0)
+    // For numerical stability in division, we clamp in the GGX functions themselves if needed
+    return roughness;
 }
 
 // Sample GGX VNDF (approx) in local space (around +Z) – simple version
@@ -109,6 +111,12 @@ class material {
         if (NdotL <= 0.0) return colour(0,0,0);
         colour base = albedo(rec);
         return base * Li * (NdotL / pi) * (float)vis;
+    }
+
+    // Optional subsurface shading hook. Default implementation returns
+    // zero so materials that don't implement SSS don't contribute.
+    virtual colour shade_sss(const hit_record& /*rec*/, const vec3& /*V*/, const vec3& /*Ldir*/, const colour& /*Li*/, const hittable& /*world*/, double /*vis*/ = 1.0) const {
+        return colour(0,0,0);
     }
 
     //diffuse "base color" hook (used later for direct lighting)
@@ -665,12 +673,22 @@ public:
         // ---------------
         // Lobe selection
         // ---------------
-        // Simple heuristic: more metallic = more likely specular
+        // Heuristic: more metallic and/or lower roughness = more likely specular
+        // At roughness >= 0.95, force pure diffuse (no specular lobes)
         double spec_prob;
-        if (metallic > 0.9) {
+        if (rough >= 0.95 && metallic < 0.9) {
+            // Very rough non-metals: pure diffuse
+            spec_prob = 0.0;
+        } else if (metallic > 0.9) {
+            // Metals are always mostly specular
             spec_prob = 1.0;
         } else {
-            spec_prob = 0.25 + 0.7 * metallic;
+            // For dielectrics, reduce specular probability as roughness increases
+            // Base probability from metallic
+            double base_spec = 0.25 + 0.7 * metallic;
+            // Reduce by roughness: at rough=1, multiply by ~0, at rough=0, multiply by 1.0
+            double roughness_factor = 1.0 - rough;
+            spec_prob = base_spec * roughness_factor;
             spec_prob = clamp01(spec_prob);
         }
 
@@ -862,117 +880,89 @@ public:
         // Final outgoing radiance: f * Li * cosθ
         colour direct = brdf * Li * (float)NdotL;
 
-        // Subsurface scattering support. Modes available:
-        // - SSS_SINGLE_SCATTER: the previous cheap exit-point trace (fast)
-        // - SSS_DIPOLE_BURLEY: dipole-style diffusion sampling (same-triangle
-        //   / local exit-point attempt). This is a pragmatic initial
-        //   implementation and uses the Burley-like radial profile in
-        //   include/core/materials/sss.h.
-        if (sss_strength > 0.0) {
-            if (sss_model == SSS_DIPOLE_BURLEY) {
-                // Importance sample radial distances and angles around the shading point.
-                colour sss_acc(0,0,0);
-                int ns = std::max(1, sss_samples);
-                for (int si = 0; si < ns; ++si) {
-                    double u1 = random_double();
-                    double u2 = random_double();
-                    double r = sss::sample_r_exponential(sss_radius, u1);
-                    double theta = 2.0 * pi * u2;
-
-                    double dx = r * std::cos(theta);
-                    double dy = r * std::sin(theta);
-
-                    // Probe point offset in tangent plane slightly above the surface
-                    point3 probe = rec.p + T * (float)dx + B * (float)dy + rec.normal * 0.001f;
-
-                    // Cast a short ray inward at the probe to find an exit point
-                    ray probe_into(probe, -rec.normal, 0.0);
-                    hit_record exit_rec;
-                    if (!world.hit(probe_into, interval(0.001, infinity), exit_rec))
-                        continue;
-
-                    double travel = (exit_rec.p - rec.p).length();
-                    double trans = std::exp(-travel / std::max(1e-6, sss_radius));
-
-                    // Evaluate diffusion profile and area pdf
-                    double base_lum = luminance(baseColor);
-                    double Rd = sss::burley_Rd(r, base_lum, sss_radius);
-                    double pdf_area = sss::pdf_area_from_radius(r, sss_radius);
-                    if (pdf_area <= 0.0) continue;
-
-                    // Determine light-side visibility from exit point toward light
-                    vec3 L_exit = unit_vector(Ldir);
-                    double NdotL_exit = std::max(0.0, dot(exit_rec.normal, L_exit));
-                    if (NdotL_exit <= 0.0) continue;
-
-                    // Deterministic transmittance from exit to light (accumulate transparency)
-                    ray shadow_from_exit(exit_rec.p + exit_rec.normal * 0.001, L_exit, 0.0);
-                    double Tvis = 1.0;
-                    hit_record sh;
-                    double tmin_local = 0.001;
-                    while (world.hit(shadow_from_exit, interval(tmin_local, std::numeric_limits<double>::infinity()), sh)) {
-                        double opacity = 1.0;
-                        if (sh.mat) opacity = sh.mat->opacity_at(sh);
-                        double t_here = 1.0 - clamp01(opacity);
-                        if (t_here <= 1e-6) { Tvis = 0.0; break; }
-                        Tvis *= t_here;
-                        if (Tvis <= 1e-6) { Tvis = 0.0; break; }
-                        tmin_local = sh.t + 0.001;
-                        shadow_from_exit = ray(sh.p + sh.normal * 0.001, L_exit, 0.0);
-                    }
-                    if (Tvis <= 1e-6) continue;
-
-                    colour exit_alb = exit_rec.mat ? exit_rec.mat->albedo(exit_rec) : baseColor;
-
-                    // Per-sample contribution: Rd (per unit incident flux) times exit albedo
-                    // We divide by the area-pdf to account for sampling in the tangent plane.
-                    colour contrib = exit_alb * (float)(sss_strength * trans * Rd / pdf_area) * Li * (float)NdotL_exit * (float)Tvis;
-                    sss_acc += contrib;
-                }
-                direct += sss_acc * (float)(1.0 / std::max(1, sss_samples));
-            } else {
-                // Fallback: original single-scatter into->exit trace
-                vec3 into_dir = -rec.normal;
-                ray into_ray(rec.p + into_dir * 0.001, into_dir, 0.0);
-                hit_record exit_rec;
-
-                if (world.hit(into_ray, interval(0.001, infinity), exit_rec)) {
-                    double travel = (exit_rec.p - rec.p).length();
-
-                    double trans = std::exp(-travel / std::max(1e-6, sss_scale));
-
-                    double Favg_loc = (F0.x() + F0.y() + F0.z()) / 3.0;
-
-                    vec3 L_exit = unit_vector(Ldir);
-                    double NdotL_exit = std::max(0.0, dot(exit_rec.normal, L_exit));
-
-                    if (NdotL_exit > 0.0) {
-                        ray shadow_from_exit(exit_rec.p + exit_rec.normal * 0.001, L_exit, 0.0);
-                        double T = 1.0;
-                        hit_record sh;
-                        double tmin_local = 0.001;
-                        while (world.hit(shadow_from_exit, interval(tmin_local, std::numeric_limits<double>::infinity()), sh)) {
-                            double opacity = 1.0;
-                            if (sh.mat) opacity = sh.mat->opacity_at(sh);
-                            double t_here = 1.0 - clamp01(opacity);
-                            if (t_here <= 1e-6) { T = 0.0; break; }
-                            T *= t_here;
-                            if (T <= 1e-6) { T = 0.0; break; }
-                            tmin_local = sh.t + 0.001;
-                            shadow_from_exit = ray(sh.p + sh.normal * 0.001, L_exit, 0.0);
-                        }
-
-                        if (T > 1e-6) {
-                            colour exit_alb = exit_rec.mat ? exit_rec.mat->albedo(exit_rec) : baseColor;
-                            colour sss = exit_alb * (float)(sss_strength * trans * (1.0 - Favg_loc)) * Li * (float)NdotL_exit * (float)T;
-                            direct += sss;
-                        }
-                    }
-                }
-            }
-        }
+        // SSS is handled separately via `shade_sss()` to allow the renderer
+        // to compute the main BRDF using the fast ISPC path and then add
+        // the SSS contribution afterwards. See `shade_sss()` implementation
+        // below in pbr_material.
 
         return direct;
+    }
+
+    // pbr_material: SSS-only shading hook (called by renderer after BRDF)
+    colour shade_sss(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li, const hittable& world, double vis = 1.0) const override {
+        (void)vis; (void)Ldir;
+        if (sss_strength <= 0.0) return colour(0,0,0);
+
+        // Only apply when light comes from front of surface
+        vec3 L = unit_vector(Ldir);
+        double NdotL = std::max(0.0, dot(rec.normal, L));
+        if (NdotL <= 0.0) return colour(0,0,0);
+
+        // Choose SSS tint
+        colour sss_tint = sss_color_override ? sss_color_override_col : albedo(rec);
+
+        // DEBUG: if user enabled explicit override, print once and return a strong
+        // debug color immediately to confirm the SSS shading path and color
+        // propagation (temporary diagnostic to validate sun/point/area lights).
+        if (sss_color_override) {
+            static bool dbg_printed = false;
+            if (!dbg_printed) {
+                dbg_printed = true;
+                std::fprintf(stderr, "shade_sss: debug override active (material)\n");
+            }
+            float scale = (float)std::max(1.0, sss_strength);
+            return sss_color_override_col * scale * (float)NdotL * Li;
+        }
+
+        if (sss_model == SSS_DIPOLE_BURLEY) {
+            colour sss_acc(0,0,0);
+            int ns = std::max(1, sss_samples);
+            vec3 T = rec.tangent; vec3 B = rec.bitangent;
+            for (int si = 0; si < ns; ++si) {
+                double u1 = random_double();
+                double u2 = random_double();
+                double r = sss::sample_r_exponential(sss_radius, u1);
+                double theta = 2.0 * pi * u2;
+                double dx = r * std::cos(theta);
+                double dy = r * std::sin(theta);
+
+                point3 exit_probe = rec.p + T * (float)dx + B * (float)dy;
+                point3 ray_origin = exit_probe + rec.normal * (float)(sss_radius * 0.5);
+                ray probe_ray(ray_origin, -rec.normal, 0.0);
+                hit_record exit_rec;
+                if (!world.hit(probe_ray, interval(0.001, sss_radius * 2.0), exit_rec)) continue;
+
+                double scatter_dist = (exit_rec.p - rec.p).length();
+                double trans = std::exp(-scatter_dist / std::max(1e-6, sss_radius));
+
+                double base_lum = std::max(0.1, luminance(albedo(rec)));
+                double Rd = sss::burley_Rd(r, base_lum, sss_radius);
+                double pdf_area = sss::pdf_area_from_radius(r, sss_radius);
+                if (pdf_area <= 1e-9) continue;
+
+                double NdotV_exit = std::max(0.0, dot(exit_rec.normal, V));
+                if (NdotV_exit <= 0.0) continue;
+
+                colour contrib = sss_tint * (float)(sss_strength * trans * Rd / pdf_area)
+                                 * Li * (float)NdotL * (float)NdotV_exit;
+                sss_acc += contrib;
+            }
+            return sss_acc * (float)(1.0 / std::max(1, sss_samples));
+        } else {
+            // Single-scatter fallback
+            vec3 scatter_dir = -rec.normal;
+            ray into_ray(rec.p + scatter_dir * 0.001, scatter_dir, 0.0);
+            hit_record exit_rec;
+            if (!world.hit(into_ray, interval(0.001, sss_radius * 5.0), exit_rec)) return colour(0,0,0);
+            double travel = (exit_rec.p - rec.p).length();
+            double trans = std::exp(-travel / std::max(1e-6, sss_scale));
+            double NdotL_exit = std::max(0.0, -dot(exit_rec.normal, rec.normal));
+            if (trans <= 1e-6 || NdotL_exit <= 0.0) return colour(0,0,0);
+            double Favg_loc = (dielectric_F0.x() + dielectric_F0.y() + dielectric_F0.z()) / 3.0;
+            double T_fresnel = 1.0 - Favg_loc;
+            colour sss = sss_tint * (float)(sss_strength * trans * T_fresnel) * Li * (float)NdotL;
+            return sss;
+        }
     }
 
         // Mask test for triangle-level discard

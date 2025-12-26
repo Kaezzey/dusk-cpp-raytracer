@@ -701,14 +701,77 @@ class camera {
                         
                         // Scale by 1/pick_prob to account for importance sampling and MIS weight
                         result += throughput * f_brdf * Li * (float)(w_light / (pdf_light * num_direct_samples * pick_prob));
+
+                        // Add SSS contribution (if the material supports it)
+                        // This ensures SSS is visible for emissive/area lights when doing NEE.
+                        {
+                            vec3 V = -unit_vector(current_ray.direction());
+                            colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
+                            if (sss.x() != 0.0 || sss.y() != 0.0 || sss.z() != 0.0) {
+                                result += throughput * sss * (float)(w_light / (pdf_light * num_direct_samples * pick_prob));
+                            }
+                        }
                         did_nee = true;
                     }
                 }
             }
 
+            // If direct lighting is disabled (direct_light_samples==0), SSS would otherwise never
+            // show up for emissive/area lights. Do a single light-sample for SSS-only.
+            if (direct_light_samples <= 0 && !emissive_surfaces.empty() && !emissive_cdf.empty()) {
+                // Only bother if material actually has SSS enabled.
+                const pbr_material* pbr = dynamic_cast<const pbr_material*>(rec.mat.get());
+                const bool do_sss = (pbr && pbr->sss_strength > 0.0 && pbr->sss_model != SSS_NONE);
+                if (do_sss) {
+                    // Importance sample one emissive surface by power
+                    double r = random_double();
+                    int sampled_idx = 0;
+                    for (size_t i = 0; i < emissive_cdf.size(); ++i) {
+                        if (r <= emissive_cdf[i]) { sampled_idx = (int)i; break; }
+                    }
+
+                    const auto& surf = emissive_surfaces[sampled_idx];
+                    double pick_prob = (sampled_idx == 0)
+                        ? emissive_cdf[0]
+                        : (emissive_cdf[sampled_idx] - emissive_cdf[sampled_idx - 1]);
+                    if (pick_prob > 1e-10) {
+                        point3 light_pos = surf.position;
+                        vec3 light_normal = surf.normal;
+
+                        vec3 toLight = light_pos - rec.p;
+                        double dist = toLight.length();
+                        if (dist > 1e-6) {
+                            vec3 Ldir = unit_vector(toLight);
+                            double NdotL = dot(rec.normal, Ldir);
+                            double NdotL_light = dot(light_normal, -Ldir);
+                            if (NdotL > 0.0 && NdotL_light > 0.0) {
+                                ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
+                                double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
+                                if (tr > 0.0) {
+                                    double G = (NdotL * NdotL_light) / std::max(1e-4, dist * dist);
+                                    double pdf_light = 1.0 / std::max(1e-10, surf.area);
+                                    double pdf_light_omega = pdf_light * dist * dist / std::max(1e-10, NdotL_light);
+                                    double pdf_bsdf_light = NdotL / pi;
+                                    double w_light = (pdf_light_omega * pdf_light_omega) /
+                                                    (pdf_light_omega * pdf_light_omega + pdf_bsdf_light * pdf_bsdf_light);
+
+                                    colour Li = surf.emission * (float)(G * tr);
+                                    vec3 V = -unit_vector(current_ray.direction());
+                                    colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
+                                    result += throughput * sss * (float)(w_light / (pdf_light * 1.0 * pick_prob));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Directional sun (camera-mirrored) support: sample soft sun/shadows if enabled.
-            // Only do this for specular materials or if MIS is disabled
-            if (use_sun && (rec.mat->is_specular() || !enable_mis)) {
+            // By default we only do this for specular materials or if MIS is disabled.
+            // However, SSS needs an explicit direct-light evaluation to be visible.
+            const pbr_material* pbr_for_sun = dynamic_cast<const pbr_material*>(rec.mat.get());
+            const bool do_sss_sun = (pbr_for_sun && pbr_for_sun->sss_strength > 0.0 && pbr_for_sun->sss_model != SSS_NONE);
+            if (use_sun && ((rec.mat->is_specular() || !enable_mis) || do_sss_sun)) {
                 // central sun direction (FROM scene toward sun)
                 vec3 Lc = unit_vector(sun_dir);
                 int samples = std::max(1, sun_shadow_samples);
@@ -748,8 +811,18 @@ class camera {
                 vis /= double(samples);
                 if (vis > 0.0) {
                     vec3 V = -unit_vector(current_ray.direction());
-                    colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance, world);
-                    result += throughput * (direct * (float)vis);
+
+                    // Keep existing direct-light behaviour for specular / MIS-disabled.
+                    if (rec.mat->is_specular() || !enable_mis) {
+                        colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance, world);
+                        result += throughput * (direct * (float)vis);
+                    }
+
+                    // Always add SSS when enabled.
+                    if (do_sss_sun) {
+                        colour sss = rec.mat->shade_sss(rec, V, Lc, sun_radiance, world);
+                        result += throughput * (sss * (float)vis);
+                    }
                 }
             }
 
@@ -758,7 +831,14 @@ class camera {
             // Skip if we already did NEE+MIS above for non-specular materials
             if (depth == 0 && precomputed_direct) {
                 result += throughput * (*precomputed_direct);
-            } else if ((rec.mat->is_specular() || !enable_mis) && !point_lights.empty()) {
+            }
+
+            // Point lights: sample one random point light. We normally only do this for
+            // specular materials or if MIS is disabled, but SSS needs explicit direct-light
+            // evaluation even when MIS is enabled.
+            const pbr_material* pbr_for_pl = dynamic_cast<const pbr_material*>(rec.mat.get());
+            const bool do_sss_pl = (pbr_for_pl && pbr_for_pl->sss_strength > 0.0 && pbr_for_pl->sss_model != SSS_NONE);
+            if (((rec.mat->is_specular() || !enable_mis) || do_sss_pl) && !point_lights.empty()) {
                 // OPTIMIZATION: Sample one random light (importance-weighted) instead of all N lights
                 int num_lights = (int)point_lights.size();
                 
@@ -820,10 +900,19 @@ class camera {
                         colour Li = pl.radiance * (float)(att * tr);
 
                         vec3 V = -unit_vector(current_ray.direction());
-                        colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
-                        
-                        // Scale by 1/pick_prob to account for sampling only one light
-                        result += throughput * direct * (float)(1.0 / pick_prob);
+
+                        // Keep existing direct-light behaviour for specular / MIS-disabled.
+                        if (rec.mat->is_specular() || !enable_mis) {
+                            colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
+                            // Scale by 1/pick_prob to account for sampling only one light
+                            result += throughput * direct * (float)(1.0 / pick_prob);
+                        }
+
+                        // Always add SSS when enabled.
+                        if (do_sss_pl) {
+                            colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
+                            result += throughput * sss * (float)(1.0 / pick_prob);
+                        }
                     }
                 }
             }

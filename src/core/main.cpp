@@ -50,6 +50,23 @@ int main() {
     scn.materials.back().normal_strength = 1.0;
     scn.materials.back().dielectric_F0  = colour(0.04, 0.04, 0.04);
 
+    // Test: PBR material with strong subsurface scattering (blue tint)
+    int sss_test_mat = (int)scn.materials.size();
+    scn.materials.push_back({});
+    scn.materials.back().name           = "SSS Test";
+    scn.materials.back().model          = scene_material_model::pbr;
+    scn.materials.back().base_color     = colour(1.0, 1.0, 1.0);
+    scn.materials.back().metallic       = 0.0;
+    scn.materials.back().roughness      = 0.3;
+    scn.materials.back().normal_strength = 1.0;
+    scn.materials.back().use_sss        = true;
+    scn.materials.back().sss_strength   = 20.0;   // intentionally >1 for visibility
+    scn.materials.back().sss_radius     = 0.2;
+    scn.materials.back().sss_samples    = 64;
+    scn.materials.back().sss_model      = 3;      // dipole (Burley)
+    scn.materials.back().sss_color_override_enabled = true;
+    scn.materials.back().sss_color_override_color = vec3(0.0, 0.2, 1.0);
+
     // -------------------------
     // Objects (spheres)
     // -------------------------
@@ -73,7 +90,7 @@ int main() {
     scn.objects.push_back({
         "GlassSphere",
         scene_object_type::sphere,
-        glass_mat,
+        sss_test_mat,
         point3(-1, 0, -1),
         0.5
     });

@@ -55,6 +55,7 @@ struct scene_material {
     // - sss_strength: [0..1] amount of subsurface transmission
     // - sss_scale: mean free path / scattering scale (larger -> more transmission)
     // Note: the SSS tint uses the material albedo (base_color).
+    bool   use_sss      = false;                      // Enable subsurface scattering
     double sss_strength = 0.0;
     double sss_scale    = 1.0;
     // Extended dipole/diffusion parameters (editor-facing). sss_model is

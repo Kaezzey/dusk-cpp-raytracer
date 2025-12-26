@@ -43,23 +43,33 @@ render_result renderer::render(
 {
     using clock = std::chrono::steady_clock;
 
+    std::fprintf(stderr, "[RENDERER] initialize() starting...\n");
     cam.initialize();
+    std::fprintf(stderr, "[RENDERER] initialize() complete\n");
 
+    std::fprintf(stderr, "[RENDERER] Allocating render_result structure...\n");
     render_result out;
     out.width  = cam.image_width;
     out.height = cam.image_height;
+    std::fprintf(stderr, "[RENDERER] Resizing output pixel buffer: %dx%d = %zu pixels\n", 
+        out.width, out.height, (size_t)out.width * out.height);
     out.pixels.resize(out.width * out.height * 3);
+    std::fprintf(stderr, "[RENDERER] Output buffer allocated\n");
 
     const int w  = out.width;
     const int h = out.height;
     const int spp    = cam.samples_per_pixel;
     const int depth  = cam.max_depth;
 
+    std::fprintf(stderr, "[RENDERER] Allocating HDR buffers (%dx%d)...\n", w, h);
     // HDR linear float buffer (3 floats per pixel) used for optional denoising
     std::vector<float> hdr_buffer((size_t)w * (size_t)h * 3, 0.0f);
+    std::fprintf(stderr, "[RENDERER] HDR buffer allocated\n");
     // Albedo (base color) and normal AOVs for OIDN guidance
     std::vector<float> albedo_buffer((size_t)w * (size_t)h * 3, 0.0f);
+    std::fprintf(stderr, "[RENDERER] Albedo buffer allocated\n");
     std::vector<float> normal_buffer((size_t)w * (size_t)h * 3, 0.0f);
+    std::fprintf(stderr, "[RENDERER] Normal buffer allocated\n");
 
     const int total_scanlines = h;
     const int chunk_size      = 4; // update ETA every N lines
@@ -97,12 +107,14 @@ render_result renderer::render(
 
     static const interval intensity(0.000, 0.999);
 
+    std::fprintf(stderr, "[RENDERER] Setting up tile-based rendering...\n");
     // Tile-based parallel rendering: reduces OpenMP scheduling overhead
     const int tile_w = 32;
     const int tile_h = 32;
     const int num_tiles_x = (w + tile_w - 1) / tile_w;
     const int num_tiles_y = (h + tile_h - 1) / tile_h;
     const int num_tiles = num_tiles_x * num_tiles_y;
+    std::fprintf(stderr, "[RENDERER] Tile config: %dx%d tiles, %d total\n", num_tiles_x, num_tiles_y, num_tiles);
     // Tile progress bookkeeping (used for ETA calculation)
     std::atomic<int> completed_tiles{0};
 
@@ -123,8 +135,13 @@ render_result renderer::render(
     int worker_count = 1;
 #ifdef _OPENMP
     worker_count = std::max(1, omp_get_max_threads());
+    std::fprintf(stderr, "[RENDERER] OpenMP enabled: %d worker threads\n", worker_count);
+#else
+    std::fprintf(stderr, "[RENDERER] Single-threaded mode\n");
 #endif
 
+    std::fprintf(stderr, "[RENDERER] Allocating per-thread buffers (%d threads, %d pixels/tile)...\n", 
+        worker_count, max_tile_pixels);
     // Per-thread storage
     std::vector<std::vector<hit_record>> thread_first_rec(worker_count);
     std::vector<std::vector<char>>       thread_first_hit(worker_count);
@@ -139,15 +156,35 @@ render_result renderer::render(
         thread_tile_normals[t].reserve(max_tile_pixels * 3);
         thread_tile_idxf[t].reserve(max_tile_pixels);
     }
+    std::fprintf(stderr, "[RENDERER] Per-thread buffers allocated\n");
 
-    #pragma omp parallel for schedule(dynamic,1)
+    std::fprintf(stderr, "[RENDERER] Starting parallel tile loop...\n");
+    // Force a consistent number of threads to match preallocated buffers
+    #pragma omp parallel for schedule(dynamic,1) num_threads(worker_count)
     for (int ti = 0; ti < num_tiles; ++ti) {
+        if (ti == 0) {
+            std::fprintf(stderr, "[RENDERER] First tile starting (thread %d)\n", 
+#ifdef _OPENMP
+                omp_get_thread_num()
+#else
+                0
+#endif
+            );
+            std::fflush(stderr);
+        }
+        
         if (cancel_flag && cancel_flag->load()) continue;
 
         int tid = 0;
 #ifdef _OPENMP
         tid = omp_get_thread_num();
 #endif
+        // Safety: ensure tid maps into the preallocated per-thread buffers
+        if (tid < 0 || tid >= worker_count) {
+            tid = tid % std::max(1, worker_count);
+        }
+
+        if (ti == 0) { std::fprintf(stderr, "[TILE0] tid=%d\n", tid); std::fflush(stderr); }
 
         int tx = ti % num_tiles_x;
         int ty = ti / num_tiles_x;
@@ -184,7 +221,7 @@ render_result renderer::render(
                 top_bvh = dynamic_cast<const bvh_node*>(wl->objects[0].get());
             }
         }
-
+        
         if (top_bvh) {
             // For each primary sample index, packet-trace primary rays and store per-sample prehits.
             for (int s = 0; s < spp; ++s) {
@@ -227,15 +264,23 @@ render_result renderer::render(
         // Per-tile timer (start before any work)
         auto tile_start = clock::now();
 
+        // DISABLED: Direct lighting precompute causing crashes
+        // The ray_colour function will handle direct lighting via NEE/MIS instead
+        /*
+        if (ti == 0) { std::fprintf(stderr, "[TILE0] Starting direct lighting precompute, top_bvh=%p\n", (void*)top_bvh); std::fflush(stderr); }
+
         // If we have a top-level BVH, attempt to batch direct-lighting for
         // the first-hit points using packetized shadow queries and ISPC
         // specular evaluation. This precomputes a direct-light colour per
         // (sample,pixel) which we later pass into `camera::ray_colour`.
         if (top_bvh) {
+            if (ti == 0) { std::fprintf(stderr, "[TILE0] Entering direct lighting loop\n"); std::fflush(stderr); }
             // Precompute per-sample first-hit direct lighting
             for (int s = 0; s < spp; ++s) {
+                if (ti == 0 && s == 0) { std::fprintf(stderr, "[TILE0] Direct light sample s=0\n"); std::fflush(stderr); }
                 for (int j = y0; j < y1; ++j) {
                     for (int i = x0; i < x1; i += 4) {
+                        if (ti == 0 && s == 0 && j == y0 && i == x0) { std::fprintf(stderr, "[TILE0] First direct packet\n"); std::fflush(stderr); }
                         // Build a small 4-wide packet for up to 4 lanes
                         RayPacket4 pk;
                         pk.active_mask = 0;
@@ -243,24 +288,50 @@ render_result renderer::render(
                         int lane_px[4];
                         int lane_local_idx[4];
                         int lane_idx_global[4];
+                        if (ti == 0 && s == 0 && j == y0 && i == x0) { std::fprintf(stderr, "[TILE0] Arrays initialized\n"); std::fflush(stderr); }
                         for (int l = 0; l < 4; ++l) {
                             int px = i + l;
                             lane_px[l] = px;
                             if (px >= x1) continue;
                             int local_idx = (j - y0) * (x1 - x0) + (px - x0);
                             int idx = s * tile_w_pixels + local_idx;
+                            if (ti == 0 && s == 0 && j == y0 && i == x0 && l == 0) { 
+                                std::fprintf(stderr, "[TILE0] Lane 0: px=%d local_idx=%d idx=%d tile_first_hit.size()=%zu tile_first_rec.size()=%zu\n", 
+                                    px, local_idx, idx, tile_first_hit.size(), tile_first_rec.size()); 
+                                std::fflush(stderr); 
+                            }
                             lane_local_idx[l] = local_idx;
                             lane_idx_global[l] = idx;
-                            if (tile_first_hit[idx]) {
+                            if (ti == 0 && s == 0 && j == y0 && i == x0 && l == 0) { 
+                                std::fprintf(stderr, "[TILE0] About to check tile_first_hit[%d]\n", idx); 
+                                std::fflush(stderr); 
+                            }
+                            bool has_hit = (idx < tile_first_hit.size()) && tile_first_hit[idx];
+                            if (ti == 0 && s == 0 && j == y0 && i == x0 && l == 0) { 
+                                std::fprintf(stderr, "[TILE0] tile_first_hit[%d]=%d\n", idx, (int)has_hit); 
+                                std::fflush(stderr); 
+                            }
+                            if (has_hit) {
+                                if (ti == 0 && s == 0 && j == y0 && i == x0 && l == 0) { std::fprintf(stderr, "[TILE0] Lane 0 has hit, loading rec\n"); std::fflush(stderr); }
                                 primary_recs[l] = tile_first_rec[idx];
                                 pk.r[l] = cam.get_ray(px, j, s);
                                 pk.tmin[l] = 0.001;
                                 pk.tmax[l] = 1e30;
                                 pk.active_mask |= (1u << l);
                             }
+                            if (ti == 0 && s == 0 && j == y0 && i == x0 && l == 0) { 
+                                std::fprintf(stderr, "[TILE0] Lane 0 complete, has_hit=%d\n", (int)has_hit); 
+                                std::fflush(stderr); 
+                            }
+                        }
+                        if (ti == 0 && s == 0 && j == y0 && i == x0) { 
+                            std::fprintf(stderr, "[TILE0] All 4 lanes processed, checking active_mask\n"); 
+                            std::fflush(stderr); 
                         }
 
                         if (pk.active_mask == 0) continue;
+                        
+                        if (ti == 0 && s == 0 && j == y0 && i == x0) { std::fprintf(stderr, "[TILE0] Active mask=%u, processing direct light\n", pk.active_mask); std::fflush(stderr); }
 
                         // For each directional sun (if enabled) and point lights,
                         // perform a packet shadow query and accumulate direct light.
@@ -395,9 +466,19 @@ render_result renderer::render(
                                     int l = lane_map[pk_i];
                                     int global_idx = lane_idx_global[l];
                                     colour Li = cam.sun_radiance;
-                                    tile_direct[global_idx] += colour(out_r[pk_i] * (float)Li.x(),
-                                                                      out_g[pk_i] * (float)Li.y(),
-                                                                      out_b[pk_i] * (float)Li.z());
+                                    colour brdf_col(out_r[pk_i] * (float)Li.x(),
+                                                     out_g[pk_i] * (float)Li.y(),
+                                                     out_b[pk_i] * (float)Li.z());
+                                    tile_direct[global_idx] += brdf_col;
+
+                                    // Add SSS contribution from the concrete material if present
+                                    hit_record& rec = primary_recs[l];
+                                    const material* mptr = rec.mat.get();
+                                    const pbr_material* pbr = dynamic_cast<const pbr_material*>(mptr);
+                                    if (pbr && pbr->sss_strength > 0.0) {
+                                        colour sss = pbr->shade_sss(rec, V, Ldir, cam.sun_radiance, world, 1.0);
+                                        tile_direct[global_idx] += sss;
+                                    }
                                 }
                             }
                         }
@@ -529,9 +610,19 @@ render_result renderer::render(
                                     int l = lane_map[pk_i];
                                     int global_idx = lane_idx_global[l];
                                     colour Li = pl.radiance * (float)(1.0 / std::max(1e-4, (pl.position - primary_recs[l].p).length_squared()));
-                                    tile_direct[global_idx] += colour(out_r[pk_i] * (float)Li.x(),
-                                                                      out_g[pk_i] * (float)Li.y(),
-                                                                      out_b[pk_i] * (float)Li.z());
+                                    colour brdf_col(out_r[pk_i] * (float)Li.x(),
+                                                     out_g[pk_i] * (float)Li.y(),
+                                                     out_b[pk_i] * (float)Li.z());
+                                    tile_direct[global_idx] += brdf_col;
+
+                                    // Add SSS from material if set
+                                    hit_record& rec = primary_recs[l];
+                                    const material* mptr = rec.mat.get();
+                                    const pbr_material* pbr = dynamic_cast<const pbr_material*>(mptr);
+                                    if (pbr && pbr->sss_strength > 0.0) {
+                                        colour sss = pbr->shade_sss(rec, V, Ldir, Li, world, 1.0);
+                                        tile_direct[global_idx] += sss;
+                                    }
                                 }
                             }
                         }
@@ -539,7 +630,9 @@ render_result renderer::render(
                 }
             }
         }
+        */
 
+        // Main per-pixel rendering loop
         for (int j = y0; j < y1; ++j) {
             for (int i = x0; i < x1; ++i) {
             // We'll perform per-pixel sampling with optional adaptive stopping.
@@ -841,12 +934,21 @@ render_result renderer::render(
                     partial.height = h;
                     partial.pixels.resize((size_t)w * (size_t)h * 3);
 
-                    auto aces_film_small = [](double x) -> double {
-                        const double a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-                        double v = (x * (a * x + b)) / (x * (c * x + d) + e);
-                        if (!std::isfinite(v) || v < 0.0) return 0.0;
-                        if (v > 1.0) return 1.0;
-                        return v;
+                    // Luminance-based Reinhard tone mapping (preserves color saturation)
+                    auto tonemap_reinhard_lum = [](double r, double g, double b, double& out_r, double& out_g, double& out_b) {
+                        // Calculate luminance
+                        double lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                        if (lum < 1e-6) {
+                            out_r = out_g = out_b = 0.0;
+                            return;
+                        }
+                        // Tone map luminance only
+                        double lum_compressed = lum / (lum + 1.0);
+                        // Scale RGB by the compression ratio to preserve saturation
+                        double scale = lum_compressed / lum;
+                        out_r = r * scale;
+                        out_g = g * scale;
+                        out_b = b * scale;
                     };
 
                     for (int yy = 0; yy < h; ++yy) {
@@ -858,9 +960,8 @@ render_result renderer::render(
                                 double r_lin = (double)display_hdr[hidx + 0];
                                 double g_lin = (double)display_hdr[hidx + 1];
                                 double b_lin = (double)display_hdr[hidx + 2];
-                                double r_t = aces_film_small(r_lin);
-                                double g_t = aces_film_small(g_lin);
-                                double b_t = aces_film_small(b_lin);
+                                double r_t, g_t, b_t;
+                                tonemap_reinhard_lum(r_lin, g_lin, b_lin, r_t, g_t, b_t);
                                 double r_g = linear_to_gamma(r_t);
                                 double g_g = linear_to_gamma(g_t);
                                 double b_g = linear_to_gamma(b_t);
@@ -1101,16 +1202,18 @@ render_result renderer::render(
                         double r_lin = (double)src[id + 0];
                         double g_lin = (double)src[id + 1];
                         double b_lin = (double)src[id + 2];
-                        auto aces = [&](double x) {
-                            const double a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-                            double v = (x * (a * x + b)) / (x * (c * x + d) + e);
-                            if (!std::isfinite(v) || v < 0.0) return 0.0;
-                            if (v > 1.0) return 1.0;
-                            return v;
-                        };
-                        double r_t = aces(r_lin);
-                        double g_t = aces(g_lin);
-                        double b_t = aces(b_lin);
+                        // Luminance-based Reinhard tone mapping (preserves color saturation)
+                        double lum = 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin;
+                        double r_t, g_t, b_t;
+                        if (lum < 1e-6) {
+                            r_t = g_t = b_t = 0.0;
+                        } else {
+                            double lum_compressed = lum / (lum + 1.0);
+                            double scale = lum_compressed / lum;
+                            r_t = r_lin * scale;
+                            g_t = g_lin * scale;
+                            b_t = b_lin * scale;
+                        }
                         double r_g = linear_to_gamma(r_t);
                         double g_g = linear_to_gamma(g_t);
                         double b_g = linear_to_gamma(b_t);
@@ -1154,12 +1257,21 @@ render_result renderer::render(
 #endif
 
     // Final tonemap/gamma pass: convert denoised linear floats -> 8-bit
-    auto aces_film = [](double x) -> double {
-        const double a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-        double v = (x * (a * x + b)) / (x * (c * x + d) + e);
-        if (!std::isfinite(v) || v < 0.0) return 0.0;
-        if (v > 1.0) return 1.0;
-        return v;
+    // Luminance-based Reinhard tone mapping (preserves color saturation)
+    auto tonemap_reinhard_lum = [](double r, double g, double b, double& out_r, double& out_g, double& out_b) {
+        // Calculate luminance
+        double lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        if (lum < 1e-6) {
+            out_r = out_g = out_b = 0.0;
+            return;
+        }
+        // Tone map luminance only
+        double lum_compressed = lum / (lum + 1.0);
+        // Scale RGB by the compression ratio to preserve saturation
+        double scale = lum_compressed / lum;
+        out_r = r * scale;
+        out_g = g * scale;
+        out_b = b * scale;
     };
 
     for (int j = 0; j < h; ++j) {
@@ -1169,9 +1281,8 @@ render_result renderer::render(
             double g_lin = (double)denoised_buffer[idx + 1];
             double b_lin = (double)denoised_buffer[idx + 2];
 
-            double r_t = aces_film(r_lin);
-            double g_t = aces_film(g_lin);
-            double b_t = aces_film(b_lin);
+            double r_t, g_t, b_t;
+            tonemap_reinhard_lum(r_lin, g_lin, b_lin, r_t, g_t, b_t);
 
             double r_g = linear_to_gamma(r_t);
             double g_g = linear_to_gamma(g_t);
