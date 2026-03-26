@@ -9,6 +9,7 @@
 #define STBI_FAILURE_USERMSG
 #include "../../external/stb_image.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -49,30 +50,35 @@ public:
         std::cerr << "ERROR: Could not load image file '" << image_filename << "'.\n";
     }
 
-    // Alpha helpers: support images with an alpha channel (RGBA).
-    bool has_alpha() const { return bytes_per_pixel >= 4; }
+    // Alpha helpers: support images with an alpha channel (RGBA / GA).
+    bool has_alpha() const { return bytes_per_pixel == 2 || bytes_per_pixel >= 4; }
+    bool is_hdr() const { return hdr; }
     unsigned char pixel_alpha_byte(int x, int y) const {
-        if (!bdata || !has_alpha()) return 255;
-        x = clamp(x, 0, image_width);
-        y = clamp(y, 0, image_height);
-        const unsigned char* p = bdata + y * bytes_per_scanline + x * bytes_per_pixel;
-        return p[3];
+        if (!has_alpha()) return 255;
+        double a = channel_value(x, y, alpha_channel_index());
+        a = std::clamp(a, 0.0, 1.0);
+        return static_cast<unsigned char>(255.0 * a + 0.5);
     }
 
     ~rtw_image() {
-        delete[] bdata;
-        stbi_image_free(fdata);  // <-- use function, not STBI_FREE macro
+        stbi_image_free(bdata);
+        stbi_image_free(fdata);
     }
 
     bool load(const std::string& filename) {
         int n = 0;
-        // Let stb tell us how many components the file has (n). Request no forced comp.
-        fdata = stbi_loadf(filename.c_str(), &image_width, &image_height, &n, 0);
-        if (!fdata) return false;
+        if (stbi_is_hdr(filename.c_str())) {
+            hdr = true;
+            fdata = stbi_loadf(filename.c_str(), &image_width, &image_height, &n, 0);
+            if (!fdata) return false;
+        } else {
+            hdr = false;
+            bdata = stbi_load(filename.c_str(), &image_width, &image_height, &n, 0);
+            if (!bdata) return false;
+        }
 
         bytes_per_pixel = (n > 0) ? n : 3;
         bytes_per_scanline = image_width * bytes_per_pixel;
-        convert_to_bytes();
         return true;
     }
 
@@ -84,7 +90,7 @@ public:
 
     const unsigned char* pixel_data(int x, int y) const {
         static unsigned char magenta[] = { 255, 0, 255 };
-        if (!bdata) return magenta;
+        if (!bdata || hdr) return magenta;
 
         x = clamp(x, 0, image_width);
         y = clamp(y, 0, image_height);
@@ -92,8 +98,29 @@ public:
         return bdata + y * bytes_per_scanline + x * bytes_per_pixel;
     }
 
+    double channel_value(int x, int y, int channel) const {
+        if (image_width <= 0 || image_height <= 0 || bytes_per_pixel <= 0) return 0.0;
+
+        x = clamp(x, 0, image_width);
+        y = clamp(y, 0, image_height);
+        channel = std::clamp(channel, 0, bytes_per_pixel - 1);
+
+        size_t offset = (static_cast<size_t>(y) * static_cast<size_t>(image_width) + static_cast<size_t>(x))
+                      * static_cast<size_t>(bytes_per_pixel)
+                      + static_cast<size_t>(channel);
+
+        if (hdr && fdata) {
+            return static_cast<double>(fdata[offset]);
+        }
+        if (bdata) {
+            return static_cast<double>(bdata[offset]) / 255.0;
+        }
+        return 0.0;
+    }
+
 private:
     int            bytes_per_pixel = 3;
+    bool           hdr = false;
     float         *fdata = nullptr;
     unsigned char *bdata = nullptr;
     int            image_width = 0;
@@ -106,21 +133,10 @@ private:
         return high - 1;
     }
 
-    static unsigned char float_to_byte(float value) {
-        if (value <= 0.0f) return 0;
-        if (value >= 1.0f) return 255;
-        return static_cast<unsigned char>(256.0f * value);
-    }
-
-    void convert_to_bytes() {
-        int total = image_width * image_height * bytes_per_pixel;
-        bdata = new unsigned char[total];
-
-        auto* bp = bdata;
-        auto* fp = fdata;
-
-        for (int i = 0; i < total; ++i, ++fp, ++bp)
-            *bp = float_to_byte(*fp);
+    int alpha_channel_index() const {
+        if (bytes_per_pixel == 2) return 1;
+        if (bytes_per_pixel >= 4) return 3;
+        return 0;
     }
 };
 

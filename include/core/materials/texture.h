@@ -5,6 +5,7 @@
 #include "perlin.h"
 #include "dusk_image.h"
 #include <algorithm>
+#include <cmath>
 
 class texture {
   public:
@@ -17,6 +18,11 @@ class texture {
     // interpret RGB images as luminance masks if desired. Default forwards
     // to `alpha_at` for backwards compatibility.
     virtual double mask_alpha_at(double u, double v, const point3& p) const { return alpha_at(u,v,p); }
+};
+
+enum class texture_sample_space {
+    srgb_color,
+    linear_data
 };
 
 class solid_colour : public texture {
@@ -72,7 +78,8 @@ class noise_texture : public texture {
 
 class image_texture : public texture {
   public:
-    image_texture(const char* filename) : image(filename) {}
+    image_texture(const char* filename, texture_sample_space sample_space = texture_sample_space::srgb_color)
+        : image(filename), sample_space(sample_space) {}
 
     // Expose whether the loaded image contains an alpha channel.
     bool has_alpha() const { return image.has_alpha(); }
@@ -81,33 +88,43 @@ class image_texture : public texture {
         //no texture data, then return solid cyan as a debugging aid
         if (image.height() <= 0) return colour(0,1,1);
 
-        //clamp input texture coordinates to [0,1] x [1,0]
-        u = interval(0,1).clamp(u);
+        int i = 0, j = 0;
+        resolve_texel(u, v, i, j);
 
-        //flip V to image coordinates
-        v = 1.0 - interval(0,1).clamp(v);  
+        double r = 0.0;
+        double g = 0.0;
+        double b = 0.0;
 
-        auto i = int(u * image.width());
-        auto j = int(v * image.height());
-        auto pixel = image.pixel_data(i,j);
+        int ch = image.channels();
+        if (ch <= 0) {
+            return colour(0,1,1);
+        }
+        if (ch == 1 || ch == 2) {
+            r = g = b = image.channel_value(i, j, 0);
+        } else {
+            r = image.channel_value(i, j, 0);
+            g = image.channel_value(i, j, 1);
+            b = image.channel_value(i, j, 2);
+        }
 
-        auto color_scale = 1.0 / 255.0;
-        return colour(color_scale*pixel[0], color_scale*pixel[1], color_scale*pixel[2]);
+        if (sample_space == texture_sample_space::srgb_color && !image.is_hdr()) {
+            r = srgb_to_linear(r);
+            g = srgb_to_linear(g);
+            b = srgb_to_linear(b);
+        }
+
+        return colour(r, g, b);
     }
 
       double alpha_at(double u, double v, const point3& p) const override {
         if (image.height() <= 0) return 1.0;
 
-        u = interval(0,1).clamp(u);
-        v = 1.0 - interval(0,1).clamp(v);
-
-        auto i = int(u * image.width());
-        auto j = int(v * image.height());
+        int i = 0, j = 0;
+        resolve_texel(u, v, i, j);
 
         // If the image has an explicit alpha channel, use it.
         if (image.has_alpha()) {
-          auto a = image.pixel_alpha_byte(i, j);
-          return double(a) / 255.0;
+          return std::clamp(image.channel_value(i, j, image.channels() == 2 ? 1 : 3), 0.0, 1.0);
         }
 
         // No explicit alpha channel: only treat true mask images as alpha.
@@ -117,14 +134,13 @@ class image_texture : public texture {
         //  - 3-channel (RGB): do NOT derive alpha from luminance here because
         //    RGB albedo textures should not be interpreted as opacity masks.
         //    Return fully opaque so PBR fallback doesn't accidentally mask geometry.
-        const unsigned char* pix = image.pixel_data(i, j);
         int ch = image.channels();
         if (ch <= 0) return 1.0;
         if (ch == 1) {
-          return double(pix[0]) / 255.0;
+          return std::clamp(image.channel_value(i, j, 0), 0.0, 1.0);
         } else if (ch == 2) {
           // gray + alpha (second channel is alpha)
-          return double(pix[1]) / 255.0;
+          return std::clamp(image.channel_value(i, j, 1), 0.0, 1.0);
         } else {
           // 3 or more channels but no explicit alpha -> treat as opaque
           return 1.0;
@@ -138,32 +154,41 @@ class image_texture : public texture {
       double mask_alpha_at(double u, double v, const point3& p) const override {
         if (image.height() <= 0) return 1.0;
 
-        u = interval(0,1).clamp(u);
-        v = 1.0 - interval(0,1).clamp(v);
-
-        auto i = int(u * image.width());
-        auto j = int(v * image.height());
+        int i = 0, j = 0;
+        resolve_texel(u, v, i, j);
 
         if (image.has_alpha()) {
-            auto a = image.pixel_alpha_byte(i, j);
-            return double(a) / 255.0;
+            return std::clamp(image.channel_value(i, j, image.channels() == 2 ? 1 : 3), 0.0, 1.0);
         }
 
-        const unsigned char* pix = image.pixel_data(i, j);
         int ch = image.channels();
         if (ch <= 0) return 1.0;
-        if (ch == 1) return double(pix[0]) / 255.0;
-        if (ch == 2) return double(pix[1]) / 255.0;
+        if (ch == 1) return std::clamp(image.channel_value(i, j, 0), 0.0, 1.0);
+        if (ch == 2) return std::clamp(image.channel_value(i, j, 1), 0.0, 1.0);
 
         // RGB or larger: compute perceived luminance as mask value.
-        double r = double(pix[0]) / 255.0;
-        double g = double(pix[1]) / 255.0;
-        double b = double(pix[2]) / 255.0;
+        double r = image.channel_value(i, j, 0);
+        double g = image.channel_value(i, j, 1);
+        double b = image.channel_value(i, j, 2);
         return std::clamp(0.2126 * r + 0.7152 * g + 0.0722 * b, 0.0, 1.0);
       }
 
   private:
+    static double srgb_to_linear(double c) {
+        c = std::clamp(c, 0.0, 1.0);
+        if (c <= 0.04045) return c / 12.92;
+        return std::pow((c + 0.055) / 1.055, 2.4);
+    }
+
+    void resolve_texel(double u, double v, int& i, int& j) const {
+        u = interval(0,1).clamp(u);
+        v = 1.0 - interval(0,1).clamp(v);
+        i = int(u * image.width());
+        j = int(v * image.height());
+    }
+
     rtw_image image;
+    texture_sample_space sample_space = texture_sample_space::srgb_color;
 };
 
 #endif

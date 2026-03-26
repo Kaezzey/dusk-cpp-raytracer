@@ -58,15 +58,17 @@ struct scene_material {
     bool   use_sss      = false;                      // Enable subsurface scattering
     double sss_strength = 0.0;
     double sss_scale    = 1.0;
-    // Extended dipole/diffusion parameters (editor-facing). sss_model is
-    // an integer mapping to runtime SSSModel; defaults choose the existing
-    // single-scatter behaviour for backwards compatibility.
-    int    sss_model    = 1;    // 0=none,1=single,2=multi-single,3=dipole-burley
+    // Extended dipole/diffusion parameters (editor-facing). sss_model maps
+    // directly to runtime SSSModel values.
+    int    sss_model    = 1;    // 0=none,1=single,2=multi-single,3=dipole,4=skin,5=foliage
     int    sss_samples  = 4;
     double sss_radius   = 1.0;
     double sss_eta      = 1.3;
     bool   sss_color_override_enabled = false;
     vec3   sss_color_override_color = vec3(1.0, 1.0, 1.0);
+    // When true, interpret packed metal/roughness textures using Unreal-style channels
+    // (G = roughness, B = metallic) when a combined texture is used.
+    bool   unreal_pbr = false;
     double emission_intensity = 1.0;                  // intensity multiplier for diffuse_light
     vec3   dielectric_F0    = vec3(0.04, 0.04, 0.04); // PBR dielectric F0
     double normal_strength  = 1.0;                    // PBR normal strength

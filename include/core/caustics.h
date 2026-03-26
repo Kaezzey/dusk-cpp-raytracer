@@ -1,6 +1,7 @@
 #ifndef CAUSTICS_H
 #define CAUSTICS_H
 
+#include <algorithm>
 #include <vector>
 #include <unordered_map>
 #include <cmath>
@@ -77,8 +78,11 @@ public:
 
         // Collect candidate photons from neighboring buckets
         struct Cand { const photon* ph; double dist2; };
-        std::vector<Cand> cands;
-        cands.reserve((size_t)k * 4);
+        thread_local std::vector<Cand> cands;
+        cands.clear();
+        if (cands.capacity() < (size_t)k * 4) {
+            cands.reserve((size_t)k * 4);
+        }
 
         ivec3 base = cell_coord(p);
         for (int dz=-1; dz<=1; ++dz)
@@ -167,18 +171,13 @@ inline void build_sun_caustics(const vec3& sun_dir, const colour& sun_radiance,
                                const caustics_config& cfg,
                                photon_map& out_map)
 {
-    std::fprintf(stderr, "[CAUSTICS::BUILD] Entry\n");
     out_map.clear();
     out_map.intensity_scale = cfg.intensity_scale;
     out_map.knn_k = cfg.knn_k;
-    std::fprintf(stderr, "[CAUSTICS::BUILD] Map cleared, intensity_scale=%.1f\n", cfg.intensity_scale);
     
     // L is direction FROM scene toward sun; we shoot photons in -L direction
     vec3 L = unit_vector(sun_dir);
     vec3 shoot_dir = -L;  // from sun toward scene
-    
-    std::fprintf(stderr, "[CAUSTICS::BUILD] Shoot direction: (%.3f, %.3f, %.3f)\n", 
-        shoot_dir.x(), shoot_dir.y(), shoot_dir.z());
     
     // Build orthonormal basis for sampling plane perpendicular to shoot direction
     vec3 w = shoot_dir;
@@ -189,28 +188,13 @@ inline void build_sun_caustics(const vec3& sun_dir, const colour& sun_radiance,
     // Per-photon power: divide sun radiance by photon count
     colour flux = sun_radiance * (float)(1.0 / std::max(1, cfg.photon_count));
     
-    std::fprintf(stderr, "[CAUSTICS::BUILD] Per-photon flux: (%.6f, %.6f, %.6f)\n",
-        flux.x(), flux.y(), flux.z());
-    
     // Emit photons from a broad plane covering the scene (e.g., 50x50 world units)
     double plane_size = 50.0;  // adjust based on your scene bounds
     double plane_distance = 100.0;  // distance from origin
     
-    std::fprintf(stderr, "[CAUSTICS::BUILD] Emission plane: size=%.1f, distance=%.1f\n", 
-        plane_size, plane_distance);
-    std::fprintf(stderr, "[CAUSTICS::BUILD] Emitting %d photons...\n", cfg.photon_count);
-    
     int deposited = 0;
-    int hit_specular = 0;
-    int missed = 0;
-    int progress_interval = cfg.photon_count / 10;
     
     for (int i=0; i<cfg.photon_count; ++i) {
-        if (progress_interval > 0 && i % progress_interval == 0) {
-            std::fprintf(stderr, "[CAUSTICS::BUILD] Progress: %d/%d photons (%.0f%%), deposited=%d\n",
-                i, cfg.photon_count, 100.0 * i / cfg.photon_count, deposited);
-        }
-        
         // Random point on plane perpendicular to sun direction
         double ru = (random_double() - 0.5) * plane_size;
         double rv = (random_double() - 0.5) * plane_size;
@@ -227,7 +211,6 @@ inline void build_sun_caustics(const vec3& sun_dir, const colour& sun_radiance,
         for (int b=0; b<cfg.max_bounces; ++b) {
             hit_record rec;
             if (!world.hit(r, interval(0.001, infinity), rec)) {
-                missed++;
                 break;
             }
 
@@ -244,8 +227,6 @@ inline void build_sun_caustics(const vec3& sun_dir, const colour& sun_radiance,
                 // Regardless, terminate on diffuse
                 break;
             }
-
-            hit_specular++;
             spec_events++;
             
             // Specular: scatter (reflect/refract)
@@ -257,11 +238,6 @@ inline void build_sun_caustics(const vec3& sun_dir, const colour& sun_radiance,
             r = scattered;
         }
     }
-    
-    std::fprintf(stderr, "[CAUSTICS::BUILD] Complete: deposited=%d, hit_specular=%d, missed=%d\n",
-        deposited, hit_specular, missed);
-    std::fprintf(stderr, "[CAUSTICS::BUILD] Final photon map size: %zu\n", out_map.size());
-    std::fprintf(stderr, "[CAUSTICS::BUILD] Exit\n");
 }
 
 #endif

@@ -2056,7 +2056,7 @@ static void SaveMaterialsManifest()
         out << m.emission_intensity << "|";
         out << m.dielectric_F0.x() << "," << m.dielectric_F0.y() << "," << m.dielectric_F0.z() << "|";
         out << m.normal_strength << "|";
-        out << m.albedo_tex << "|" << m.metallic_tex << "|" << m.roughness_tex << "|" << m.normal_tex << "|" << m.alpha_tex << "|" << (m.alpha_double_sided?1:0) << "|" << m.alpha_cutoff << "\n";
+        out << m.albedo_tex << "|" << m.metallic_tex << "|" << m.roughness_tex << "|" << m.normal_tex << "|" << m.alpha_tex << "|" << (m.alpha_double_sided?1:0) << "|" << m.alpha_cutoff << "|" << (m.unreal_pbr?1:0) << "\n";
     }
 }
 
@@ -2115,6 +2115,7 @@ static void LoadMaterialsManifest()
         if (idx < toks.size()) m.alpha_tex = std::stoi(toks[idx++]);
         if (idx < toks.size()) m.alpha_double_sided = (std::stoi(toks[idx++]) != 0);
         if (idx < toks.size()) m.alpha_cutoff = std::stod(toks[idx++]);
+        if (idx < toks.size()) m.unreal_pbr = (std::stoi(toks[idx++]) != 0);
 
         g_scene.materials.push_back(std::move(m));
     }
@@ -3230,9 +3231,11 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         if (mat.use_sss) {
             ImGui::Indent();
             
-            float sss_f = (float)mat.sss_strength;
-            if (ImGui::SliderFloat("SSS Strength", &sss_f, 0.0f, 1.0f)) {
-                mat.sss_strength = (double)sss_f;
+            // Editor exposes SSS strength in [0..1] for convenience, but the
+            // renderer expects a smaller physical scale. Map UI [0..1] -> internal [0..0.1].
+            float sss_ui = (float)std::clamp(mat.sss_strength / 0.1, 0.0, 1.0);
+            if (ImGui::SliderFloat("SSS Strength", &sss_ui, 0.0f, 1.0f)) {
+                mat.sss_strength = (double)(sss_ui * 0.1f);
                 g_world_dirty = true;
             }
 
@@ -3244,20 +3247,28 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
                 g_world_dirty = true;
             }
 
-            // Compact model selector: None / Single / Dipole
-            const char* sss_items_simple[] = { "None", "Single", "Dipole (Burley)" };
+            // Compact model selector: None / Single / Multi-Single / Dipole / Skin / Foliage
+            const char* sss_items_simple[] = { "None", "Single", "Multi-Single", "Dipole (Burley)", "Skin", "Foliage" };
             int sss_model_idx = 0;
             // Map runtime enum values to combo index
             if (mat.sss_model == SSS_NONE) sss_model_idx = 0;
             else if (mat.sss_model == SSS_SINGLE_SCATTER) sss_model_idx = 1;
-            else if (mat.sss_model == SSS_DIPOLE_BURLEY) sss_model_idx = 2;
+            else if (mat.sss_model == SSS_MULTI_SINGLE_SCATTER) sss_model_idx = 2;
+            else if (mat.sss_model == SSS_DIPOLE_BURLEY) sss_model_idx = 3;
+            else if (mat.sss_model == SSS_SKIN) sss_model_idx = 4;
+            else if (mat.sss_model == SSS_FOLIAGE) sss_model_idx = 5;
 
             if (ImGui::Combo("SSS Model", &sss_model_idx, sss_items_simple, IM_ARRAYSIZE(sss_items_simple))) {
                 if (sss_model_idx == 0) mat.sss_model = SSS_NONE;
                 else if (sss_model_idx == 1) mat.sss_model = SSS_SINGLE_SCATTER;
-                else mat.sss_model = SSS_DIPOLE_BURLEY;
+                else if (sss_model_idx == 2) mat.sss_model = SSS_MULTI_SINGLE_SCATTER;
+                else if (sss_model_idx == 3) mat.sss_model = SSS_DIPOLE_BURLEY;
+                else if (sss_model_idx == 4) mat.sss_model = SSS_SKIN;
+                else mat.sss_model = SSS_FOLIAGE;
                 g_world_dirty = true;
             }
+
+            // (Unreal PBR checkbox moved to the Textures section)
 
             // Only expose sample count when Dipole is selected (advanced)
             if (mat.sss_model == SSS_DIPOLE_BURLEY) {
@@ -3330,6 +3341,10 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         draw_tex_slot("Roughness", mat.roughness_tex);
         draw_tex_slot("Normal",    mat.normal_tex);
         draw_tex_slot("Opacity Mask (optional)", mat.alpha_tex);
+        // Unreal-style packed PBR textures (G=roughness, B=metallic)
+        if (ImGui::Checkbox("Unreal PBR (G=roughness, B=metallic)", &mat.unreal_pbr)) {
+            g_world_dirty = true;
+        }
         ImGui::TextDisabled("If Opacity Mask is empty, the albedo's alpha channel will be used.");
 
         ImGui::TextDisabled("build_world_from_scene must hook these into pbr_material.");
@@ -3367,6 +3382,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
     if (orig.roughness_tex != mat.roughness_tex) material_changed = true;
     if (orig.normal_tex != mat.normal_tex) material_changed = true;
     if (orig.alpha_tex != mat.alpha_tex) material_changed = true;
+    if (orig.unreal_pbr != mat.unreal_pbr) material_changed = true;
 
     if (material_changed) {
         InvalidateMaterialThumbnail(mat_index);
@@ -5877,47 +5893,37 @@ int main()
 
                     g_render_thread = std::thread([world_copy, cam_copy]() mutable {
                     try {
-                        std::fprintf(stderr, "\n=== RENDER THREAD START ===\n");
-                        std::fprintf(stderr, "[RENDER] Thread ID: %zu\n", std::hash<std::thread::id>{}(std::this_thread::get_id()));
-                        std::fprintf(stderr, "[RENDER] World copy shared_ptr valid: %s\n", world_copy ? "YES" : "NO");
-                        std::fprintf(stderr, "[RENDER] World copy use_count: %ld\n", world_copy.use_count());
-                        
                         // Additional safety check inside thread
                         if (!world_copy) {
                             std::fprintf(stderr, "[ERROR] World copy is NULL inside render thread! Aborting.\n");
                             return;
                         }
-                        
-                        std::fprintf(stderr, "[RENDER] Camera image size: %dx%d\n", cam_copy.image_width, cam_copy.image_height);
-                        std::fprintf(stderr, "[RENDER] Camera use_sun: %s\n", cam_copy.use_sun ? "YES" : "NO");
+
+                        size_t pixel_count = (size_t)cam_copy.image_width * (size_t)cam_copy.image_height;
                         
                         // Build caustics photon map once before render. Build when
                         // we have either a sun or point lights so point-light
                         // caustics are captured even if the sun is disabled.
                         if (cam_copy.use_sun || !cam_copy.point_lights.empty()) {
-                            std::fprintf(stderr, "[CAUSTICS] Starting photon map build...\n");
-                            std::fprintf(stderr, "[CAUSTICS] Sun direction: (%.3f, %.3f, %.3f)\n", 
-                                cam_copy.sun_dir.x(), cam_copy.sun_dir.y(), cam_copy.sun_dir.z());
-                            std::fprintf(stderr, "[CAUSTICS] Sun radiance: (%.3f, %.3f, %.3f)\n", 
-                                cam_copy.sun_radiance.x(), cam_copy.sun_radiance.y(), cam_copy.sun_radiance.z());
-                            
                             caustics_config cfg;
-                            cfg.photon_count   = 2000000;
-                            cfg.max_bounces    = 10;
-                            cfg.deposit_radius = 0.2;
+                            cfg.photon_count   = (int)std::clamp<size_t>(pixel_count / 3, 150000, 750000);
+                            cfg.max_bounces    = std::max(2, std::min(8, cam_copy.max_depth));
+                            cfg.deposit_radius = 0.18;
                             cfg.intensity_scale= 100.0;
-                            
-                            std::fprintf(stderr, "[CAUSTICS] Config: photons=%d, bounces=%d, radius=%.3f, scale=%.1f\n",
-                                cfg.photon_count, (int)cfg.max_bounces, cfg.deposit_radius, cfg.intensity_scale);
-                            
+                            cfg.knn_k          = 0;
+
+                            int caustic_emitters = (cam_copy.use_sun ? 1 : 0) + (!cam_copy.point_lights.empty() ? 1 : 0);
+                            int sun_budget = cam_copy.use_sun ? std::max(1, cfg.photon_count / std::max(1, caustic_emitters)) : 0;
+                            int point_budget = !cam_copy.point_lights.empty() ? std::max(1, cfg.photon_count - sun_budget) : 0;
+
                             photon_map pm;
-                            std::fprintf(stderr, "[CAUSTICS] Photon map allocated\n");
 
                             // Build sun caustics if enabled
                             if (cam_copy.use_sun) {
+                                caustics_config sun_cfg = cfg;
+                                sun_cfg.photon_count = sun_budget;
                                 build_sun_caustics(cam_copy.sun_dir, cam_copy.sun_radiance,
-                                                   *world_copy, cfg, pm);
-                                std::fprintf(stderr, "[CAUSTICS] Sun photon map built. Size: %zu photons\n", pm.size());
+                                                   *world_copy, sun_cfg, pm);
                             }
 
                             // Also emit photons from point lights so they contribute
@@ -5925,23 +5931,11 @@ int main()
                             // equally across point lights to keep it simple.
                             if (!cam_copy.point_lights.empty()) {
                                 int npl = (int)cam_copy.point_lights.size();
-                                // Limit photons per point light to prevent memory issues
-                                int photons_per_pl = std::min(200000, std::max(1, cfg.photon_count / npl));
-                                std::fprintf(stderr, "[CAUSTICS] Emitting %d photons per point-light (%d lights)\n",
-                                    photons_per_pl, npl);
+                                // Cap per-light photons so point-light caustics don't dominate render startup.
+                                int photons_per_pl = std::min(75000, std::max(1, point_budget / npl));
 
-                                int light_idx = 0;
                                 for (const auto& pl : cam_copy.point_lights) {
-                                    int deposited = 0;
-                                    int progress_interval = photons_per_pl / 10;
-                                    
                                     for (int pi = 0; pi < photons_per_pl; ++pi) {
-                                        // Progress indication
-                                        if (progress_interval > 0 && pi % progress_interval == 0) {
-                                            std::fprintf(stderr, "[CAUSTICS] Light %d: %d/%d photons (%.0f%%), deposited=%d\n",
-                                                light_idx, pi, photons_per_pl, 100.0 * pi / photons_per_pl, deposited);
-                                        }
-                                        
                                         // Sample a random direction (uniform on sphere)
                                         double z = 1.0 - 2.0 * random_double();
                                         double r = std::sqrt(std::max(0.0, 1.0 - z*z));
@@ -5966,7 +5960,6 @@ int main()
                                                     ph.dir = unit_vector(r0.direction());
                                                     ph.power = throughput;
                                                     pm.insert(ph);
-                                                    deposited++;
                                                 }
                                                 break; // terminate on diffuse
                                             }
@@ -5981,22 +5974,11 @@ int main()
                                             r0 = scattered;
                                         }
                                     }
-                                    std::fprintf(stderr, "[CAUSTICS] Light %d complete: deposited %d photons\n", light_idx, deposited);
-                                    light_idx++;
                                 }
-                                std::fprintf(stderr, "[CAUSTICS] Point-light photons added. Map size: %zu\n", pm.size());
                             }
 
                             cam_copy.set_caustics(pm, cfg.deposit_radius);
-                            std::fprintf(stderr, "[CAUSTICS] Photon map assigned to camera\n");
                         }
-                        
-                        std::fprintf(stderr, "[RENDER] Pre-flight checks...\n");
-                        std::fprintf(stderr, "[RENDER] - World valid: %s\n", world_copy ? "YES" : "NO");
-                        std::fprintf(stderr, "[RENDER] - Camera res: %dx%d\n", cam_copy.image_width, cam_copy.image_height);
-                        std::fprintf(stderr, "[RENDER] - SPP: %d, Depth: %d\n", cam_copy.samples_per_pixel, cam_copy.max_depth);
-                        std::fprintf(stderr, "[RENDER] - MNEE enabled: %s\n", cam_copy.enable_mnee ? "YES" : "NO");
-                        std::fprintf(stderr, "[RENDER] - Point lights: %zu\n", cam_copy.point_lights.size());
                         
                         // Sanity check render dimensions to avoid massive allocations
                         if (cam_copy.image_width <= 0 || cam_copy.image_height <= 0) {
@@ -6010,12 +5992,6 @@ int main()
                             throw std::runtime_error("Render dimensions exceed maximum");
                         }
                         
-                        // Estimate memory usage (rough)
-                        size_t pixel_count = (size_t)cam_copy.image_width * (size_t)cam_copy.image_height;
-                        size_t buffer_bytes = pixel_count * 3 * sizeof(float) * 3; // HDR + albedo + normal
-                        std::fprintf(stderr, "[RENDER] Estimated buffer memory: %.1f MB\n", buffer_bytes / (1024.0 * 1024.0));
-                        
-                        std::fprintf(stderr, "[RENDER] Starting renderer.render()...\n");
                         render_result img =
                             g_renderer.render(*world_copy, cam_copy,
                                               &g_cancel_flag, &g_render_progress,
@@ -6032,22 +6008,13 @@ int main()
                                                   }
                                               });
 
-                        std::fprintf(stderr, "[RENDER] Render completed. Image size: %dx%d, %zu pixels\n",
-                            img.width, img.height, img.pixels.size());
-
                         // final result: store and mark final-ready
                         {
-                            std::fprintf(stderr, "[RENDER] Acquiring mutex for final result...\n");
                             std::lock_guard<std::mutex> lock(g_render_mutex);
-                            std::fprintf(stderr, "[RENDER] Moving result to global...\n");
                             g_render_result = std::move(img);
                             g_render_has_result = true;
                             g_render_final_image_ready.store(true);
-                            std::fprintf(stderr, "[RENDER] Final result stored successfully\n");
                         }
-                        
-                        std::fprintf(stderr, "=== RENDER THREAD END (success) ===\n\n");
-                        
                     } catch (const std::bad_alloc& e) {
                         std::fprintf(stderr, "\n!!! FATAL: Memory allocation failed in render thread !!!\n");
                         std::fprintf(stderr, "[EXCEPTION] bad_alloc: %s\n", e.what());

@@ -374,12 +374,68 @@ class camera {
         return double(nn) / double(0x7fffffffu);
     }
 
+    static double colour_luminance(const colour& c) {
+        return 0.2126 * c.x() + 0.7152 * c.y() + 0.0722 * c.z();
+    }
+
+    double point_light_sampling_weight(const point_light& pl, const point3& p, const vec3& normal) const {
+        vec3 to_light = pl.position - p;
+        double dist = to_light.length();
+        if (dist <= 1e-6) return 0.0;
+        if (pl.range > 0.0 && dist > pl.range) return 0.0;
+
+        vec3 Ldir = unit_vector(to_light);
+        double NdotL = dot(normal, Ldir);
+        if (NdotL <= 0.0) return 0.0;
+
+        double att = 1.0 / std::max(1e-4, dist * dist);
+        return att * NdotL * colour_luminance(pl.radiance);
+    }
+
+    double total_point_light_sampling_weight(const point3& p, const vec3& normal) const {
+        double total = 0.0;
+        for (const auto& pl : point_lights) {
+            total += point_light_sampling_weight(pl, p, normal);
+        }
+        return total;
+    }
+
+    bool sample_point_light(const point3& p, const vec3& normal, double total_weight,
+                            const point_light*& out_light, double& out_pick_prob) const {
+        out_light = nullptr;
+        out_pick_prob = 0.0;
+        if (point_lights.empty() || total_weight <= 1e-10) return false;
+
+        double target = random_double() * total_weight;
+        double accum = 0.0;
+        const point_light* fallback_light = nullptr;
+        double fallback_weight = 0.0;
+
+        for (const auto& pl : point_lights) {
+            double weight = point_light_sampling_weight(pl, p, normal);
+            if (weight <= 1e-10) continue;
+
+            fallback_light = &pl;
+            fallback_weight = weight;
+            accum += weight;
+            if (target <= accum) {
+                out_light = &pl;
+                out_pick_prob = weight / total_weight;
+                return true;
+            }
+        }
+
+        if (!fallback_light) return false;
+        out_light = fallback_light;
+        out_pick_prob = fallback_weight / total_weight;
+        return true;
+    }
+
     // Optionally returns the first-hit surface albedo and normal via out parameters
     colour ray_colour(const ray& r0, int max_depth, const hittable& world, colour* out_albedo = nullptr, vec3* out_normal = nullptr, const hit_record* prehit = nullptr, const colour* precomputed_direct = nullptr) const {
         ray    current_ray = r0;
         colour throughput(1.0, 1.0, 1.0);
         colour result(0,0,0);
-        bool passed_through_glass = false;  // track if ray went through dielectric
 
         for (int depth = 0; depth < max_depth; ++depth) {
 
@@ -444,9 +500,11 @@ class camera {
             // Since the photon map stores only caustic photons (paths that
             // went through a dielectric), we can query unconditionally on
             // non-specular hits.
-            if (!rec.mat->is_specular()) {
-                colour Lc = caustics.query(rec.p, caustics_radius);
-                result += throughput * Lc;
+            if (!rec.mat->is_specular() && depth <= 1) {
+                if (caustics.size() > 0) {
+                    colour Lc = caustics.query(rec.p, caustics_radius);
+                    result += throughput * Lc;
+                }
 
                 if (enable_mnee && mnee_has_sphere) {
                     mnee_config mc;
@@ -486,9 +544,6 @@ class camera {
                 break;
             }
 
-            // Track whether path went through glass (for future use/debug)
-            if (!rec.front_face && rec.mat->is_dielectric()) passed_through_glass = true;
-
             // For non-specular materials, do explicit light sampling (NEE) with MIS
             bool did_nee = false;
             if (!rec.mat->is_specular() && enable_mis) {
@@ -522,30 +577,25 @@ class camera {
                             Ls = unit_vector(u_s * (float)x + v_s * (float)y + w_s * (float)z);
                         }
                         
-                        double NdotL = dot(rec.normal, Ls);
-                        if (NdotL > 0.0) {
-                            ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
-                            double tr = compute_transmittance(shadow_ray, std::numeric_limits<double>::infinity(), world);
-                            
-                            if (tr > 0.0) {
-                                // Compute BRDF and PDFs for MIS
-                                colour f_brdf = rec.mat->albedo(rec) * (NdotL / pi);
-                                
-                                // PDF for light sampling (uniform on sun disc)
-                                double solid_angle = 2.0 * pi * (1.0 - cos_theta_max);
-                                double pdf_light = 1.0 / std::max(1e-10, solid_angle);
-                                
-                                // PDF for BSDF sampling (cosine-weighted hemisphere)
-                                double pdf_bsdf_light = NdotL / pi;
-                                
-                                // MIS balance heuristic weight
-                                double w_light = (pdf_light * pdf_light) / 
+                        ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
+                        double tr = compute_transmittance(shadow_ray, std::numeric_limits<double>::infinity(), world);
+                        if (tr > 0.0) {
+                            colour Li = sun_radiance * (float)tr;
+                            colour direct = rec.mat->shade_direct(rec, V, Ls, Li, world);
+                            colour sss = rec.mat->shade_sss(rec, V, Ls, Li, world);
+
+                            double sample_weight = 1.0 / num_direct_samples;
+                            double solid_angle = 2.0 * pi * (1.0 - cos_theta_max);
+                            if (solid_angle > 1e-10) {
+                                double pdf_light = 1.0 / solid_angle;
+                                double pdf_bsdf_light = rec.mat->bsdf_pdf(rec, V, Ls);
+                                double w_light = (pdf_light * pdf_light) /
                                                 (pdf_light * pdf_light + pdf_bsdf_light * pdf_bsdf_light);
-                                
-                                colour Li = sun_radiance * (float)tr;
-                                result += throughput * f_brdf * Li * (float)(w_light / (pdf_light * num_direct_samples));
-                                did_nee = true;
+                                sample_weight = w_light / (pdf_light * num_direct_samples);
                             }
+
+                            result += throughput * (direct + sss) * (float)sample_weight;
+                            did_nee = true;
                         }
                     }
                 }
@@ -554,84 +604,27 @@ class camera {
                 // OPTIMIZATION: Sample ONE random light per bounce (weighted by contribution)
                 // and multiply by N to get unbiased result at O(1) cost instead of O(N)
                 if (num_direct_samples > 0 && !point_lights.empty()) {
-                    int num_lights = (int)point_lights.size();
-                    
-                    // Build importance weights (inverse-square + range culling)
-                    std::vector<double> weights;
-                    weights.reserve(num_lights);
-                    double total_weight = 0.0;
-                    
-                    for (const auto& pl : point_lights) {
-                        vec3 toLight = pl.position - rec.p;
-                        double dist = toLight.length();
-                        if (dist <= 1e-6) {
-                            weights.push_back(0.0);
-                            continue;
-                        }
-                        vec3 Ldir = unit_vector(toLight);
-                        double NdotL = dot(rec.normal, Ldir);
-                        if (NdotL <= 0.0) {
-                            weights.push_back(0.0);
-                            continue;
-                        }
-                        if (pl.range > 0.0 && dist > pl.range) {
-                            weights.push_back(0.0);
-                            continue;
-                        }
-                        
-                        // Weight by approximate contribution (inverse-square * NdotL * radiance luminance)
-                        double att = 1.0 / std::max(1e-4, dist * dist);
-                        double lum = 0.2126 * pl.radiance.x() + 0.7152 * pl.radiance.y() + 0.0722 * pl.radiance.z();
-                        double w = att * NdotL * lum;
-                        weights.push_back(w);
-                        total_weight += w;
-                    }
-                    
-                    // Sample one light proportional to weight
+                    double total_weight = total_point_light_sampling_weight(rec.p, rec.normal);
                     if (total_weight > 1e-10) {
                         for (int ls = 0; ls < num_direct_samples; ++ls) {
-                            double r = random_double() * total_weight;
-                            int sampled_idx = 0;
-                            double accum = 0.0;
-                            for (int li = 0; li < num_lights; ++li) {
-                                accum += weights[li];
-                                if (r <= accum) {
-                                    sampled_idx = li;
-                                    break;
-                                }
-                            }
-                            
-                            const auto& pl = point_lights[sampled_idx];
-                            double pick_prob = weights[sampled_idx] / total_weight;
-                            
+                            const point_light* sampled_light = nullptr;
+                            double pick_prob = 0.0;
+                            if (!sample_point_light(rec.p, rec.normal, total_weight, sampled_light, pick_prob)) continue;
+
+                            const auto& pl = *sampled_light;
                             vec3 toLight = pl.position - rec.p;
                             double dist = toLight.length();
                             vec3 Ldir = unit_vector(toLight);
-                            double NdotL = dot(rec.normal, Ldir);
-                            
                             ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
                             double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
                             if (tr <= 0.0) continue;
-                            
-                            // Compute BRDF
-                            colour f_brdf = rec.mat->albedo(rec) * (NdotL / pi);
-                            
-                            // PDF for light sampling (1 / solid angle)
-                            double solid_angle = (4.0 * pi * dist * dist) / std::max(1e-10, NdotL);
-                            double pdf_light = 1.0 / std::max(1e-10, solid_angle);
-                            
-                            // PDF for BSDF sampling
-                            double pdf_bsdf_light = NdotL / pi;
-                            
-                            // MIS weight
-                            double w_light = (pdf_light * pdf_light) / 
-                                            (pdf_light * pdf_light + pdf_bsdf_light * pdf_bsdf_light);
-                            
+
                             double att = 1.0 / std::max(1e-4, dist * dist);
                             colour Li = pl.radiance * (float)(att * tr);
-                            
-                            // Scale by 1/pick_prob to account for sampling only one light
-                            result += throughput * f_brdf * Li * (float)(w_light / (pdf_light * num_direct_samples * pick_prob));
+
+                            colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
+                            colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
+                            result += throughput * (direct + sss) * (float)(1.0 / (num_direct_samples * pick_prob));
                             did_nee = true;
                         }
                     }
@@ -677,40 +670,23 @@ class camera {
                         double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
                         if (tr <= 0.0) continue;
                         
-                        // Geometry term: G = (N·L * N_light·-L) / r^2
-                        double G = (NdotL * NdotL_light) / std::max(1e-4, dist * dist);
-                        
-                        // BRDF evaluation
-                        colour f_brdf = rec.mat->albedo(rec) * (NdotL / pi);
-                        
                         // PDF for light sampling: 1 / area (uniform sampling on surface)
                         double pdf_light = 1.0 / std::max(1e-10, surf.area);
                         
                         // Convert to solid angle PDF: pdf_omega = pdf_area * r^2 / (N_light · -L)
                         double pdf_light_omega = pdf_light * dist * dist / std::max(1e-10, NdotL_light);
+                        double pdf_light_omega_total = pdf_light_omega * pick_prob;
                         
-                        // PDF for BSDF sampling (cosine-weighted)
-                        double pdf_bsdf_light = NdotL / pi;
+                        double pdf_bsdf_light = rec.mat->bsdf_pdf(rec, V, Ldir);
                         
                         // MIS balance heuristic weight
-                        double w_light = (pdf_light_omega * pdf_light_omega) / 
-                                        (pdf_light_omega * pdf_light_omega + pdf_bsdf_light * pdf_bsdf_light);
+                        double w_light = (pdf_light_omega_total * pdf_light_omega_total) / 
+                                        (pdf_light_omega_total * pdf_light_omega_total + pdf_bsdf_light * pdf_bsdf_light);
                         
-                        // Emitted radiance with geometry term and transmittance
-                        colour Li = surf.emission * (float)(G * tr);
-                        
-                        // Scale by 1/pick_prob to account for importance sampling and MIS weight
-                        result += throughput * f_brdf * Li * (float)(w_light / (pdf_light * num_direct_samples * pick_prob));
-
-                        // Add SSS contribution (if the material supports it)
-                        // This ensures SSS is visible for emissive/area lights when doing NEE.
-                        {
-                            vec3 V = -unit_vector(current_ray.direction());
-                            colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
-                            if (sss.x() != 0.0 || sss.y() != 0.0 || sss.z() != 0.0) {
-                                result += throughput * sss * (float)(w_light / (pdf_light * num_direct_samples * pick_prob));
-                            }
-                        }
+                        colour Li = surf.emission * (float)((NdotL_light / std::max(1e-4, dist * dist)) * tr);
+                        colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
+                        colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
+                        result += throughput * (direct + sss) * (float)(w_light / (pdf_light * pick_prob * num_direct_samples));
                         did_nee = true;
                     }
                 }
@@ -748,17 +724,17 @@ class camera {
                                 ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
                                 double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
                                 if (tr > 0.0) {
-                                    double G = (NdotL * NdotL_light) / std::max(1e-4, dist * dist);
                                     double pdf_light = 1.0 / std::max(1e-10, surf.area);
                                     double pdf_light_omega = pdf_light * dist * dist / std::max(1e-10, NdotL_light);
-                                    double pdf_bsdf_light = NdotL / pi;
-                                    double w_light = (pdf_light_omega * pdf_light_omega) /
-                                                    (pdf_light_omega * pdf_light_omega + pdf_bsdf_light * pdf_bsdf_light);
-
-                                    colour Li = surf.emission * (float)(G * tr);
                                     vec3 V = -unit_vector(current_ray.direction());
+                                    double pdf_light_omega_total = pdf_light_omega * pick_prob;
+                                    double pdf_bsdf_light = rec.mat->bsdf_pdf(rec, V, Ldir);
+                                    double w_light = (pdf_light_omega_total * pdf_light_omega_total) /
+                                                    (pdf_light_omega_total * pdf_light_omega_total + pdf_bsdf_light * pdf_bsdf_light);
+
+                                    colour Li = surf.emission * (float)((NdotL_light / std::max(1e-4, dist * dist)) * tr);
                                     colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
-                                    result += throughput * sss * (float)(w_light / (pdf_light * 1.0 * pick_prob));
+                                    result += throughput * sss * (float)(w_light / (pdf_light * pick_prob));
                                 }
                             }
                         }
@@ -769,9 +745,7 @@ class camera {
             // Directional sun (camera-mirrored) support: sample soft sun/shadows if enabled.
             // By default we only do this for specular materials or if MIS is disabled.
             // However, SSS needs an explicit direct-light evaluation to be visible.
-            const pbr_material* pbr_for_sun = dynamic_cast<const pbr_material*>(rec.mat.get());
-            const bool do_sss_sun = (pbr_for_sun && pbr_for_sun->sss_strength > 0.0 && pbr_for_sun->sss_model != SSS_NONE);
-            if (use_sun && ((rec.mat->is_specular() || !enable_mis) || do_sss_sun)) {
+            if (use_sun && (rec.mat->is_specular() || !enable_mis || direct_light_samples <= 0)) {
                 // central sun direction (FROM scene toward sun)
                 vec3 Lc = unit_vector(sun_dir);
                 int samples = std::max(1, sun_shadow_samples);
@@ -812,17 +786,9 @@ class camera {
                 if (vis > 0.0) {
                     vec3 V = -unit_vector(current_ray.direction());
 
-                    // Keep existing direct-light behaviour for specular / MIS-disabled.
-                    if (rec.mat->is_specular() || !enable_mis) {
-                        colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance, world);
-                        result += throughput * (direct * (float)vis);
-                    }
-
-                    // Always add SSS when enabled.
-                    if (do_sss_sun) {
-                        colour sss = rec.mat->shade_sss(rec, V, Lc, sun_radiance, world);
-                        result += throughput * (sss * (float)vis);
-                    }
+                    colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance, world);
+                    colour sss = rec.mat->shade_sss(rec, V, Lc, sun_radiance, world);
+                    result += throughput * ((direct + sss) * (float)vis);
                 }
             }
 
@@ -836,82 +802,28 @@ class camera {
             // Point lights: sample one random point light. We normally only do this for
             // specular materials or if MIS is disabled, but SSS needs explicit direct-light
             // evaluation even when MIS is enabled.
-            const pbr_material* pbr_for_pl = dynamic_cast<const pbr_material*>(rec.mat.get());
-            const bool do_sss_pl = (pbr_for_pl && pbr_for_pl->sss_strength > 0.0 && pbr_for_pl->sss_model != SSS_NONE);
-            if (((rec.mat->is_specular() || !enable_mis) || do_sss_pl) && !point_lights.empty()) {
-                // OPTIMIZATION: Sample one random light (importance-weighted) instead of all N lights
-                int num_lights = (int)point_lights.size();
-                
-                // Build importance weights
-                std::vector<double> weights;
-                weights.reserve(num_lights);
-                double total_weight = 0.0;
-                
-                for (const auto& pl : point_lights) {
-                    vec3 toLight = pl.position - rec.p;
-                    double dist = toLight.length();
-                    if (dist <= 1e-6) {
-                        weights.push_back(0.0);
-                        continue;
-                    }
-                    vec3 Ldir = unit_vector(toLight);
-                    double NdotL = dot(rec.normal, Ldir);
-                    if (NdotL <= 0.0) {
-                        weights.push_back(0.0);
-                        continue;
-                    }
-                    if (pl.range > 0.0 && dist > pl.range) {
-                        weights.push_back(0.0);
-                        continue;
-                    }
-                    
-                    // Weight by contribution (inverse-square * NdotL * luminance)
-                    double att = 1.0 / std::max(1e-4, dist * dist);
-                    double lum = 0.2126 * pl.radiance.x() + 0.7152 * pl.radiance.y() + 0.0722 * pl.radiance.z();
-                    double w = att * NdotL * lum;
-                    weights.push_back(w);
-                    total_weight += w;
-                }
-                
-                // Sample one light
+            if ((rec.mat->is_specular() || !enable_mis || direct_light_samples <= 0) && !point_lights.empty()) {
+                double total_weight = total_point_light_sampling_weight(rec.p, rec.normal);
                 if (total_weight > 1e-10) {
-                    double r = random_double() * total_weight;
-                    int sampled_idx = 0;
-                    double accum = 0.0;
-                    for (int li = 0; li < num_lights; ++li) {
-                        accum += weights[li];
-                        if (r <= accum) {
-                            sampled_idx = li;
-                            break;
-                        }
-                    }
-                    
-                    const auto& pl = point_lights[sampled_idx];
-                    double pick_prob = weights[sampled_idx] / total_weight;
-                    
-                    vec3 toLight = pl.position - rec.p;
-                    double dist = toLight.length();
-                    vec3 Ldir = unit_vector(toLight);
+                    const point_light* sampled_light = nullptr;
+                    double pick_prob = 0.0;
+                    if (sample_point_light(rec.p, rec.normal, total_weight, sampled_light, pick_prob)) {
+                        const auto& pl = *sampled_light;
+                        vec3 toLight = pl.position - rec.p;
+                        double dist = toLight.length();
+                        vec3 Ldir = unit_vector(toLight);
 
-                    ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
-                    double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
-                    if (tr > 0.0) {
-                        double att = 1.0 / std::max(1e-4, dist * dist);
-                        colour Li = pl.radiance * (float)(att * tr);
+                        ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
+                        double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
+                        if (tr > 0.0) {
+                            double att = 1.0 / std::max(1e-4, dist * dist);
+                            colour Li = pl.radiance * (float)(att * tr);
 
-                        vec3 V = -unit_vector(current_ray.direction());
+                            vec3 V = -unit_vector(current_ray.direction());
 
-                        // Keep existing direct-light behaviour for specular / MIS-disabled.
-                        if (rec.mat->is_specular() || !enable_mis) {
                             colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
-                            // Scale by 1/pick_prob to account for sampling only one light
-                            result += throughput * direct * (float)(1.0 / pick_prob);
-                        }
-
-                        // Always add SSS when enabled.
-                        if (do_sss_pl) {
                             colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
-                            result += throughput * sss * (float)(1.0 / pick_prob);
+                            result += throughput * (direct + sss) * (float)(1.0 / pick_prob);
                         }
                     }
                 }
@@ -922,10 +834,8 @@ class camera {
             current_ray = scattered;
 
             // Russian roulette after some depth
-            if (depth > 25) {
-                double luminance = 0.2126 * throughput.x()
-                                + 0.7152 * throughput.y()
-                                + 0.0722 * throughput.z();
+            if (depth >= 8) {
+                double luminance = colour_luminance(throughput);
 
                 double p = std::min(std::max(luminance, 0.1), 0.95);
 

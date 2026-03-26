@@ -40,23 +40,23 @@ public:
     // 0.0 = off (stronger = smoother, typical 0.2-0.5), interpreted by OIDN when enabled
     double denoiser_strength = 0.1;
     // Progressive denoising: apply OIDN to partial results during render (like Cycles)
-    bool progressive_denoise = true;
+    bool progressive_denoise = false;
 
     // Photon mapping removed: no-op (was used for caustic photon pre-pass)
 
     // Adaptive sampling: when enabled, the renderer will estimate per-pixel
     // variance and stop sampling a pixel early when its estimate of the
     // pixel mean has sufficiently low standard error.
-    bool adaptive_sampling = false;
+    bool adaptive_sampling = true;
     // Minimum samples before considering stopping (raised for fewer checks)
-    int adaptive_min_samples = 8;
+    int adaptive_min_samples = 16;
     // How often (in samples) to check convergence (raised to reduce overhead)
-    int adaptive_check_interval = 8;
+    int adaptive_check_interval = 16;
     // Relative standard error threshold: stop when std_error/mean < threshold
     // Typical values: 0.01 .. 0.03
-    double adaptive_rel_threshold = 0.02;
+    double adaptive_rel_threshold = 0.03;
     // Absolute standard error fallback (if mean near zero): stop when std_error < abs
-    double adaptive_abs_threshold = 1e-4;
+    double adaptive_abs_threshold = 2e-4;
 
     // OLD signature kept for console main, etc.
     render_result render(

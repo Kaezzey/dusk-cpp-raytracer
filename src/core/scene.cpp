@@ -32,9 +32,10 @@ static bool has_extension_ci(const std::string& path, const char* ext)
 }
 
 // ------------------------------------------------------------
-// Texture cache: map file path -> shared_ptr<texture>
+// Texture cache: map file path + sample-space -> shared_ptr<texture>
 // ------------------------------------------------------------
-static std::shared_ptr<texture> load_scene_texture(const scene& scn, int tex_index)
+static std::shared_ptr<texture> load_scene_texture(const scene& scn, int tex_index,
+                                                   texture_sample_space sample_space = texture_sample_space::srgb_color)
 {
     if (tex_index < 0 || tex_index >= (int)scn.textures.size())
         return nullptr;
@@ -44,15 +45,17 @@ static std::shared_ptr<texture> load_scene_texture(const scene& scn, int tex_ind
     // Cache by path
     static std::unordered_map<std::string, std::weak_ptr<texture>> tex_cache;
 
-    auto it = tex_cache.find(t.path);
+    std::string cache_key = t.path + ((sample_space == texture_sample_space::srgb_color) ? "|srgb" : "|linear");
+
+    auto it = tex_cache.find(cache_key);
     if (it != tex_cache.end()) {
         if (auto existing = it->second.lock()) {
             return existing;
         }
     }
 
-    std::shared_ptr<texture> tex = std::make_shared<image_texture>(t.path.c_str());
-    tex_cache[t.path] = tex;
+    std::shared_ptr<texture> tex = std::make_shared<image_texture>(t.path.c_str(), sample_space);
+    tex_cache[cache_key] = tex;
     return tex;
 }
 
@@ -100,7 +103,7 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 
     case scene_material_model::lambert:
     {
-        auto tex = load_scene_texture(scn, m.albedo_tex);
+        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> base_tex =
             tex ? tex : make_base_colour(m.base_color);
 
@@ -109,7 +112,7 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 
     case scene_material_model::metal:
     {
-        auto tex = load_scene_texture(scn, m.albedo_tex);
+        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> base_tex =
             tex ? tex : make_base_colour(m.base_color);
 
@@ -140,7 +143,7 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 
         vec3 emit_col = base_emit * (float)m.emission_intensity;
 
-        auto tex = load_scene_texture(scn, m.albedo_tex);
+        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> emit_tex =
             tex ? tex : make_base_colour(emit_col);
 
@@ -150,27 +153,27 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
     case scene_material_model::pbr:
     {
         // Base albedo
-        auto base_tex_loaded = load_scene_texture(scn, m.albedo_tex);
+        auto base_tex_loaded = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> base_tex =
             base_tex_loaded ? base_tex_loaded : make_base_colour(m.base_color);
 
         // Metallic scalar -> greyscale texture if no texture bound
-        auto metal_tex_loaded = load_scene_texture(scn, m.metallic_tex);
+        auto metal_tex_loaded = load_scene_texture(scn, m.metallic_tex, texture_sample_space::linear_data);
         std::shared_ptr<texture> metallic_tex =
             metal_tex_loaded ? metal_tex_loaded : make_grey(m.metallic);
 
         // Roughness scalar -> greyscale texture if no texture bound
-        auto rough_tex_loaded = load_scene_texture(scn, m.roughness_tex);
+        auto rough_tex_loaded = load_scene_texture(scn, m.roughness_tex, texture_sample_space::linear_data);
         std::shared_ptr<texture> roughness_tex =
             rough_tex_loaded ? rough_tex_loaded : make_grey(m.roughness);
 
         // Normal map (tangent-space)
         std::shared_ptr<texture> normal_tex =
-            load_scene_texture(scn, m.normal_tex); // can be nullptr
+            load_scene_texture(scn, m.normal_tex, texture_sample_space::linear_data); // can be nullptr
 
         // Alpha map (optional)
         std::shared_ptr<texture> alpha_tex =
-            load_scene_texture(scn, m.alpha_tex); // can be nullptr
+            load_scene_texture(scn, m.alpha_tex, texture_sample_space::linear_data); // can be nullptr
 
         // Force double-sided masking if either an explicit alpha map is
         // provided or the albedo texture contains an alpha channel.
@@ -212,6 +215,8 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
             (float)m.sss_color_override_color.y(),
             (float)m.sss_color_override_color.z()
         );
+        // Unreal PBR packing flag
+        mat->use_unreal_pbr = m.unreal_pbr;
 
         return mat;
     }

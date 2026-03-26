@@ -50,8 +50,10 @@ export void compute_specular(uniform float Nx[], uniform float Ny[], uniform flo
         uniform float denom = (NdotH*NdotH)*(a2 - 1.0f) + 1.0f;
         uniform float D = (a2) / (3.14159265f * denom * denom + 1e-12f);
 
-        // Geometry (Schlick-GGX)
-        uniform float k = (a2) * 0.5f;
+        // Geometry (Schlick-GGX) with analytic-light roughness remap
+        uniform float rough = sqrt(max(a, 0.0f));
+        uniform float k = rough + 1.0f;
+        k = (k * k) * 0.125f;
         uniform float geomV = NdotV / (NdotV * (1.0f - k) + k);
         uniform float geomL = NdotL / (NdotL * (1.0f - k) + k);
         uniform float G = geomV * geomL;
@@ -137,7 +139,9 @@ export void compute_shade(uniform float Ngeomx[], uniform float Ngeomy[], unifor
         uniform float a = alpha[i]; uniform float a2 = a*a;
         uniform float denom = (NdotH*NdotH)*(a2 - 1.0f) + 1.0f;
         uniform float D = (a2) / (3.14159265f * denom * denom + 1e-12f);
-        uniform float k = (a2) * 0.5f;
+        uniform float rough = sqrt(max(a, 0.0f));
+        uniform float k = rough + 1.0f;
+        k = (k * k) * 0.125f;
         uniform float geomV = NdotV / (NdotV * (1.0f - k) + k);
         uniform float geomL = NdotL / (NdotL * (1.0f - k) + k);
         uniform float G = geomV * geomL;
@@ -161,8 +165,7 @@ export void compute_shade(uniform float Ngeomx[], uniform float Ngeomy[], unifor
         uniform float specb = spec_factor * Fb * NdotL;
 
         // diffuse
-        uniform float Favg = (F0r_v + F0g_v + F0b_v) * (1.0f/3.0f);
-        uniform float kdiff = (1.0f - metall) * (1.0f - Favg);
+        uniform float kdiff = (1.0f - metall);
         uniform float dr = baser_v * kdiff * (1.0f / 3.14159265f);
         uniform float dg = baseg_v * kdiff * (1.0f / 3.14159265f);
         uniform float db = baseb_v * kdiff * (1.0f / 3.14159265f);

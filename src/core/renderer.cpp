@@ -43,39 +43,34 @@ render_result renderer::render(
 {
     using clock = std::chrono::steady_clock;
 
-    std::fprintf(stderr, "[RENDERER] initialize() starting...\n");
     cam.initialize();
-    std::fprintf(stderr, "[RENDERER] initialize() complete\n");
 
-    std::fprintf(stderr, "[RENDERER] Allocating render_result structure...\n");
     render_result out;
     out.width  = cam.image_width;
     out.height = cam.image_height;
-    std::fprintf(stderr, "[RENDERER] Resizing output pixel buffer: %dx%d = %zu pixels\n", 
-        out.width, out.height, (size_t)out.width * out.height);
     out.pixels.resize(out.width * out.height * 3);
-    std::fprintf(stderr, "[RENDERER] Output buffer allocated\n");
 
     const int w  = out.width;
     const int h = out.height;
     const int spp    = cam.samples_per_pixel;
     const int depth  = cam.max_depth;
+    const bool need_aux_aovs = this->use_denoiser;
+    const bool use_primary_prehit = false;
 
-    std::fprintf(stderr, "[RENDERER] Allocating HDR buffers (%dx%d)...\n", w, h);
     // HDR linear float buffer (3 floats per pixel) used for optional denoising
     std::vector<float> hdr_buffer((size_t)w * (size_t)h * 3, 0.0f);
-    std::fprintf(stderr, "[RENDERER] HDR buffer allocated\n");
     // Albedo (base color) and normal AOVs for OIDN guidance
-    std::vector<float> albedo_buffer((size_t)w * (size_t)h * 3, 0.0f);
-    std::fprintf(stderr, "[RENDERER] Albedo buffer allocated\n");
-    std::vector<float> normal_buffer((size_t)w * (size_t)h * 3, 0.0f);
-    std::fprintf(stderr, "[RENDERER] Normal buffer allocated\n");
+    std::vector<float> albedo_buffer;
+    std::vector<float> normal_buffer;
+    if (need_aux_aovs) {
+        albedo_buffer.resize((size_t)w * (size_t)h * 3, 0.0f);
+        normal_buffer.resize((size_t)w * (size_t)h * 3, 0.0f);
+    }
 
     const int total_scanlines = h;
-    const int chunk_size      = 4; // update ETA every N lines
-    const int progress_min_interval_ms = 500; // throttle partial updates
-    const int progress_denoise_interval_ms = 10000; // denoise less frequently (every 10 seconds)
-    const int progress_denoise_hold_ms = 9000; // hold cached denoised result for this many ms to avoid flicker
+    const int progress_min_interval_ms = 1500; // throttle partial updates aggressively
+    const int progress_denoise_interval_ms = 30000; // OIDN during render is expensive; keep it rare
+    const int progress_denoise_hold_ms = 25000; // hold cached denoised result to avoid flicker/churn
 
     // Rolling average per-tile time (seconds). Updated under critical section.
     std::atomic<double> avg_tile_time{0.0};
@@ -98,23 +93,14 @@ render_result renderer::render(
     }
 
     auto render_start = clock::now();
-    // Chunk timing used by scanline progress updates (kept as fallback)
-    auto chunk_start = render_start;
-    int    accumulated_lines = 0;
-    double accumulated_time  = 0.0;
-    double eta_longterm      = 0.0;
-    double eta_shortterm     = 0.0;
-
     static const interval intensity(0.000, 0.999);
 
-    std::fprintf(stderr, "[RENDERER] Setting up tile-based rendering...\n");
     // Tile-based parallel rendering: reduces OpenMP scheduling overhead
     const int tile_w = 32;
     const int tile_h = 32;
     const int num_tiles_x = (w + tile_w - 1) / tile_w;
     const int num_tiles_y = (h + tile_h - 1) / tile_h;
     const int num_tiles = num_tiles_x * num_tiles_y;
-    std::fprintf(stderr, "[RENDERER] Tile config: %dx%d tiles, %d total\n", num_tiles_x, num_tiles_y, num_tiles);
     // Tile progress bookkeeping (used for ETA calculation)
     std::atomic<int> completed_tiles{0};
 
@@ -135,13 +121,8 @@ render_result renderer::render(
     int worker_count = 1;
 #ifdef _OPENMP
     worker_count = std::max(1, omp_get_max_threads());
-    std::fprintf(stderr, "[RENDERER] OpenMP enabled: %d worker threads\n", worker_count);
-#else
-    std::fprintf(stderr, "[RENDERER] Single-threaded mode\n");
 #endif
 
-    std::fprintf(stderr, "[RENDERER] Allocating per-thread buffers (%d threads, %d pixels/tile)...\n", 
-        worker_count, max_tile_pixels);
     // Per-thread storage
     std::vector<std::vector<hit_record>> thread_first_rec(worker_count);
     std::vector<std::vector<char>>       thread_first_hit(worker_count);
@@ -150,29 +131,20 @@ render_result renderer::render(
     std::vector<std::vector<int>>        thread_tile_idxf(worker_count);
 
     for (int t = 0; t < worker_count; ++t) {
-        thread_first_rec[t].resize(max_first_size);
-        thread_first_hit[t].resize(max_first_size);
-        thread_tile_direct[t].resize(max_first_size, colour(0,0,0));
-        thread_tile_normals[t].reserve(max_tile_pixels * 3);
-        thread_tile_idxf[t].reserve(max_tile_pixels);
+        if (use_primary_prehit) {
+            thread_first_rec[t].resize(max_first_size);
+            thread_first_hit[t].resize(max_first_size);
+            thread_tile_direct[t].resize(max_first_size, colour(0,0,0));
+        }
+        if (need_aux_aovs) {
+            thread_tile_normals[t].reserve(max_tile_pixels * 3);
+            thread_tile_idxf[t].reserve(max_tile_pixels);
+        }
     }
-    std::fprintf(stderr, "[RENDERER] Per-thread buffers allocated\n");
 
-    std::fprintf(stderr, "[RENDERER] Starting parallel tile loop...\n");
     // Force a consistent number of threads to match preallocated buffers
     #pragma omp parallel for schedule(dynamic,1) num_threads(worker_count)
     for (int ti = 0; ti < num_tiles; ++ti) {
-        if (ti == 0) {
-            std::fprintf(stderr, "[RENDERER] First tile starting (thread %d)\n", 
-#ifdef _OPENMP
-                omp_get_thread_num()
-#else
-                0
-#endif
-            );
-            std::fflush(stderr);
-        }
-        
         if (cancel_flag && cancel_flag->load()) continue;
 
         int tid = 0;
@@ -183,8 +155,6 @@ render_result renderer::render(
         if (tid < 0 || tid >= worker_count) {
             tid = tid % std::max(1, worker_count);
         }
-
-        if (ti == 0) { std::fprintf(stderr, "[TILE0] tid=%d\n", tid); std::fflush(stderr); }
 
         int tx = ti % num_tiles_x;
         int ty = ti / num_tiles_x;
@@ -199,26 +169,32 @@ render_result renderer::render(
 
         auto& tile_normals = thread_tile_normals[tid];
         auto& tile_idxf = thread_tile_idxf[tid];
-        tile_normals.clear();
-        tile_idxf.clear();
-        tile_normals.reserve((x1 - x0) * (y1 - y0) * 3);
-        tile_idxf.reserve((x1 - x0) * (y1 - y0));
+        if (need_aux_aovs) {
+            tile_normals.clear();
+            tile_idxf.clear();
+            tile_normals.reserve((x1 - x0) * (y1 - y0) * 3);
+            tile_idxf.reserve((x1 - x0) * (y1 - y0));
+        }
 
         auto& tile_first_rec = thread_first_rec[tid];
         auto& tile_first_hit = thread_first_hit[tid];
-        if (tile_first_rec.size() < needed_first) {
-            tile_first_rec.resize(needed_first);
-            tile_first_hit.resize(needed_first);
+        if (use_primary_prehit) {
+            if (tile_first_rec.size() < needed_first) {
+                tile_first_rec.resize(needed_first);
+                tile_first_hit.resize(needed_first);
+            }
+            // reset hit flags for the active range
+            std::fill_n(tile_first_hit.data(), (size_t)needed_first, (char)0);
         }
-        // reset hit flags for the active range
-        std::fill_n(tile_first_hit.data(), (size_t)needed_first, (char)0);
 
         // Try to obtain a pointer to a top-level BVH to use packet traversal.
         const bvh_node* top_bvh = nullptr;
-        if (auto wl = dynamic_cast<const hittable_list*>(&world)) {
-            if (!wl->objects.empty()) {
-                // Object[0] is expected to be the top-level BVH node constructed in scene builder
-                top_bvh = dynamic_cast<const bvh_node*>(wl->objects[0].get());
+        if (use_primary_prehit) {
+            if (auto wl = dynamic_cast<const hittable_list*>(&world)) {
+                if (!wl->objects.empty()) {
+                    // Object[0] is expected to be the top-level BVH node constructed in scene builder
+                    top_bvh = dynamic_cast<const bvh_node*>(wl->objects[0].get());
+                }
             }
         }
         
@@ -258,8 +234,10 @@ render_result renderer::render(
 
         // Prepare per-tile precomputed direct lighting (for first-hit only)
         auto& tile_direct = thread_tile_direct[tid];
-        if (tile_direct.size() < needed_first) tile_direct.resize(needed_first);
-        std::fill_n(tile_direct.data(), needed_first, colour(0,0,0));
+        if (use_primary_prehit) {
+            if (tile_direct.size() < needed_first) tile_direct.resize(needed_first);
+            std::fill_n(tile_direct.data(), needed_first, colour(0,0,0));
+        }
 
         // Per-tile timer (start before any work)
         auto tile_start = clock::now();
@@ -418,7 +396,17 @@ render_result renderer::render(
                                 colour n_tex = colour(0.5f, 0.5f, 1.0f);
                                 float nstrength = 0.0f;
                                 if (pbr) {
-                                    if (pbr->metallic_tex) metallic_v = (float)pbr->metallic_tex->value(rec.u, rec.v, rec.p).x();
+                                    if (pbr->metallic_tex) {
+                                        // Sample metallic/roughness textures. Default: R channel = metallic, G = roughness.
+                                        // If Unreal packing is enabled, interpret G=roughness, B=metallic.
+                                        colour mr = pbr->metallic_tex->value(rec.u, rec.v, rec.p);
+                                        if (pbr->use_unreal_pbr) {
+                                            rough_v = (float)mr.g();
+                                            metallic_v = (float)mr.b();
+                                        } else {
+                                            metallic_v = (float)mr.x();
+                                        }
+                                    }
                                     if (pbr->roughness_tex) rough_v = (float)pbr->roughness_tex->value(rec.u, rec.v, rec.p).x();
                                     dielectricF0 = pbr->dielectric_F0;
                                     base = pbr->albedo(rec);
@@ -675,7 +663,7 @@ render_result renderer::render(
                 vec3   samp_normal(0,0,0);
                 const hit_record* prehit_ptr = nullptr;
                 const colour* precomputed_direct_ptr = nullptr;
-                if (top_bvh) {
+                if (use_primary_prehit && top_bvh) {
                     int local_idx = (j - y0) * (x1 - x0) + (i - x0);
                     int idx = s * tile_w_pixels + local_idx;
                     if (local_idx >= 0 && idx >= 0 && idx < (int)tile_first_hit.size() && tile_first_hit[idx]) {
@@ -683,7 +671,9 @@ render_result renderer::render(
                         precomputed_direct_ptr = &tile_direct[idx];
                     }
                 }
-                samp = cam.ray_colour(r, depth, world, &samp_albedo, &samp_normal, prehit_ptr, precomputed_direct_ptr);
+                colour* albedo_out = need_aux_aovs ? &samp_albedo : nullptr;
+                vec3* normal_out = need_aux_aovs ? &samp_normal : nullptr;
+                samp = cam.ray_colour(r, depth, world, albedo_out, normal_out, prehit_ptr, precomputed_direct_ptr);
 
                 double sr = samp_sanitize(samp.x());
                 double sg = samp_sanitize(samp.y());
@@ -722,21 +712,23 @@ render_result renderer::render(
                 mean_b += delta_b / n;
                 m2_b += delta_b * (sb - mean_b);
 
-                // Incremental mean for albedo (per-channel)
-                double ar = samp_albedo.x();
-                double ag = samp_albedo.y();
-                double ab = samp_albedo.z();
-                double delta_ar = ar - mean_ar;
-                mean_ar += delta_ar / n;
-                double delta_ag = ag - mean_ag;
-                mean_ag += delta_ag / n;
-                double delta_ab = ab - mean_ab;
-                mean_ab += delta_ab / n;
+                if (need_aux_aovs) {
+                    // Incremental mean for albedo (per-channel)
+                    double ar = samp_albedo.x();
+                    double ag = samp_albedo.y();
+                    double ab = samp_albedo.z();
+                    double delta_ar = ar - mean_ar;
+                    mean_ar += delta_ar / n;
+                    double delta_ag = ag - mean_ag;
+                    mean_ag += delta_ag / n;
+                    double delta_ab = ab - mean_ab;
+                    mean_ab += delta_ab / n;
 
-                // Accumulate normals as simple vector sum (will normalize at end)
-                normal_sum_x += samp_normal.x();
-                normal_sum_y += samp_normal.y();
-                normal_sum_z += samp_normal.z();
+                    // Accumulate normals as simple vector sum (will normalize at end)
+                    normal_sum_x += samp_normal.x();
+                    normal_sum_y += samp_normal.y();
+                    normal_sum_z += samp_normal.z();
+                }
 
                 // Adaptive convergence check: after min samples and on intervals
                 if (adaptive && n >= min_samples && (n % check_interval) == 0) {
@@ -775,14 +767,17 @@ render_result renderer::render(
             double a_lin_g = mean_ag;
             double a_lin_b = mean_ab;
 
-            // finalize normal (average and renormalize)
-            vec3 avgN((float)(normal_sum_x * scale), (float)(normal_sum_y * scale), (float)(normal_sum_z * scale));
-            // Defer normalization: compute destination index and push raw vector into tile-local buffer
             int idxf = 3 * (j * w + i);
-            tile_normals.push_back(avgN.x());
-            tile_normals.push_back(avgN.y());
-            tile_normals.push_back(avgN.z());
-            tile_idxf.push_back(idxf);
+            vec3 avgN(0, 0, 0);
+            if (need_aux_aovs) {
+                // finalize normal (average and renormalize)
+                avgN = vec3((float)(normal_sum_x * scale), (float)(normal_sum_y * scale), (float)(normal_sum_z * scale));
+                // Defer normalization: compute destination index and push raw vector into tile-local buffer
+                tile_normals.push_back(avgN.x());
+                tile_normals.push_back(avgN.y());
+                tile_normals.push_back(avgN.z());
+                tile_idxf.push_back(idxf);
+            }
 
             // Sanitize components to avoid NaN/Inf and extremely large values
             auto sanitize = [](double v) -> double {
@@ -804,15 +799,17 @@ render_result renderer::render(
             hdr_buffer[idxf + 0] = (float)r_lin;
             hdr_buffer[idxf + 1] = (float)g_lin;
             hdr_buffer[idxf + 2] = (float)b_lin;
-            // Store albedo AOV (mean albedo per pixel)
-            albedo_buffer[idxf + 0] = (float)a_lin_r;
-            albedo_buffer[idxf + 1] = (float)a_lin_g;
-            albedo_buffer[idxf + 2] = (float)a_lin_b;
+            if (need_aux_aovs) {
+                // Store albedo AOV (mean albedo per pixel)
+                albedo_buffer[idxf + 0] = (float)a_lin_r;
+                albedo_buffer[idxf + 1] = (float)a_lin_g;
+                albedo_buffer[idxf + 2] = (float)a_lin_b;
 
-            // Store normal AOV (normalized average normal)
-            normal_buffer[idxf + 0] = avgN.x();
-            normal_buffer[idxf + 1] = avgN.y();
-            normal_buffer[idxf + 2] = avgN.z();
+                // Store normal AOV (normalized average normal)
+                normal_buffer[idxf + 0] = avgN.x();
+                normal_buffer[idxf + 1] = avgN.y();
+                normal_buffer[idxf + 2] = avgN.z();
+            }
         }
 
         if (progress) {
@@ -835,10 +832,10 @@ render_result renderer::render(
             if (now_ms - last_ms >= progress_min_interval_ms) {
                 if (s_last_progress_ms.compare_exchange_strong(last_ms, now_ms)) {
                     // Apply progressive denoising if enabled (with separate, less frequent throttle)
-                    std::vector<float> display_hdr = hdr_buffer;
-                    bool denoised = false;
+                    const std::vector<float>* display_hdr = &hdr_buffer;
+                    std::vector<float> display_hdr_copy;
 #ifdef HAVE_OIDN
-                    if (this->progressive_denoise && this->use_denoiser && this->denoiser_strength > 0.0) {
+                    if (need_aux_aovs && this->progressive_denoise && this->use_denoiser && this->denoiser_strength > 0.0) {
                         long long last_denoise_ms = s_last_denoise_ms.load();
                         // Only denoise if enough time has passed AND we're not cancelled
                         if (now_ms - last_denoise_ms >= progress_denoise_interval_ms && 
@@ -899,7 +896,6 @@ render_result renderer::render(
                                                                 std::memcpy(s_cached_denoised_hdr.data(), outPtr, bufBytes);
                                                             }
                                                             s_cached_denoised_ts.store(now_ms);
-                                                            denoised = true;
                                                         }
                                                     }
                                                 }
@@ -920,10 +916,12 @@ render_result renderer::render(
                     // stable partial display to avoid flicker between noisy/denoised.
                     {
                         long long cached_ts = s_cached_denoised_ts.load();
-                        if (cached_ts != 0 && (now_ms - cached_ts) <= progress_denoise_hold_ms) {
+                        if (need_aux_aovs && cached_ts != 0 && (now_ms - cached_ts) <= progress_denoise_hold_ms) {
                             std::lock_guard<std::mutex> cache_lock(s_cached_denoised_mutex);
-                            if (s_cached_denoised_hdr.size() == display_hdr.size()) {
-                                std::memcpy(display_hdr.data(), s_cached_denoised_hdr.data(), display_hdr.size() * sizeof(float));
+                            if (s_cached_denoised_hdr.size() == hdr_buffer.size()) {
+                                display_hdr_copy.resize(hdr_buffer.size());
+                                std::memcpy(display_hdr_copy.data(), s_cached_denoised_hdr.data(), hdr_buffer.size() * sizeof(float));
+                                display_hdr = &display_hdr_copy;
                             }
                         }
                     }
@@ -957,9 +955,9 @@ render_result renderer::render(
                             int idx = 3 * (yy * w + xx);
                             if (done_line) {
                                 int hidx = idx;
-                                double r_lin = (double)display_hdr[hidx + 0];
-                                double g_lin = (double)display_hdr[hidx + 1];
-                                double b_lin = (double)display_hdr[hidx + 2];
+                                double r_lin = (double)(*display_hdr)[hidx + 0];
+                                double g_lin = (double)(*display_hdr)[hidx + 1];
+                                double b_lin = (double)(*display_hdr)[hidx + 2];
                                 double r_t, g_t, b_t;
                                 tonemap_reinhard_lum(r_lin, g_lin, b_lin, r_t, g_t, b_t);
                                 double r_g = linear_to_gamma(r_t);
@@ -987,7 +985,7 @@ render_result renderer::render(
     }
 
         // After finishing a tile, batch-normalize the collected normals (fast path)
-        int normals_count = (int)tile_idxf.size();
+        int normals_count = need_aux_aovs ? (int)tile_idxf.size() : 0;
         if (normals_count > 0) {
             // normalize in-place (ISPC optimized when available)
             ispc_normalize_batch(tile_normals.data(), normals_count);
@@ -1065,42 +1063,11 @@ render_result renderer::render(
     denoised_buffer = hdr_buffer; // default: copy
 
 #ifdef HAVE_OIDN
-    if (this->use_denoiser) {
+    if (this->use_denoiser && need_aux_aovs) {
         try {
-            // Compute basic HDR statistics before denoising
-            double min_lum = std::numeric_limits<double>::infinity();
-            double max_lum = 0.0;
-            double sum_lum = 0.0;
-            double sum_rgb = 0.0;
             const int pixels = w * h;
-            for (int p = 0; p < pixels; ++p) {
-                int id = 3 * p;
-                double r = (double)hdr_buffer[id + 0];
-                double g = (double)hdr_buffer[id + 1];
-                double b = (double)hdr_buffer[id + 2];
-                double lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                if (lum < min_lum) min_lum = lum;
-                if (lum > max_lum) max_lum = lum;
-                sum_lum += lum;
-                sum_rgb += std::abs(r) + std::abs(g) + std::abs(b);
-            }
-            double mean_lum = sum_lum / std::max(1, pixels);
-            std::fprintf(stdout, "OIDN: starting denoiser (strength=%.3f) -- pre stats: min=%.6e max=%.6e mean=%.6e sumRGB=%.6e\n",
-                         (double)this->denoiser_strength, min_lum, max_lum, mean_lum, sum_rgb);
-
-            // Also append a small line to the debug stats file recording the strength used
-            {
-                FILE* df = std::fopen("Renders/Debug_OIDN_stats.txt", "a");
-                if (df) {
-                    std::fprintf(df, "OIDN_RUN: strength=%.6f pre_min=%.6e pre_max=%.6e pre_mean=%.6e\n",
-                                 (double)this->denoiser_strength, min_lum, max_lum, mean_lum);
-                    std::fclose(df);
-                }
-            }
-
             oidn::DeviceRef device = oidn::newDevice();
             device.commit();
-
             oidn::FilterRef filter = device.newFilter("RT");
 
             // Create device-accessible buffers and copy host HDR data into them
@@ -1140,111 +1107,6 @@ render_result renderer::render(
             void* outPtr = outBuf.getData();
             if (outPtr) {
                 std::memcpy(denoised_buffer.data(), outPtr, bufBytes);
-            }
-
-            // Release device-side resources ASAP to avoid holding large device allocations
-            filter = oidn::FilterRef();
-            colorBuf = oidn::BufferRef();
-            albedoBuf = oidn::BufferRef();
-            normalBuf = oidn::BufferRef();
-            outBuf = oidn::BufferRef();
-            // Note: device can be reused but we destroy it to free potential backend memory
-            device = oidn::DeviceRef();
-
-            // Check for device errors reported by OIDN
-            {
-                const char* errorMessage = nullptr;
-                if (device.getError(errorMessage) != oidn::Error::None) {
-                    std::fprintf(stderr, "OIDN device error after execute: %s\n", errorMessage ? errorMessage : "(null)");
-                }
-            }
-
-            // Compute HDR statistics after denoising and a simple diff metric
-            double min_lum2 = std::numeric_limits<double>::infinity();
-            double max_lum2 = 0.0;
-            double sum_lum2 = 0.0;
-            double sum_rgb2 = 0.0;
-            double sum_abs_diff = 0.0;
-            for (int p = 0; p < pixels; ++p) {
-                int id = 3 * p;
-                double r = (double)denoised_buffer[id + 0];
-                double g = (double)denoised_buffer[id + 1];
-                double b = (double)denoised_buffer[id + 2];
-                double lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                if (lum < min_lum2) min_lum2 = lum;
-                if (lum > max_lum2) max_lum2 = lum;
-                sum_lum2 += lum;
-                sum_rgb2 += std::abs(r) + std::abs(g) + std::abs(b);
-                // abs diff from original
-                double r0 = (double)hdr_buffer[id + 0];
-                double g0 = (double)hdr_buffer[id + 1];
-                double b0 = (double)hdr_buffer[id + 2];
-                sum_abs_diff += std::abs(r - r0) + std::abs(g - g0) + std::abs(b - b0);
-            }
-            double mean_lum2 = sum_lum2 / std::max(1, pixels);
-            std::fprintf(stdout, "OIDN: denoiser finished -- post stats: min=%.6e max=%.6e mean=%.6e sumRGB=%.6e absDiffSum=%.6e\n",
-                         min_lum2, max_lum2, mean_lum2, sum_rgb2, sum_abs_diff);
-
-            if (sum_abs_diff == 0.0) {
-                std::fprintf(stdout, "OIDN: WARNING: denoised buffer identical to input (absDiffSum == 0).\n");
-            }
-
-            // Write tonemapped debug PPMs for visual comparison
-            try {
-                render_result dbg_orig;
-                render_result dbg_den;
-                dbg_orig.width = w; dbg_orig.height = h; dbg_orig.pixels.resize(w * h * 3);
-                dbg_den.width = w; dbg_den.height = h; dbg_den.pixels.resize(w * h * 3);
-
-                for (int p = 0; p < pixels; ++p) {
-                    int id = 3 * p;
-                    auto tonemap_and_pack = [&](const float* src, std::uint8_t* dst) {
-                        double r_lin = (double)src[id + 0];
-                        double g_lin = (double)src[id + 1];
-                        double b_lin = (double)src[id + 2];
-                        // Luminance-based Reinhard tone mapping (preserves color saturation)
-                        double lum = 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin;
-                        double r_t, g_t, b_t;
-                        if (lum < 1e-6) {
-                            r_t = g_t = b_t = 0.0;
-                        } else {
-                            double lum_compressed = lum / (lum + 1.0);
-                            double scale = lum_compressed / lum;
-                            r_t = r_lin * scale;
-                            g_t = g_lin * scale;
-                            b_t = b_lin * scale;
-                        }
-                        double r_g = linear_to_gamma(r_t);
-                        double g_g = linear_to_gamma(g_t);
-                        double b_g = linear_to_gamma(b_t);
-                        auto clamp01 = [&](double v){ if (!std::isfinite(v) || v < 0.0) return 0.0; if (v>0.999) return 0.999; return v; };
-                        dst[id + 0] = (std::uint8_t)(int(256 * clamp01(r_g)));
-                        dst[id + 1] = (std::uint8_t)(int(256 * clamp01(g_g)));
-                        dst[id + 2] = (std::uint8_t)(int(256 * clamp01(b_g)));
-                    };
-
-                    tonemap_and_pack(hdr_buffer.data(), dbg_orig.pixels.data());
-                    tonemap_and_pack(denoised_buffer.data(), dbg_den.pixels.data());
-                }
-
-            } catch (...) {
-                // don't let debug IO break the render
-            }
-
-            // Also append stats to a small debug file so user can inspect them without a console
-            {
-                FILE* f = std::fopen("Renders/Debug_OIDN_stats.txt", "a");
-                if (f) {
-                    std::fprintf(f, "pre:  min=%.6e max=%.6e mean=%.6e sumRGB=%.6e\n",
-                                 min_lum, max_lum, mean_lum, sum_rgb);
-                    std::fprintf(f, "post: min=%.6e max=%.6e mean=%.6e sumRGB=%.6e absDiffSum=%.6e\n",
-                                 min_lum2, max_lum2, mean_lum2, sum_rgb2, sum_abs_diff);
-                    if (sum_abs_diff == 0.0) {
-                        std::fprintf(f, "WARNING: Denoised buffer identical to input (absDiffSum == 0).\n");
-                    }
-                    std::fprintf(f, "\n");
-                    std::fclose(f);
-                }
             }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "OIDN exception: %s\n", e.what());
@@ -1301,6 +1163,8 @@ render_result renderer::render(
     // Free large temporary HDR buffers before returning to reduce peak resident memory
     {
         std::vector<float>().swap(hdr_buffer);
+        std::vector<float>().swap(albedo_buffer);
+        std::vector<float>().swap(normal_buffer);
         std::vector<float>().swap(denoised_buffer);
     }
 
