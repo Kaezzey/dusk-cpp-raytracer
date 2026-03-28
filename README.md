@@ -12,8 +12,10 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 ---
 
 ## Active Editor
-<img width="2560" alt="Dusktracer Editor" src="https://github.com/user-attachments/assets/dc21bea5-6b67-4773-aad5-7f60da5d536c" />
+<img width="2560" height="1395" alt="image" src="https://github.com/user-attachments/assets/f0226789-c9c9-4805-a88c-a86439ff9a09" />
 <img width="2560" height="1440" alt="CornellBoxHero" src="https://github.com/user-attachments/assets/1d30c475-d0f5-4bd1-8490-e4351e90b866" />
+<img width="2560" height="1395" alt="image" src="https://github.com/user-attachments/assets/f321a3e5-4f85-4e6c-8f18-1c0e86031269" />
+
 
 ---
 
@@ -31,6 +33,8 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 - Embree path UV interpolation fix to ensure correct texture sampling on hardware-accelerated geometry
 
 ### Editor Features
+- Unreal-like shader graph editor
+- Content Drawer (ctrl + spacebar)
 - GPU-based picking via RGB8 ID buffer  
 - Screen-space gizmo: axis translation with closest-point ray math  
 - Scene Hierarchy, Inspector, and Material Editor  
