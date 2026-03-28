@@ -121,7 +121,10 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 
     case scene_material_model::dielectric:
     {
-        // assuming your dielectric ctor is (double ior, colour tint)
+        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
+        if (tex) {
+            return std::make_shared<dielectric>(m.ior, tex);
+        }
         return std::make_shared<dielectric>(
             m.ior,
             colour(m.base_color.x(),
@@ -222,9 +225,12 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
     }
 
     case scene_material_model::isotropic:
-        // If you actually use isotropic for volumes, wire it properly.
-        // For now, simple diffuse fallback:
-        return std::make_shared<lambertian>(make_base_colour(m.base_color));
+    {
+        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
+        std::shared_ptr<texture> base_tex =
+            tex ? tex : make_base_colour(m.base_color);
+        return std::make_shared<isotropic>(base_tex);
+    }
     }
 
     // Fallback if model enum is invalid
