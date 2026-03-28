@@ -55,6 +55,7 @@ render_result renderer::render(
     const int spp    = cam.samples_per_pixel;
     const int depth  = cam.max_depth;
     const bool need_aux_aovs = this->use_denoiser;
+    const bool enable_progressive_updates = (bool)progress_callback;
     const bool use_primary_prehit = false;
 
     // HDR linear float buffer (3 floats per pixel) used for optional denoising
@@ -75,7 +76,7 @@ render_result renderer::render(
     // Rolling average per-tile time (seconds). Updated under critical section.
     std::atomic<double> avg_tile_time{0.0};
     // Track which scanlines are fully written to HDR buffer
-    std::vector<char> row_done(h, 0);
+    std::vector<char> row_done(enable_progressive_updates ? (size_t)h : 0, 0);
 
     // Throttle progress callbacks across all OMP workers
     static std::atomic<long long> s_last_progress_ms{0};
@@ -818,11 +819,13 @@ render_result renderer::render(
             ++progress->completed_scanlines; // atomic
         }
 
-        // Mark this scanline as complete for safe partial display
-        row_done[j] = 1;
+        if (enable_progressive_updates) {
+            // Mark this scanline as complete for safe partial display
+            row_done[j] = 1;
+        }
 
         // Outside critical section: throttled partial image callback
-        if (progress_callback) {
+        if (enable_progressive_updates) {
             // Check cancel flag first - don't waste time on callbacks if cancelled
             if (cancel_flag && cancel_flag->load()) continue;
             

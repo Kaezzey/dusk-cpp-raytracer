@@ -95,6 +95,8 @@ static renderer            g_renderer;
 static editor_camera_state g_editor_cam;
 static std::atomic<bool>   g_cancel_flag{false};
 static bool                g_scene_initialized = false;
+static ImFont*             g_ui_font_body = nullptr;
+static ImFont*             g_ui_font_heading = nullptr;
 
 // Viewport focus/hover state
 static bool g_viewport_focused = false;
@@ -134,6 +136,171 @@ static std::unordered_map<std::string, CpuImage> g_texture_cpu_cache;
 static std::mutex g_texture_cpu_cache_mutex;
 static std::atomic<bool> g_asset_preloader_running{false};
 static std::thread g_asset_preloader_thread;
+
+static ImFont* TryLoadFont(ImGuiIO& io, const std::initializer_list<const char*>& candidates, float size, const ImFontConfig* cfg = nullptr)
+{
+    for (const char* candidate : candidates) {
+        if (!candidate) continue;
+        std::error_code ec;
+        if (!std::filesystem::exists(candidate, ec)) continue;
+        if (ImFont* font = io.Fonts->AddFontFromFileTTF(candidate, size, cfg)) {
+            return font;
+        }
+    }
+    return nullptr;
+}
+
+static void SetupEditorFonts(ImGuiIO& io)
+{
+    ImFontConfig body_cfg;
+    body_cfg.OversampleH = 2;
+    body_cfg.OversampleV = 2;
+    body_cfg.PixelSnapH = false;
+    body_cfg.RasterizerMultiply = 1.05f;
+    g_ui_font_body = TryLoadFont(
+        io,
+        {
+            "C:/Windows/Fonts/segoeui.ttf",
+            "C:/Windows/Fonts/Inter-Regular.ttf",
+            "C:/Windows/Fonts/arial.ttf"
+        },
+        17.0f,
+        &body_cfg
+    );
+
+    ImFontConfig heading_cfg = body_cfg;
+    heading_cfg.RasterizerMultiply = 1.10f;
+    g_ui_font_heading = TryLoadFont(
+        io,
+        {
+            "C:/Windows/Fonts/segoeuib.ttf",
+            "C:/Windows/Fonts/bahnschrift.ttf",
+            "C:/Windows/Fonts/arialbd.ttf"
+        },
+        19.0f,
+        &heading_cfg
+    );
+
+    if (!g_ui_font_body) {
+        g_ui_font_body = io.Fonts->AddFontDefault();
+    }
+    if (!g_ui_font_heading) {
+        g_ui_font_heading = g_ui_font_body;
+    }
+    io.FontDefault = g_ui_font_body;
+}
+
+static void ApplyModernEditorTheme()
+{
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec4* colors = style.Colors;
+
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(10.0f, 7.0f);
+    style.CellPadding = ImVec2(10.0f, 8.0f);
+    style.ItemSpacing = ImVec2(10.0f, 8.0f);
+    style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
+    style.TouchExtraPadding = ImVec2(0.0f, 0.0f);
+    style.IndentSpacing = 20.0f;
+    style.ScrollbarSize = 14.0f;
+    style.GrabMinSize = 10.0f;
+
+    style.WindowRounding = 0.0f;
+    style.ChildRounding = 0.0f;
+    style.FrameRounding = 0.0f;
+    style.PopupRounding = 0.0f;
+    style.ScrollbarRounding = 0.0f;
+    style.GrabRounding = 0.0f;
+    style.TabRounding = 0.0f;
+
+    style.WindowBorderSize = 1.0f;
+    style.ChildBorderSize = 1.0f;
+    style.PopupBorderSize = 1.0f;
+    style.FrameBorderSize = 1.0f;
+    style.TabBorderSize = 1.0f;
+
+    colors[ImGuiCol_Text]                  = ImVec4(0.95f, 0.97f, 0.99f, 1.00f);
+    colors[ImGuiCol_TextDisabled]          = ImVec4(0.56f, 0.63f, 0.70f, 1.00f);
+    colors[ImGuiCol_WindowBg]              = ImVec4(0.08f, 0.10f, 0.13f, 0.98f);
+    colors[ImGuiCol_ChildBg]               = ImVec4(0.10f, 0.12f, 0.16f, 0.78f);
+    colors[ImGuiCol_PopupBg]               = ImVec4(0.10f, 0.12f, 0.16f, 0.98f);
+    colors[ImGuiCol_Border]                = ImVec4(0.18f, 0.23f, 0.29f, 0.85f);
+    colors[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_FrameBg]               = ImVec4(0.13f, 0.16f, 0.20f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered]        = ImVec4(0.18f, 0.25f, 0.30f, 1.00f);
+    colors[ImGuiCol_FrameBgActive]         = ImVec4(0.21f, 0.32f, 0.38f, 1.00f);
+    colors[ImGuiCol_TitleBg]               = ImVec4(0.07f, 0.09f, 0.12f, 1.00f);
+    colors[ImGuiCol_TitleBgActive]         = ImVec4(0.09f, 0.12f, 0.16f, 1.00f);
+    colors[ImGuiCol_MenuBarBg]             = ImVec4(0.07f, 0.09f, 0.12f, 1.00f);
+    colors[ImGuiCol_ScrollbarBg]           = ImVec4(0.08f, 0.10f, 0.13f, 0.80f);
+    colors[ImGuiCol_ScrollbarGrab]         = ImVec4(0.24f, 0.31f, 0.38f, 0.95f);
+    colors[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.31f, 0.41f, 0.49f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.36f, 0.48f, 0.58f, 1.00f);
+    colors[ImGuiCol_CheckMark]             = ImVec4(0.58f, 0.88f, 0.78f, 1.00f);
+    colors[ImGuiCol_SliderGrab]            = ImVec4(0.42f, 0.76f, 0.67f, 0.95f);
+    colors[ImGuiCol_SliderGrabActive]      = ImVec4(0.54f, 0.88f, 0.79f, 1.00f);
+    colors[ImGuiCol_Button]                = ImVec4(0.17f, 0.29f, 0.33f, 1.00f);
+    colors[ImGuiCol_ButtonHovered]         = ImVec4(0.24f, 0.42f, 0.47f, 1.00f);
+    colors[ImGuiCol_ButtonActive]          = ImVec4(0.29f, 0.50f, 0.56f, 1.00f);
+    colors[ImGuiCol_Header]                = ImVec4(0.15f, 0.22f, 0.28f, 1.00f);
+    colors[ImGuiCol_HeaderHovered]         = ImVec4(0.21f, 0.31f, 0.38f, 1.00f);
+    colors[ImGuiCol_HeaderActive]          = ImVec4(0.25f, 0.37f, 0.45f, 1.00f);
+    colors[ImGuiCol_Separator]             = ImVec4(0.19f, 0.24f, 0.31f, 1.00f);
+    colors[ImGuiCol_SeparatorHovered]      = ImVec4(0.33f, 0.54f, 0.60f, 1.00f);
+    colors[ImGuiCol_SeparatorActive]       = ImVec4(0.42f, 0.68f, 0.74f, 1.00f);
+    colors[ImGuiCol_ResizeGrip]            = ImVec4(0.30f, 0.46f, 0.54f, 0.30f);
+    colors[ImGuiCol_ResizeGripHovered]     = ImVec4(0.42f, 0.68f, 0.74f, 0.70f);
+    colors[ImGuiCol_ResizeGripActive]      = ImVec4(0.54f, 0.88f, 0.79f, 0.90f);
+    colors[ImGuiCol_Tab]                   = ImVec4(0.12f, 0.16f, 0.20f, 1.00f);
+    colors[ImGuiCol_TabHovered]            = ImVec4(0.20f, 0.29f, 0.35f, 1.00f);
+    colors[ImGuiCol_TabActive]             = ImVec4(0.17f, 0.25f, 0.31f, 1.00f);
+    colors[ImGuiCol_TabUnfocused]          = ImVec4(0.09f, 0.12f, 0.16f, 1.00f);
+    colors[ImGuiCol_TabUnfocusedActive]    = ImVec4(0.13f, 0.18f, 0.22f, 1.00f);
+    colors[ImGuiCol_DockingPreview]        = ImVec4(0.40f, 0.79f, 0.73f, 0.28f);
+    colors[ImGuiCol_DockingEmptyBg]        = ImVec4(0.06f, 0.08f, 0.11f, 1.00f);
+    colors[ImGuiCol_PlotHistogram]         = ImVec4(0.42f, 0.84f, 0.72f, 1.00f);
+    colors[ImGuiCol_PlotHistogramHovered]  = ImVec4(0.56f, 0.93f, 0.81f, 1.00f);
+    colors[ImGuiCol_TextSelectedBg]        = ImVec4(0.25f, 0.48f, 0.54f, 0.45f);
+    colors[ImGuiCol_DragDropTarget]        = ImVec4(0.54f, 0.88f, 0.79f, 0.95f);
+    colors[ImGuiCol_NavHighlight]          = ImVec4(0.54f, 0.88f, 0.79f, 1.00f);
+}
+
+static void DrawPanelTitle(const char* title, const char* subtitle = nullptr)
+{
+    if (g_ui_font_heading) ImGui::PushFont(g_ui_font_heading);
+    ImGui::TextUnformatted(title);
+    if (g_ui_font_heading) ImGui::PopFont();
+    if (subtitle && subtitle[0] != '\0') {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s", subtitle);
+        ImGui::PopStyleColor();
+    }
+    ImGui::Spacing();
+}
+
+static void DrawSectionLabel(const char* label)
+{
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.68f, 0.91f, 0.84f, 1.0f));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+}
+
+static void DrawInfoChip(const char* label)
+{
+    ImVec2 pad(9.0f, 5.0f);
+    ImVec2 text_size = ImGui::CalcTextSize(label);
+    ImVec2 start = ImGui::GetCursorScreenPos();
+    ImVec2 end(start.x + text_size.x + pad.x * 2.0f, start.y + text_size.y + pad.y * 2.0f);
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    draw_list->AddRectFilled(start, end, IM_COL32(34, 47, 58, 235), 0.0f);
+    draw_list->AddRect(start, end, IM_COL32(82, 112, 130, 180), 0.0f);
+    draw_list->AddText(ImVec2(start.x + pad.x, start.y + pad.y), IM_COL32(226, 236, 242, 255), label);
+
+    ImGui::Dummy(ImVec2(end.x - start.x, end.y - start.y));
+}
 
 static GLuint CreateTextureThumbnail(const std::string& path)
 {
@@ -752,23 +919,6 @@ static int g_viewport_mode = 1;
 static void glfw_error_callback(int error, const char* description)
 {
     std::fprintf(stderr, "GLFW Error %d: %s\n", error, description);
-}
-
-// Key callback: handle Ctrl+Z / Ctrl+Y for undo/redo (GLFW-level for reliability)
-static void glfw_key_callback(GLFWwindow* /*window*/, int key, int scancode, int action, int mods)
-{
-    if (action != GLFW_PRESS) return;
-
-    if ((mods & GLFW_MOD_CONTROL) != 0) {
-        if (key == GLFW_KEY_Z) {
-            UndoManager::Instance().undo();
-            return;
-        }
-        if (key == GLFW_KEY_Y) {
-            UndoManager::Instance().redo();
-            return;
-        }
-    }
 }
 
 static inline double dot3(const vec3& a, const vec3& b)
@@ -2766,6 +2916,38 @@ static void sync_camera_from_editor(float viewport_width, float viewport_height)
     }
 }
 
+struct viewport_image_layout {
+    ImVec2 offset = ImVec2(0.0f, 0.0f);
+    ImVec2 size   = ImVec2(0.0f, 0.0f);
+};
+
+static viewport_image_layout ComputeViewportImageLayout(
+    const ImVec2& available_region,
+    int           image_width,
+    int           image_height)
+{
+    viewport_image_layout layout;
+    if (available_region.x <= 0.0f || available_region.y <= 0.0f ||
+        image_width <= 0 || image_height <= 0) {
+        return layout;
+    }
+
+    layout.size = available_region;
+
+    const float image_aspect = (float)image_width / (float)image_height;
+    const float region_aspect = available_region.x / available_region.y;
+
+    if (region_aspect > image_aspect) {
+        layout.size.x = available_region.y * image_aspect;
+    } else {
+        layout.size.y = available_region.x / image_aspect;
+    }
+
+    layout.offset.x = 0.5f * (available_region.x - layout.size.x);
+    layout.offset.y = 0.5f * (available_region.y - layout.size.y);
+    return layout;
+}
+
 // Convert render_result to RGBA8 texture
 static void UploadRenderToTexture(const render_result& img)
 {
@@ -3090,8 +3272,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         }
     }
 
-    ImGui::Separator();
-    ImGui::Text("Material Class");
+    DrawSectionLabel("Material Class");
 
     const char* model_label = "Unknown";
     switch (mat.model) {
@@ -3128,8 +3309,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         ImGui::EndCombo();
     }
 
-    ImGui::Separator();
-    ImGui::Text("Material Parameters");
+    DrawSectionLabel("Material Parameters");
 
     {
         float base[3] = {
@@ -3585,7 +3765,6 @@ int main()
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
     glfwSetDropCallback(window, glfw_drop_callback);
-    glfwSetKeyCallback(window, glfw_key_callback);
 
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) {
@@ -3604,13 +3783,11 @@ int main()
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
+    SetupEditorFonts(io);
     ImGui::StyleColorsDark();
+    ApplyModernEditorTheme();
 
     ImGuiStyle& style = ImGui::GetStyle();
-    // Progress bar (PlotHistogram) colour
-    style.Colors[ImGuiCol_PlotHistogram]        = ImVec4(0.26f, 0.75f, 0.33f, 1.0f); // fill
-    style.Colors[ImGuiCol_PlotHistogramHovered] = ImVec4(0.36f, 0.85f, 0.43f, 1.0f); // hover
-
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
     {
         style.WindowRounding = 0.0f;
@@ -3624,7 +3801,10 @@ int main()
 
     bool   show_demo_window = false;
     double last_time        = glfwGetTime();
-    static bool s_viewport_match_render = false;
+    static bool s_viewport_match_render = true;
+    static bool s_content_drawer_open = false;
+    static bool s_focus_content_drawer = false;
+    static float s_content_drawer_anim = 0.0f;
 
     while (!glfwWindowShouldClose(window))
     {
@@ -3694,19 +3874,27 @@ int main()
         // Ctrl+Z / Ctrl+Y handling (undo/redo) using GLFW key state; debounce on key transition
         static bool s_prev_ctrlz = false;
         static bool s_prev_ctrly = false;
+        static bool s_prev_ctrlspace = false;
         bool ctrl_down = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) || (glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
         bool z_down    = (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS);
         bool y_down    = (glfwGetKey(window, GLFW_KEY_Y) == GLFW_PRESS);
+        bool space_down = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
         bool cur_ctrlz = ctrl_down && z_down;
         bool cur_ctrly = ctrl_down && y_down;
+        bool cur_ctrlspace = ctrl_down && space_down;
         if (cur_ctrlz && !s_prev_ctrlz) {
             UndoManager::Instance().undo();
         }
         if (cur_ctrly && !s_prev_ctrly) {
             UndoManager::Instance().redo();
         }
+        if (cur_ctrlspace && !s_prev_ctrlspace) {
+            s_content_drawer_open = !s_content_drawer_open;
+            s_focus_content_drawer = s_content_drawer_open;
+        }
         s_prev_ctrlz = cur_ctrlz;
         s_prev_ctrly = cur_ctrly;
+        s_prev_ctrlspace = cur_ctrlspace;
 
         // Global Delete key: remove selected object when Delete pressed.
         // Allow Delete when viewport is focused even if ImGui requests keyboard capture
@@ -3799,9 +3987,6 @@ int main()
                     dock_main_id, ImGuiDir_Left, 0.20f, nullptr, &dock_main_id);
                 ImGuiID dock_right_id  = ImGui::DockBuilderSplitNode(
                     dock_main_id, ImGuiDir_Right, 0.25f, nullptr, &dock_main_id);
-                // Create a bottom strip under the main viewport for Assets
-                ImGuiID dock_bottom_id = ImGui::DockBuilderSplitNode(
-                    dock_main_id, ImGuiDir_Down, 0.28f, nullptr, &dock_main_id);
 
                 // Center: Viewport
                 ImGui::DockBuilderDockWindow("Viewport",       dock_main_id);
@@ -3810,12 +3995,9 @@ int main()
                 ImGui::DockBuilderDockWindow("Scene Hierarchy", dock_left_id);
                 ImGui::DockBuilderDockWindow("Lights",          dock_left_id);
 
-                // Bottom: Assets and Debug Camera
-                ImGui::DockBuilderDockWindow("Assets",          dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Debug Camera",    dock_bottom_id);
-
-                // Right: Inspector
+                // Right: Inspector and diagnostics
                 ImGui::DockBuilderDockWindow("Inspector",      dock_right_id);
+                ImGui::DockBuilderDockWindow("Debug Camera",   dock_right_id);
 
                 ImGui::DockBuilderFinish(dockspace_id);
             }
@@ -3823,6 +4005,11 @@ int main()
 
             if (ImGui::BeginMenuBar())
             {
+                if (g_ui_font_heading) ImGui::PushFont(g_ui_font_heading);
+                ImGui::TextUnformatted("Dusktracer");
+                if (g_ui_font_heading) ImGui::PopFont();
+                ImGui::SameLine(0.0f, 18.0f);
+
                 if (ImGui::BeginMenu("File"))
                 {
                     bool canExport = !g_render_in_progress;
@@ -3839,6 +4026,9 @@ int main()
                 if (ImGui::BeginMenu("View"))
                 {
                     ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window);
+                    if (ImGui::MenuItem("Content Drawer", "Ctrl+Space", &s_content_drawer_open)) {
+                        s_focus_content_drawer = s_content_drawer_open;
+                    }
                     ImGui::EndMenu();
                 }
                 if (ImGui::BeginMenu("Edit"))
@@ -3853,6 +4043,13 @@ int main()
                     }
                     ImGui::EndMenu();
                 }
+                float right_anchor = ImGui::GetWindowContentRegionMax().x - 220.0f;
+                if (ImGui::GetCursorPosX() < right_anchor) {
+                    ImGui::SetCursorPosX(right_anchor);
+                }
+                DrawInfoChip(g_render_in_progress ? "Rendering" : "Realtime Editor");
+                ImGui::SameLine();
+                DrawInfoChip(g_world_dirty ? "Scene Dirty" : "Scene Synced");
                 ImGui::EndMenuBar();
             }
 
@@ -3863,8 +4060,15 @@ int main()
         // Scene Hierarchy
         // ---------------------------------------------------------------------
         ImGui::Begin("Scene Hierarchy");
-        ImGui::Text("Objects:");
-        ImGui::Separator();
+        DrawPanelTitle("Scene", "Objects, transforms and quick creation tools.");
+        char scene_objects_chip[64];
+        char scene_materials_chip[64];
+        std::snprintf(scene_objects_chip, sizeof(scene_objects_chip), "%d objects", (int)g_scene.objects.size());
+        std::snprintf(scene_materials_chip, sizeof(scene_materials_chip), "%d materials", (int)g_scene.materials.size());
+        DrawInfoChip(scene_objects_chip);
+        ImGui::SameLine();
+        DrawInfoChip(scene_materials_chip);
+        DrawSectionLabel("Objects");
 
         // List + selection
         for (size_t i = 0; i < g_scene.objects.size(); ++i) {
@@ -4037,19 +4241,60 @@ int main()
         ImGui::End();
 
         // ---------------------------------------------------------------------
-        // Assets window (textures + models), docked at bottom
+        // Content drawer (textures + models), hidden by default and toggled
+        // with Ctrl+Space so the viewport keeps its full height when closed.
         // ---------------------------------------------------------------------
         g_thumbs_created_this_frame = 0; // reset per-frame budget before rendering assets
-        ImGui::Begin("Assets");
-        bool assets_visible = ImGui::IsWindowAppearing() || ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) || ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
-        if (!assets_visible) {
-            // If the Assets window isn't visible or in use, avoid generating thumbnails this frame
-            g_thumb_budget_per_frame = 0;
+        const float drawer_anim_duration = 0.18f;
+        const float drawer_anim_step = (drawer_anim_duration > 0.0f)
+            ? std::clamp((float)io.DeltaTime / drawer_anim_duration, 0.0f, 1.0f)
+            : 1.0f;
+        if (s_content_drawer_open) {
+            s_content_drawer_anim = std::min(1.0f, s_content_drawer_anim + drawer_anim_step);
         } else {
-            g_thumb_budget_per_frame = g_thumb_budget_default;
+            s_content_drawer_anim = std::max(0.0f, s_content_drawer_anim - drawer_anim_step);
         }
-        ImGui::TextDisabled("Drop images (.png/.jpg/.tga/.bmp) and models (.fbx/.obj) here to import. Double-click model to add to scene.");
-        ImGui::Separator();
+        const float drawer_eased = s_content_drawer_anim * s_content_drawer_anim * (3.0f - 2.0f * s_content_drawer_anim);
+
+        if (drawer_eased > 0.001f) {
+            const ImGuiViewport* drawer_viewport = ImGui::GetMainViewport();
+            const float drawer_margin = 12.0f;
+            const float drawer_height = std::clamp(drawer_viewport->WorkSize.y * 0.34f, 260.0f, 430.0f);
+            const float hidden_y = drawer_viewport->WorkPos.y + drawer_viewport->WorkSize.y + drawer_margin;
+            const float shown_y = drawer_viewport->WorkPos.y + drawer_viewport->WorkSize.y - drawer_height - drawer_margin;
+            const float drawer_y = hidden_y + (shown_y - hidden_y) * drawer_eased;
+            const bool drawer_interactive = s_content_drawer_open && drawer_eased >= 0.98f;
+            ImGui::SetNextWindowViewport(drawer_viewport->ID);
+            ImGui::SetNextWindowPos(
+                ImVec2(drawer_viewport->WorkPos.x + drawer_margin,
+                       drawer_y),
+                ImGuiCond_Always
+            );
+            ImGui::SetNextWindowSize(
+                ImVec2(drawer_viewport->WorkSize.x - drawer_margin * 2.0f, drawer_height),
+                ImGuiCond_Always
+            );
+            ImGui::SetNextWindowBgAlpha(0.72f + 0.24f * drawer_eased);
+            if (s_focus_content_drawer) {
+                ImGui::SetNextWindowFocus();
+                s_focus_content_drawer = false;
+            }
+
+            ImGuiWindowFlags content_drawer_flags =
+                ImGuiWindowFlags_NoDocking |
+                ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoSavedSettings;
+            if (!drawer_interactive) {
+                content_drawer_flags |= ImGuiWindowFlags_NoInputs;
+            }
+            ImGui::Begin("Content Drawer", nullptr, content_drawer_flags);
+            DrawPanelTitle("Content Drawer", "Textures, meshes and materials available in the current scene.");
+            DrawInfoChip("Ctrl+Space");
+            ImGui::SameLine();
+            ImGui::TextDisabled("Toggle drawer");
+            g_thumb_budget_per_frame = g_thumb_budget_default;
+            ImGui::TextDisabled("Drop images (.png/.jpg/.tga/.bmp) and models (.fbx/.obj) here to import. Double-click model to add to scene.");
+            ImGui::Separator();
 
         // Assets search
         static char s_assets_search[256] = {0};
@@ -4433,17 +4678,24 @@ int main()
             // communicates intent to users (tooltip or visual effect could be added).
         }
 
-        ImGui::End();
+            ImGui::End();
+        } else {
+            g_thumb_budget_per_frame = 0;
+            s_focus_content_drawer = false;
+        }
 
         // ---------------------------------------------------------------------
         // Lights
         // ---------------------------------------------------------------------
         ImGui::Begin("Lights");
+        DrawPanelTitle("Lighting", "Directional sun, point lights and caustic controls.");
 
         // Lights support both Point and Directional (Sun) types.
 
-        ImGui::Text("Scene Lights (%d)", (int)g_scene.lights.size());
-        ImGui::Separator();
+        char lights_chip[64];
+        std::snprintf(lights_chip, sizeof(lights_chip), "%d lights", (int)g_scene.lights.size());
+        DrawInfoChip(lights_chip);
+        DrawSectionLabel("Scene Lights");
 
         if (ImGui::Button("Add Light")) {
             scene_light sl;
@@ -4663,21 +4915,20 @@ int main()
         // Inspector
         // ---------------------------------------------------------------------
         ImGui::Begin("Inspector");
-        ImGui::Text("Camera");
-        ImGui::Separator();
+        DrawPanelTitle("Inspector", "Camera, quality and output settings.");
+        DrawSectionLabel("Camera");
         ImGui::Text("Position: (%.2f, %.2f, %.2f)",
             g_editor_cam.position.x(),
             g_editor_cam.position.y(),
             g_editor_cam.position.z());
         ImGui::Text("Yaw: %.2f, Pitch: %.2f", g_editor_cam.yaw, g_editor_cam.pitch);
 
-        ImGui::Separator();
+        DrawSectionLabel("Navigation");
         ImGui::Text("Controls:");
         ImGui::Text("  WASD = move, Q/E = down/up");
         ImGui::Text("  RMB drag in Viewport = look");
 
-        ImGui::Separator();
-        ImGui::Text("Editor Camera Settings");
+        DrawSectionLabel("Editor Camera");
         ImGui::SliderFloat("Move speed",  &g_camera_move_speed, 0.1f, 20.0f);
         ImGui::SliderFloat("Look sens",   &g_camera_look_sens,  0.0005f, 0.02f);
         ImGui::SliderFloat("FOV",         &g_editor_cam.vfov,   20.0f, 90.0f);
@@ -4689,8 +4940,7 @@ int main()
             // camera reset doesn't dirty world
         }
 
-        ImGui::Separator();
-        ImGui::Text("Render Settings");
+        DrawSectionLabel("Render Quality");
 
         int spp = g_camera.samples_per_pixel;
         if (ImGui::DragInt("Samples per pixel", &spp, 1, 1, 4096)) {
@@ -4705,8 +4955,7 @@ int main()
         }
 
         // Quality presets
-        ImGui::Separator();
-        ImGui::Text("Quality Presets:");
+        DrawSectionLabel("Presets");
         if (ImGui::Button("Fast Preview")) {
             g_camera.samples_per_pixel = 256;
             g_camera.max_depth = 20;
@@ -4736,10 +4985,8 @@ int main()
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("SPP=2048, Depth=50, MNEE=256 - final production quality");
         }
-        ImGui::Separator();
-
         // Direct lighting sampling (NEE/MIS) removed
-        ImGui::Separator();
+        DrawSectionLabel("Post");
         // Exposure control (linear multiplier applied in renderer)
         {
             float exp_f = (float)g_renderer.exposure;
@@ -4757,14 +5004,6 @@ int main()
                 g_renderer.use_denoiser = use_dn;
             }
 #ifdef HAVE_OIDN
-            bool prog_dn = g_renderer.progressive_denoise;
-            if (ImGui::Checkbox("Progressive Denoise (like Cycles)", &prog_dn)) {
-                g_renderer.progressive_denoise = prog_dn;
-            }
-            if (g_renderer.progressive_denoise) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("(applies OIDN during render)");
-            }
             float ds = (float)g_renderer.denoiser_strength;
             if (ImGui::DragFloat("Denoiser Strength", &ds, 0.01f, 0.0f, 1.0f, "%.3f")) {
                 if (ds < 0.0f) ds = 0.0f;
@@ -4776,7 +5015,7 @@ int main()
             ImGui::TextDisabled("OpenImageDenoise not available in this build.");
 #endif
             // Adaptive sampling controls
-            ImGui::Separator();
+            DrawSectionLabel("Adaptive Sampling");
             bool adapt = g_renderer.adaptive_sampling;
             if (ImGui::Checkbox("Adaptive Sampling (per-pixel)", &adapt)) {
                 g_renderer.adaptive_sampling = adapt;
@@ -4808,8 +5047,7 @@ int main()
 
         ImGui::TextDisabled("Higher = cleaner but slower.");
 
-        ImGui::Separator();
-        ImGui::Text("Render Resolution");
+        DrawSectionLabel("Resolution");
 
         static int res_w = g_camera.image_width;
         static int res_h = g_camera.image_height;
@@ -5634,43 +5872,10 @@ int main()
                     }
                 }
 
-                // Choose which slot's material we are editing
-                static int s_active_slot = 0;
                 if (!mesh_asset->slot_names.empty()) {
-                    if (s_active_slot >= (int)mesh_asset->slot_names.size())
-                        s_active_slot = 0;
-
                     ImGui::Separator();
-                    ImGui::Text("Edit material for slot:");
-
-                    std::string active_label = "Slot " + std::to_string(s_active_slot) +
-                                               " (" + mesh_asset->slot_names[s_active_slot] + ")";
-                    if (ImGui::BeginCombo("Active Slot", active_label.c_str())) {
-                        for (int s = 0; s < (int)mesh_asset->slot_names.size(); ++s) {
-                            bool sel = (s == s_active_slot);
-                            std::string item = "Slot " + std::to_string(s) +
-                                               " (" + mesh_asset->slot_names[s] + ")";
-                            if (ImGui::Selectable(item.c_str(), sel)) {
-                                s_active_slot = s;
-                            }
-                            if (sel) ImGui::SetItemDefaultFocus();
-                        }
-                        ImGui::EndCombo();
-                    }
-
-                    int active_mat_idx =
-                        (s_active_slot < (int)obj.mesh_slot_materials.size()) ?
-                        obj.mesh_slot_materials[s_active_slot] : -1;
-
-                    if (active_mat_idx >= 0 &&
-                        active_mat_idx < (int)g_scene.materials.size())
-                    {
-                        auto& mat = g_scene.materials[active_mat_idx];
-                        DrawMaterialInspector(mat, g_scene, active_mat_idx);
-                        // DrawMaterialInspector already marks g_world_dirty
-                    } else {
-                        ImGui::TextDisabled("No material bound to this slot.");
-                    }
+                    ImGui::TextDisabled("Material parameters are edited from the Content Drawer.");
+                    ImGui::TextDisabled("Select the material asset there to change its shader settings.");
                 }
             }
             // --- Spheres / non-mesh: single material index as before ---
@@ -5707,8 +5912,8 @@ int main()
                 if (obj.material_index >= 0 &&
                     obj.material_index < (int)g_scene.materials.size())
                 {
-                    auto& mat = g_scene.materials[obj.material_index];
-                    DrawMaterialInspector(mat, g_scene, obj.material_index);
+                    ImGui::TextDisabled("Material parameters are edited from the Content Drawer.");
+                    ImGui::TextDisabled("Select '%s' there to edit it.", g_scene.materials[obj.material_index].name.c_str());
                 }
                 else {
                     ImGui::TextDisabled("Object has no valid material bound.");
@@ -5725,74 +5930,76 @@ int main()
         // Material Editor (for materials selected in Assets window)
         // ---------------------------------------------------------------------
         if (g_selected_material >= 0 && g_selected_material < (int)g_scene.materials.size()) {
-            ImGui::Begin("Material Editor");
-            auto& mat = g_scene.materials[g_selected_material];
-            
-            ImGui::Text("Editing Material: %s", mat.name.c_str());
-            ImGui::Separator();
-            
-            // Show material name editor with deselect button
-            ImGui::PushItemWidth(-80);
-            char name_buf[256];
-            strncpy(name_buf, mat.name.c_str(), sizeof(name_buf) - 1);
-            name_buf[sizeof(name_buf) - 1] = '\0';
-            if (ImGui::InputText("##mat_name", name_buf, sizeof(name_buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
-                mat.name = name_buf;
-                        g_world_dirty = true;
-                        g_cached_world.reset();
-                        g_materials_dirty = true;
-            }
-            ImGui::PopItemWidth();
-            ImGui::SameLine();
-            if (ImGui::Button("Deselect")) {
+            bool material_editor_open = true;
+            ImGui::Begin("Material Editor", &material_editor_open);
+            if (!material_editor_open) {
                 g_selected_material = -1;
-            }
-            
-            ImGui::Separator();
-            
-            // Draw full material inspector
-            DrawMaterialInspector(mat, g_scene, g_selected_material);
-            
-            ImGui::Separator();
-            
-            // Button to delete this material
-            if (ImGui::Button("Delete Material")) {
-                int del_idx = g_selected_material;
-                scene_material snapshot = mat;
+            } else {
+                auto& mat = g_scene.materials[g_selected_material];
                 
-                UndoManager::Instance().push(std::make_unique<LambdaAction>(
-                    [del_idx]() {
-                        if (del_idx >= 0 && del_idx < (int)g_scene.materials.size()) {
-                            g_scene.materials.erase(g_scene.materials.begin() + del_idx);
-                            if (g_selected_material == del_idx) g_selected_material = -1;
+                DrawPanelTitle("Material Editor", "Focused editing for the selected asset material.");
+                ImGui::Text("Editing Material: %s", mat.name.c_str());
+                ImGui::Separator();
+                
+                // Keep the material name editable, but use the window close
+                // button itself to dismiss the focused editor.
+                ImGui::PushItemWidth(-FLT_MIN);
+                char name_buf[256];
+                strncpy(name_buf, mat.name.c_str(), sizeof(name_buf) - 1);
+                name_buf[sizeof(name_buf) - 1] = '\0';
+                if (ImGui::InputText("##mat_name", name_buf, sizeof(name_buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+                    mat.name = name_buf;
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                    g_materials_dirty = true;
+                }
+                ImGui::PopItemWidth();
+                
+                ImGui::Separator();
+                
+                // Draw full material inspector
+                DrawMaterialInspector(mat, g_scene, g_selected_material);
+                
+                ImGui::Separator();
+                
+                // Button to delete this material
+                if (ImGui::Button("Delete Material")) {
+                    int del_idx = g_selected_material;
+                    scene_material snapshot = mat;
+                    
+                    UndoManager::Instance().push(std::make_unique<LambdaAction>(
+                        [del_idx]() {
+                            if (del_idx >= 0 && del_idx < (int)g_scene.materials.size()) {
+                                g_scene.materials.erase(g_scene.materials.begin() + del_idx);
+                                if (g_selected_material == del_idx) g_selected_material = -1;
+                                g_world_dirty = true; g_cached_world.reset();
+                            }
+                        },
+                        [del_idx, snapshot]() {
+                            if (del_idx < 0) return;
+                            int insert_at = del_idx;
+                            if (insert_at > (int)g_scene.materials.size()) insert_at = (int)g_scene.materials.size();
+                            g_scene.materials.insert(g_scene.materials.begin() + insert_at, snapshot);
+                            g_selected_material = insert_at;
                             g_world_dirty = true; g_cached_world.reset();
-                        }
-                    },
-                    [del_idx, snapshot]() {
-                        if (del_idx < 0) return;
-                        int insert_at = del_idx;
-                        if (insert_at > (int)g_scene.materials.size()) insert_at = (int)g_scene.materials.size();
-                        g_scene.materials.insert(g_scene.materials.begin() + insert_at, snapshot);
-                        g_selected_material = insert_at;
-                        g_world_dirty = true; g_cached_world.reset();
-                    },
-                    "Delete Material"
-                ));
-                
-                g_scene.materials.erase(g_scene.materials.begin() + del_idx);
-                g_selected_material = -1;
-                g_world_dirty = true;
-                g_cached_world.reset();
-                g_materials_dirty = true;
-                
-                // Invalidate thumbnail cache for this material
-                if (g_material_thumb_cache.find(del_idx) != g_material_thumb_cache.end()) {
-                    GLuint tex = g_material_thumb_cache[del_idx];
-                    if (tex) glDeleteTextures(1, &tex);
-                    g_material_thumb_cache.erase(del_idx);
+                        },
+                        "Delete Material"
+                    ));
+                    
+                    g_scene.materials.erase(g_scene.materials.begin() + del_idx);
+                    g_selected_material = -1;
+                    g_world_dirty = true;
+                    g_cached_world.reset();
+                    g_materials_dirty = true;
+                    
+                    // Invalidate thumbnail cache for this material
+                    if (g_material_thumb_cache.find(del_idx) != g_material_thumb_cache.end()) {
+                        GLuint tex = g_material_thumb_cache[del_idx];
+                        if (tex) glDeleteTextures(1, &tex);
+                        g_material_thumb_cache.erase(del_idx);
+                    }
                 }
             }
-            
             ImGui::End();
         }
 
@@ -5800,6 +6007,7 @@ int main()
         // Debug Camera
         // ---------------------------------------------------------------------
         ImGui::Begin("Debug Camera");
+        DrawPanelTitle("Diagnostics", "Live editor camera and renderer state.");
         ImGui::Text("Editor cam position:");
         ImGui::Text("  x = %.3f", g_editor_cam.position.x());
         ImGui::Text("  y = %.3f", g_editor_cam.position.y());
@@ -5827,11 +6035,11 @@ int main()
         g_viewport_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         g_viewport_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
 
-        ImVec2 vp_size = ImGui::GetContentRegionAvail();
-
-        // Render button + progress bar
-        if (!g_render_in_progress) {
-            if (ImGui::Button("Render Current View")) {
+        char viewport_res_chip[64];
+        char viewport_quality_chip[64];
+        std::snprintf(viewport_res_chip, sizeof(viewport_res_chip), "%dx%d output", g_camera.image_width, g_camera.image_height);
+        std::snprintf(viewport_quality_chip, sizeof(viewport_quality_chip), "%d spp | depth %d", g_camera.samples_per_pixel, g_camera.max_depth);
+        auto start_viewport_render = [&](const ImVec2& render_area) {
                 // Sync RT camera from editor view. If the user requested the
                 // viewport to match the configured render resolution, sync
                 // using the camera's image size so the ray tracer uses that
@@ -5839,7 +6047,7 @@ int main()
                 if (s_viewport_match_render) {
                     sync_camera_from_editor((float)g_camera.image_width, (float)g_camera.image_height);
                 } else {
-                    sync_camera_from_editor(vp_size.x, vp_size.y);
+                    sync_camera_from_editor(render_area.x, render_area.y);
                 }
 
                 // Build world only if needed
@@ -5865,9 +6073,7 @@ int main()
                 g_cancel_flag.store(false);
                 g_render_in_progress = true;
 
-                // schedule progress window popup after a short delay
-                g_progress_request_time = std::chrono::steady_clock::now();
-                g_progress_popup_pending = true;
+                g_progress_popup_pending = false;
 
                 // Kick off worker thread
                 auto world_copy = g_cached_world;
@@ -5892,153 +6098,164 @@ int main()
                     }
 
                     g_render_thread = std::thread([world_copy, cam_copy]() mutable {
-                    try {
-                        // Additional safety check inside thread
-                        if (!world_copy) {
-                            std::fprintf(stderr, "[ERROR] World copy is NULL inside render thread! Aborting.\n");
-                            return;
-                        }
-
-                        size_t pixel_count = (size_t)cam_copy.image_width * (size_t)cam_copy.image_height;
-                        
-                        // Build caustics photon map once before render. Build when
-                        // we have either a sun or point lights so point-light
-                        // caustics are captured even if the sun is disabled.
-                        if (cam_copy.use_sun || !cam_copy.point_lights.empty()) {
-                            caustics_config cfg;
-                            cfg.photon_count   = (int)std::clamp<size_t>(pixel_count / 3, 150000, 750000);
-                            cfg.max_bounces    = std::max(2, std::min(8, cam_copy.max_depth));
-                            cfg.deposit_radius = 0.18;
-                            cfg.intensity_scale= 100.0;
-                            cfg.knn_k          = 0;
-
-                            int caustic_emitters = (cam_copy.use_sun ? 1 : 0) + (!cam_copy.point_lights.empty() ? 1 : 0);
-                            int sun_budget = cam_copy.use_sun ? std::max(1, cfg.photon_count / std::max(1, caustic_emitters)) : 0;
-                            int point_budget = !cam_copy.point_lights.empty() ? std::max(1, cfg.photon_count - sun_budget) : 0;
-
-                            photon_map pm;
-
-                            // Build sun caustics if enabled
-                            if (cam_copy.use_sun) {
-                                caustics_config sun_cfg = cfg;
-                                sun_cfg.photon_count = sun_budget;
-                                build_sun_caustics(cam_copy.sun_dir, cam_copy.sun_radiance,
-                                                   *world_copy, sun_cfg, pm);
+                        try {
+                            // Additional safety check inside thread
+                            if (!world_copy) {
+                                std::fprintf(stderr, "[ERROR] World copy is NULL inside render thread! Aborting.\n");
+                                return;
                             }
 
-                            // Also emit photons from point lights so they contribute
-                            // to caustics (MNEE/photon capture). Share the budget
-                            // equally across point lights to keep it simple.
-                            if (!cam_copy.point_lights.empty()) {
-                                int npl = (int)cam_copy.point_lights.size();
-                                // Cap per-light photons so point-light caustics don't dominate render startup.
-                                int photons_per_pl = std::min(75000, std::max(1, point_budget / npl));
+                            size_t pixel_count = (size_t)cam_copy.image_width * (size_t)cam_copy.image_height;
+                            
+                            // Build caustics photon map once before render. Build when
+                            // we have either a sun or point lights so point-light
+                            // caustics are captured even if the sun is disabled.
+                            if (cam_copy.use_sun || !cam_copy.point_lights.empty()) {
+                                caustics_config cfg;
+                                cfg.photon_count   = (int)std::clamp<size_t>(pixel_count / 3, 150000, 750000);
+                                cfg.max_bounces    = std::max(2, std::min(8, cam_copy.max_depth));
+                                cfg.deposit_radius = 0.18;
+                                cfg.intensity_scale= 100.0;
+                                cfg.knn_k          = 0;
 
-                                for (const auto& pl : cam_copy.point_lights) {
-                                    for (int pi = 0; pi < photons_per_pl; ++pi) {
-                                        // Sample a random direction (uniform on sphere)
-                                        double z = 1.0 - 2.0 * random_double();
-                                        double r = std::sqrt(std::max(0.0, 1.0 - z*z));
-                                        double phi = 2.0 * M_PI * random_double();
-                                        double x = r * std::cos(phi);
-                                        double y = r * std::sin(phi);
-                                        vec3 dir = unit_vector(vec3((float)x, (float)y, (float)z));
+                                int caustic_emitters = (cam_copy.use_sun ? 1 : 0) + (!cam_copy.point_lights.empty() ? 1 : 0);
+                                int sun_budget = cam_copy.use_sun ? std::max(1, cfg.photon_count / std::max(1, caustic_emitters)) : 0;
+                                int point_budget = !cam_copy.point_lights.empty() ? std::max(1, cfg.photon_count - sun_budget) : 0;
 
-                                        ray r0(pl.position, dir, 0.0);
-                                        colour throughput = pl.radiance * (float)(1.0 / std::max(1, photons_per_pl));
+                                photon_map pm;
 
-                                        bool saw_dielectric = false;
-                                        int spec_events = 0;
-                                        for (int b = 0; b < cfg.max_bounces; ++b) {
-                                            hit_record rec;
-                                            if (!world_copy->hit(r0, interval(0.001, infinity), rec)) break;
+                                // Build sun caustics if enabled
+                                if (cam_copy.use_sun) {
+                                    caustics_config sun_cfg = cfg;
+                                    sun_cfg.photon_count = sun_budget;
+                                    build_sun_caustics(cam_copy.sun_dir, cam_copy.sun_radiance,
+                                                       *world_copy, sun_cfg, pm);
+                                }
 
-                                            if (!rec.mat || (!rec.mat->is_specular())) {
-                                                if (saw_dielectric && spec_events >= cfg.min_specular_events) {
-                                                    photon ph;
-                                                    ph.pos = rec.p;
-                                                    ph.dir = unit_vector(r0.direction());
-                                                    ph.power = throughput;
-                                                    pm.insert(ph);
+                                // Also emit photons from point lights so they contribute
+                                // to caustics (MNEE/photon capture). Share the budget
+                                // equally across point lights to keep it simple.
+                                if (!cam_copy.point_lights.empty()) {
+                                    int npl = (int)cam_copy.point_lights.size();
+                                    // Cap per-light photons so point-light caustics don't dominate render startup.
+                                    int photons_per_pl = std::min(75000, std::max(1, point_budget / npl));
+
+                                    for (const auto& pl : cam_copy.point_lights) {
+                                        for (int pi = 0; pi < photons_per_pl; ++pi) {
+                                            // Sample a random direction (uniform on sphere)
+                                            double z = 1.0 - 2.0 * random_double();
+                                            double r = std::sqrt(std::max(0.0, 1.0 - z*z));
+                                            double phi = 2.0 * M_PI * random_double();
+                                            double x = r * std::cos(phi);
+                                            double y = r * std::sin(phi);
+                                            vec3 dir = unit_vector(vec3((float)x, (float)y, (float)z));
+
+                                            ray r0(pl.position, dir, 0.0);
+                                            colour throughput = pl.radiance * (float)(1.0 / std::max(1, photons_per_pl));
+
+                                            bool saw_dielectric = false;
+                                            int spec_events = 0;
+                                            for (int b = 0; b < cfg.max_bounces; ++b) {
+                                                hit_record rec;
+                                                if (!world_copy->hit(r0, interval(0.001, infinity), rec)) break;
+
+                                                if (!rec.mat || (!rec.mat->is_specular())) {
+                                                    if (saw_dielectric && spec_events >= cfg.min_specular_events) {
+                                                        photon ph;
+                                                        ph.pos = rec.p;
+                                                        ph.dir = unit_vector(r0.direction());
+                                                        ph.power = throughput;
+                                                        pm.insert(ph);
+                                                    }
+                                                    break; // terminate on diffuse
                                                 }
-                                                break; // terminate on diffuse
-                                            }
 
-                                            // specular event
-                                            ray scattered;
-                                            colour atten;
-                                            if (!rec.mat->scatter(r0, rec, atten, scattered)) break;
-                                            throughput = throughput * atten;
-                                            if (rec.mat && rec.mat->is_dielectric()) saw_dielectric = true;
-                                            ++spec_events;
-                                            r0 = scattered;
+                                                // specular event
+                                                ray scattered;
+                                                colour atten;
+                                                if (!rec.mat->scatter(r0, rec, atten, scattered)) break;
+                                                throughput = throughput * atten;
+                                                if (rec.mat && rec.mat->is_dielectric()) saw_dielectric = true;
+                                                ++spec_events;
+                                                r0 = scattered;
+                                            }
                                         }
                                     }
                                 }
+
+                                cam_copy.set_caustics(pm, cfg.deposit_radius);
                             }
+                            
+                            // Sanity check render dimensions to avoid massive allocations
+                            if (cam_copy.image_width <= 0 || cam_copy.image_height <= 0) {
+                                std::fprintf(stderr, "[ERROR] Invalid image dimensions: %dx%d\n", 
+                                    cam_copy.image_width, cam_copy.image_height);
+                                throw std::runtime_error("Invalid render dimensions");
+                            }
+                            if (cam_copy.image_width > 8192 || cam_copy.image_height > 8192) {
+                                std::fprintf(stderr, "[ERROR] Image dimensions too large: %dx%d (max 8192x8192)\n",
+                                    cam_copy.image_width, cam_copy.image_height);
+                                throw std::runtime_error("Render dimensions exceed maximum");
+                            }
+                            
+                            render_result img =
+                                g_renderer.render(*world_copy, cam_copy,
+                                                  &g_cancel_flag, &g_render_progress,
+                                                  // progress callback: write partial image into shared result
+                                                  [](const render_result& partial) {
+                                                      try {
+                                                          std::lock_guard<std::mutex> lock(g_render_mutex);
+                                                          g_render_result = partial;
+                                                          g_render_has_result = true;
+                                                      } catch (const std::exception& e) {
+                                                          std::fprintf(stderr, "[ERROR] Progress callback exception: %s\n", e.what());
+                                                      } catch (...) {
+                                                          std::fprintf(stderr, "[ERROR] Progress callback unknown exception\n");
+                                                      }
+                                                  });
 
-                            cam_copy.set_caustics(pm, cfg.deposit_radius);
+                            // final result: store and mark final-ready
+                            {
+                                std::lock_guard<std::mutex> lock(g_render_mutex);
+                                g_render_result = std::move(img);
+                                g_render_has_result = true;
+                                g_render_final_image_ready.store(true);
+                            }
+                        } catch (const std::bad_alloc& e) {
+                            std::fprintf(stderr, "\n!!! FATAL: Memory allocation failed in render thread !!!\n");
+                            std::fprintf(stderr, "[EXCEPTION] bad_alloc: %s\n", e.what());
+                            std::fprintf(stderr, "[CRASH] Likely ran out of memory during photon map or render buffer allocation\n");
+                        } catch (const std::exception& e) {
+                            std::fprintf(stderr, "\n!!! FATAL: Exception in render thread !!!\n");
+                            std::fprintf(stderr, "[EXCEPTION] Type: std::exception\n");
+                            std::fprintf(stderr, "[EXCEPTION] what(): %s\n", e.what());
+                        } catch (...) {
+                            std::fprintf(stderr, "\n!!! FATAL: Unknown exception in render thread !!!\n");
+                            std::fprintf(stderr, "[CRASH] Caught non-standard exception (possible access violation or segfault)\n");
                         }
-                        
-                        // Sanity check render dimensions to avoid massive allocations
-                        if (cam_copy.image_width <= 0 || cam_copy.image_height <= 0) {
-                            std::fprintf(stderr, "[ERROR] Invalid image dimensions: %dx%d\n", 
-                                cam_copy.image_width, cam_copy.image_height);
-                            throw std::runtime_error("Invalid render dimensions");
-                        }
-                        if (cam_copy.image_width > 8192 || cam_copy.image_height > 8192) {
-                            std::fprintf(stderr, "[ERROR] Image dimensions too large: %dx%d (max 8192x8192)\n",
-                                cam_copy.image_width, cam_copy.image_height);
-                            throw std::runtime_error("Render dimensions exceed maximum");
-                        }
-                        
-                        render_result img =
-                            g_renderer.render(*world_copy, cam_copy,
-                                              &g_cancel_flag, &g_render_progress,
-                                              // progress callback: write partial image into shared result
-                                              [](const render_result& partial) {
-                                                  try {
-                                                      std::lock_guard<std::mutex> lock(g_render_mutex);
-                                                      g_render_result = partial;
-                                                      g_render_has_result = true;
-                                                  } catch (const std::exception& e) {
-                                                      std::fprintf(stderr, "[ERROR] Progress callback exception: %s\n", e.what());
-                                                  } catch (...) {
-                                                      std::fprintf(stderr, "[ERROR] Progress callback unknown exception\n");
-                                                  }
-                                              });
-
-                        // final result: store and mark final-ready
-                        {
-                            std::lock_guard<std::mutex> lock(g_render_mutex);
-                            g_render_result = std::move(img);
-                            g_render_has_result = true;
-                            g_render_final_image_ready.store(true);
-                        }
-                    } catch (const std::bad_alloc& e) {
-                        std::fprintf(stderr, "\n!!! FATAL: Memory allocation failed in render thread !!!\n");
-                        std::fprintf(stderr, "[EXCEPTION] bad_alloc: %s\n", e.what());
-                        std::fprintf(stderr, "[CRASH] Likely ran out of memory during photon map or render buffer allocation\n");
-                    } catch (const std::exception& e) {
-                        std::fprintf(stderr, "\n!!! FATAL: Exception in render thread !!!\n");
-                        std::fprintf(stderr, "[EXCEPTION] Type: std::exception\n");
-                        std::fprintf(stderr, "[EXCEPTION] what(): %s\n", e.what());
-                    } catch (...) {
-                        std::fprintf(stderr, "\n!!! FATAL: Unknown exception in render thread !!!\n");
-                        std::fprintf(stderr, "[CRASH] Caught non-standard exception (possible access violation or segfault)\n");
-                    }
                     });
                 }
-            }
+        };
+
+        bool request_render = false;
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 4.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+
+        if (!g_render_in_progress) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.22f, 0.55f, 0.57f, 1.00f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.29f, 0.68f, 0.70f, 1.00f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.18f, 0.45f, 0.47f, 1.00f));
+            request_render = ImGui::Button("Render");
+            ImGui::PopStyleColor(3);
         } else {
             ImGui::BeginDisabled();
-            ImGui::Button("Render Current View");
+            ImGui::Button("Rendering");
             ImGui::EndDisabled();
         }
 
         ImGui::SameLine();
         if (g_render_in_progress) {
-            if (ImGui::Button("Cancel Render")) {
+            if (ImGui::Button("Cancel")) {
                 g_cancel_flag.store(true);
                 // close the progress window immediately on cancel
                 stop_progress_window_thread();
@@ -6046,12 +6263,26 @@ int main()
                 g_progress_popup_pending = false;
             }
         } else {
-            ImGui::TextDisabled("Move camera / edit objects / materials, then click Render.");
+            ImGui::TextDisabled("RMB look | WASD move");
         }
 
-        // Progress bar / ETA
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("Mode");
+        ImGui::SameLine();
+        ImGui::RadioButton("RT##ViewportMode", &g_viewport_mode, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Raster##ViewportMode", &g_viewport_mode, 1);
+        ImGui::PopStyleVar(2);
+
+        DrawInfoChip(viewport_res_chip);
+        ImGui::SameLine();
+        DrawInfoChip(viewport_quality_chip);
+        ImGui::SameLine();
+        DrawInfoChip(g_render_in_progress ? "Render Active" : "Ready");
+
         if (g_render_in_progress) {
-            ImGui::Separator();
+            ImGui::Spacing();
             int   done;
             int   total;
             bool  using_tiles = (g_render_progress.total_tiles > 0);
@@ -6082,37 +6313,21 @@ int main()
         }
 
         ImGui::Separator();
-
-        ImGui::Text("Viewport Mode:");
-        ImGui::SameLine();
-        ImGui::RadioButton("Ray Traced", &g_viewport_mode, 0);
-        ImGui::SameLine();
-        ImGui::RadioButton("Rasterised", &g_viewport_mode, 1);
-
-        ImGui::Separator();
+        ImVec2 vp_size = ImGui::GetContentRegionAvail();
+        if (request_render) {
+            start_viewport_render(vp_size);
+        }
 
         if (g_viewport_mode == 0) {
             if (g_rtHasImage && g_rtTexture != 0) {
-                float img_aspect = (float)g_rtWidth / (float)g_rtHeight;
-                float vp_aspect  = vp_size.x / vp_size.y;
-
-                ImVec2 image_size = vp_size;
-                if (vp_aspect > img_aspect) {
-                    image_size.x = vp_size.y * img_aspect;
-                } else {
-                    image_size.y = vp_size.x / img_aspect;
-                }
-
+                const viewport_image_layout layout =
+                    ComputeViewportImageLayout(vp_size, g_rtWidth, g_rtHeight);
                 ImVec2 cursor = ImGui::GetCursorPos();
-                ImVec2 centered_pos = ImVec2(
-                    cursor.x + 0.5f * (vp_size.x - image_size.x),
-                    cursor.y + 0.5f * (vp_size.y - image_size.y)
-                );
-                ImGui::SetCursorPos(centered_pos);
+                ImGui::SetCursorPos(ImVec2(cursor.x + layout.offset.x, cursor.y + layout.offset.y));
 
                 ImGui::Image(
                     (ImTextureID)(intptr_t)g_rtTexture,
-                    image_size,
+                    layout.size,
                     ImVec2(0, 0),
                     ImVec2(1, 1)
                 );
@@ -6120,39 +6335,38 @@ int main()
                 ImGui::Text("No render yet. Click 'Render Current View'.");
             }
         } else {
-            int tex_w = (int)vp_size.x;
-            int tex_h = (int)vp_size.y;
-            if (tex_w > 0 && tex_h > 0) {
-                // Record where ImGui will draw the image on screen so we can
-                // convert mouse coordinates into texture-local coords for picking.
-                    ImVec2 screen_pos = ImGui::GetCursorScreenPos();
+            int tex_w = s_viewport_match_render ? g_camera.image_width : (int)vp_size.x;
+            int tex_h = s_viewport_match_render ? g_camera.image_height : (int)vp_size.y;
+            if (vp_size.x > 0.0f && vp_size.y > 0.0f && tex_w > 0 && tex_h > 0) {
+                const viewport_image_layout layout =
+                    ComputeViewportImageLayout(vp_size, tex_w, tex_h);
+                const ImVec2 panel_cursor = ImGui::GetCursorPos();
+                const ImVec2 draw_cursor(
+                    panel_cursor.x + layout.offset.x,
+                    panel_cursor.y + layout.offset.y
+                );
+                const ImVec2 panel_screen = ImGui::GetCursorScreenPos();
+                const ImVec2 image_screen(
+                    panel_screen.x + layout.offset.x,
+                    panel_screen.y + layout.offset.y
+                );
 
-                    // If user wants the viewport to match the configured render resolution,
-                    // render into an FBO at that resolution; otherwise render at viewport size.
-                    if (s_viewport_match_render) {
-                        tex_w = g_camera.image_width;
-                        tex_h = g_camera.image_height;
-                    } else {
-                        tex_w = (int)vp_size.x;
-                        tex_h = (int)vp_size.y;
-                    }
+                RenderRasterToTexture(tex_w, tex_h);
 
-                    RenderRasterToTexture(tex_w, tex_h);
+                // Handle mouse click / drag -> gizmo interaction or pick
+                ImGuiIO& io = ImGui::GetIO();
+                if (g_viewport_hovered && layout.size.x > 0.0f && layout.size.y > 0.0f) {
+                    ImVec2 m = io.MousePos;
+                    float local_x = m.x - image_screen.x;
+                    float local_y = m.y - image_screen.y;
 
-                    // Handle mouse click / drag -> gizmo interaction or pick
-                    ImGuiIO& io = ImGui::GetIO();
-                    if (g_viewport_hovered) {
-                        ImVec2 m = io.MousePos;
-                        float local_x = m.x - screen_pos.x;
-                        float local_y = m.y - screen_pos.y;
+                    // Map the mouse position in fitted viewport pixels to texture-local coords.
+                    double scale_x = (double)tex_w / (double)layout.size.x;
+                    double scale_y = (double)tex_h / (double)layout.size.y;
+                    double sx = (double)local_x * scale_x;
+                    double sy = (double)local_y * scale_y;
 
-                        // Map the mouse position in viewport pixels to texture-local coords
-                        double scale_x = (vp_size.x > 0.0f) ? ((double)tex_w / (double)vp_size.x) : 1.0;
-                        double scale_y = (vp_size.y > 0.0f) ? ((double)tex_h / (double)vp_size.y) : 1.0;
-                        double sx = (double)local_x * scale_x;
-                        double sy = (double)local_y * scale_y;
-
-                        if (sx >= 0 && sx < tex_w && sy >= 0 && sy < tex_h) {
+                    if (sx >= 0 && sx < tex_w && sy >= 0 && sy < tex_h) {
                         // Mouse down: attempt gizmo axis hit first, otherwise pick scene
                         if (ImGui::IsMouseClicked(0)) {
                             bool did_hit_gizmo = false;
@@ -6349,9 +6563,10 @@ int main()
                 }
 
                 if (g_rasterColorTex != 0) {
+                    ImGui::SetCursorPos(draw_cursor);
                     ImGui::Image(
                         (ImTextureID)(intptr_t)g_rasterColorTex,
-                        vp_size,
+                        layout.size,
                         ImVec2(0, 1),
                         ImVec2(1, 0)  // flip Y
                     );
